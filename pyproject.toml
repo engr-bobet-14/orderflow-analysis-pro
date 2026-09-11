@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "orderflow-system"
@@ -23,6 +23,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+tuning = ["RiskLabAI[hpo]>=3.1,<4", "optuna>=4.9,<5"]
 
 [project.scripts]
 orderflow = "orderflow_system.main:main"
+
+[tool.setuptools]
+packages = ["orderflow_system"]

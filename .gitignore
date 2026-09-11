@@ -24,3 +24,5 @@ Thumbs.db
 .python-version
 
 docs/
+notebook/.optuna_studies/
+notebook/.cv_cache/
