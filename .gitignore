@@ -12,6 +12,7 @@ build/
 .env
 venv/
 .venv/
+.venv_orderflow/
 .idea/
 .vscode/
 *.swp
@@ -20,3 +21,6 @@ venv/
 Thumbs.db
 .claude/
 .continue/
+.python-version
+
+docs/
