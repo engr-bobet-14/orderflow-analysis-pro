@@ -1,0 +1,57 @@
+{
+  "n_candles": 30102,
+  "n_days": 32,
+  "baseline_params": {
+    "price_proximity_pct": 0.002,
+    "min_composite_score": 40.0,
+    "signal_cooldown_seconds": 30.0,
+    "min_aggressive_volume": 20.0,
+    "absorption_max_price_displacement_ticks": 3.0,
+    "big_trade_filter": 3.0,
+    "min_delta_threshold": 15.0,
+    "initiative_min_price_displacement_ticks": 4.0,
+    "volume_decline_pct": 0.25,
+    "lookback_bars": 10,
+    "delta_failure_pct": 0.8
+  },
+  "arms": {
+    "A_default_real_clock": {
+      "raw_signals": 13660,
+      "raw_by_type": {
+        "initiative_auction": 3578,
+        "absorption": 1630,
+        "exhaustion": 5844,
+        "delta_divergence": 2608
+      },
+      "actions": 1,
+      "action_types": {
+        "enter": 1
+      },
+      "entries": 1,
+      "exits": 0,
+      "completed_trades": 0,
+      "open_at_end": true
+    },
+    "B_injected_event_clock_candle_time": {
+      "raw_signals": 13648,
+      "raw_by_type": {
+        "initiative_auction": 3578,
+        "absorption": 1618,
+        "exhaustion": 5844,
+        "delta_divergence": 2608
+      },
+      "actions": 337,
+      "action_types": {
+        "enter": 130,
+        "break_even": 42,
+        "exit": 130,
+        "trail": 34,
+        "exit_warning": 1
+      },
+      "entries": 130,
+      "exits": 130,
+      "completed_trades": 130,
+      "open_at_end": false
+    }
+  }
+}

@@ -251,14 +251,22 @@ class TradeState:
         self.phase = TradePhase.ABSORPTION_DETECTED
         self.absorption_signals.append(signal)
 
-    def advance_to_position(self, entry_price: float, stop_loss: float, take_profit: float):
-        """Trade entered."""
+    def advance_to_position(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        entry_time_ms: Optional[int] = None,
+    ):
+        """Trade entered. `entry_time_ms` defaults to wall-clock time (live
+        behavior unchanged); event-driven callers pass the entry event's own
+        timestamp instead."""
         self.phase = TradePhase.POSITION_OPEN
         self.entry_price = entry_price
         self.stop_loss = stop_loss
         self.take_profit = take_profit
         self.break_even_price = entry_price
-        self.entry_time_ms = int(time.time() * 1000)
+        self.entry_time_ms = entry_time_ms if entry_time_ms is not None else int(time.time() * 1000)
         risk = abs(entry_price - stop_loss)
         if risk > 0:
             self.rr_ratio = abs(take_profit - entry_price) / risk

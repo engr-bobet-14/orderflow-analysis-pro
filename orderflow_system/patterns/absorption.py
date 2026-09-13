@@ -19,7 +19,6 @@ Logic:
 
 from __future__ import annotations
 
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -30,6 +29,7 @@ from orderflow_system.data.models import (
 from orderflow_system.analytics.footprint import FootprintBar, FootprintEngine
 from orderflow_system.analytics.delta import DeltaResult
 from orderflow_system.config.settings import AbsorptionConfig
+from orderflow_system.utils.clock import Clock, RealClock
 
 
 @dataclass
@@ -56,9 +56,10 @@ class AbsorptionDetector:
     Multiple attempts at the same level increase confidence.
     """
 
-    def __init__(self, config: AbsorptionConfig, tick_size: float = 0.1):
+    def __init__(self, config: AbsorptionConfig, tick_size: float = 0.1, clock: Optional[Clock] = None):
         self.config = config
         self.tick_size = tick_size
+        self._clock = clock or RealClock()
         self._active_absorptions: dict[float, AbsorptionEvent] = {}
         self._signal_history: list[Signal] = []
         self._cleanup_interval_ms = 60_000  # Clean stale events every minute
@@ -156,7 +157,7 @@ class AbsorptionDetector:
         if not footprint.levels:
             return None
 
-        now_ms = int(time.time() * 1000)
+        now_ms = self._clock.now_ms()
         tick_size = self.tick_size
 
         for price, lv in footprint.levels.items():

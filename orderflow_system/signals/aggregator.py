@@ -15,7 +15,6 @@ Signal weighting:
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -24,6 +23,7 @@ from orderflow_system.data.models import (
 )
 from orderflow_system.signals.profile_framing import DailyBias, QualifiedLevel, LevelType
 from orderflow_system.config.settings import BiasDirection
+from orderflow_system.utils.clock import Clock, RealClock
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +60,12 @@ class SignalAggregator:
         min_composite_score: float = 60.0,
         signal_cooldown_seconds: float = 60.0,
         price_proximity_pct: float = 0.002,  # 0.2% proximity to qualified level
+        clock: Optional[Clock] = None,
     ):
         self.min_composite_score = min_composite_score
         self.signal_cooldown_seconds = signal_cooldown_seconds
         self.price_proximity_pct = price_proximity_pct
+        self._clock = clock or RealClock()
         self._active_trades: dict[str, TradeState] = {}  # instrument → trade
         self._watched_levels: dict[str, list[QualifiedLevel]] = {}  # instrument → watched levels
         self._last_signal_time: dict[str, int] = {}      # instrument → timestamp_ms
@@ -81,7 +83,7 @@ class SignalAggregator:
         Process a new pattern signal against the current bias and trade state.
         Returns an aggregated signal if action is needed.
         """
-        now_ms = int(time.time() * 1000)
+        now_ms = self._clock.now_ms()
 
         # Cooldown check
         last_ts = self._last_signal_time.get(instrument, 0)
@@ -212,7 +214,7 @@ class SignalAggregator:
 
         # Compute SL/TP and advance to position
         sl, tp = self._compute_sl_tp(signal.direction, nearest, bias, current_price)
-        trade.advance_to_position(current_price, sl, tp)
+        trade.advance_to_position(current_price, sl, tp, entry_time_ms=now_ms)
         self._active_trades[instrument] = trade
 
         agg = AggregatedSignal(
@@ -262,19 +264,24 @@ class SignalAggregator:
                 return None
             nearest_level = self._find_qualified_level(bias, trade.qualified_level)
 
-        trade.advance_to_absorption(signal)
-
         score = self._compute_composite_score(signal, nearest_level, bias)
 
         if score < self.min_composite_score:
+            # Do NOT advance the phase on a rejected attempt -- the trade
+            # stays WATCHING so a later qualifying absorption signal can
+            # still be evaluated. Advancing here before this check used to
+            # permanently wedge the state machine in ABSORPTION_DETECTED,
+            # since process_signal has no routing branch to recover from it.
             return None
+
+        trade.advance_to_absorption(signal)
 
         sl, tp = self._compute_sl_tp(
             signal.direction, nearest_level, bias, current_price
         )
 
         # Advance to position with SL/TP
-        trade.advance_to_position(current_price, sl, tp)
+        trade.advance_to_position(current_price, sl, tp, entry_time_ms=now_ms)
 
         agg = AggregatedSignal(
             timestamp_ms=now_ms,
