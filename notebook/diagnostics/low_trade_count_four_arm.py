@@ -1,38 +1,41 @@
 """
-Four-arm ablation for the "only ~0-1 trades over 32 days" defect diagnosed
-against notebook/02_cross_validation_tuning.ipynb's run_backtest.
+Post-fix verification for the "only ~0-1 trades over 32 days" defect
+diagnosed against notebook/02_cross_validation_tuning.ipynb's run_backtest.
 
-READ-ONLY DIAGNOSTIC. Never imports/monkeypatches orderflow_system on disk.
-Does not change any threshold, any InstrumentConfig value, or any strategy
-logic. The two "fixes" below exist only as local monkeypatches on a
-SignalAggregator *instance* inside this script, applied to reproduce a
-counterfactual for measurement purposes -- they are not applied to the repo.
+HISTORY: this script originally ran a four-arm ablation (neither fix /
+state-machine fix only / candle-time fix only / both fixes) by
+monkeypatching `orderflow_system.signals.aggregator.time.time` to simulate
+each counterfactual against the then-buggy code. Its recorded results
+(low_trade_count_four_arm_results.json, still committed) showed:
+  1_neither_fix              : 0 completed trades
+  2_state_machine_fix_only   : 0 completed trades (1 entry, never exits)
+  3_candle_time_fix_only     : 0 completed trades
+  4_both_fixes               : 130 completed trades (~4/day)
 
-Arms (identical 30,102-candle dataset, identical BASELINE_PARAMS, identical
-InstrumentConfig -- nothing but the two flags below ever changes):
-  1. neither fix              -- real wall-clock cooldown, stuck-phase bug present
-  2. state-machine fix only   -- real wall-clock cooldown, stuck-phase bug patched
-  3. candle-time fix only     -- historical-candle-time cooldown, stuck-phase bug present
-  4. both fixes                -- historical-candle-time cooldown, stuck-phase bug patched
+Both fixes are now shipped in core code:
+  - orderflow_system/signals/aggregator.py: `_handle_absorption_at_level`
+    no longer calls `trade.advance_to_absorption(signal)` until AFTER the
+    composite-score gate passes, so a score-miss can no longer permanently
+    wedge the state machine in TradePhase.ABSORPTION_DETECTED (no toggle
+    for this remains -- it is a correctness fix, not a diagnostic flag).
+  - orderflow_system/utils/clock.py: `Clock` protocol + `RealClock` (wall
+    clock, the default everywhere -- preserves existing live behavior
+    unchanged) + `EventClock` (reports whichever timestamp a caller last
+    set). `SignalAggregator` and `AbsorptionDetector` now accept an
+    optional `clock=` constructor arg; `TradeState.advance_to_position`
+    now accepts an explicit `entry_time_ms` instead of reading
+    `time.time()` internally.
 
-Bug #1 (stuck phase): SignalAggregator._handle_absorption_at_level calls
-trade.advance_to_absorption(signal) -- moving the active trade's phase to
-TradePhase.ABSORPTION_DETECTED -- before checking the composite-score gate
-a few lines later. On a score miss it returns None without reverting the
-phase. process_signal's routing (aggregator.py) has branches for WATCHING,
-POSITION_OPEN, and BREAK_EVEN/TRAILING -- none for ABSORPTION_DETECTED --
-so every subsequent signal for that instrument silently falls through to
-the function's final `return None` for the rest of the run.
+READ-ONLY VERIFICATION. Does not change any threshold, InstrumentConfig
+value, or strategy logic -- only constructs the real, shipped classes with
+their real, shipped constructor arguments. Two arms remain meaningful
+(the state-machine bug has no "unfixed" toggle left to compare against):
 
-Bug #2 (wall-clock cooldown): process_signal's cooldown check computes
-`now_ms = int(time.time() * 1000)` -- real wall-clock time -- and compares
-it against `signal_cooldown_seconds`. A fast in-process replay over 30,102
-candles finishes in a few seconds of real time, so after the first signal
-that updates `_last_signal_time`, the cooldown blocks essentially every
-later signal for the rest of the run regardless of simulated market time
-elapsed. notebook 01's own `HistoricalClock` adapter (Section "Historical
-Replay Clock Adapter (Backtest Only)") already fixes this for its own
-replay helpers; run_backtest in notebook 02 never adopted it.
+  A. default clock (RealClock)  -- matches every existing live call site;
+     confirms live behavior is unchanged.
+  B. injected EventClock, advanced to each candle's own timestamp_ms --
+     matches what notebook 02's run_backtest now does; confirms the fix
+     recovers the previously-diagnosed ~130 trades.
 
 Run: .venv_orderflow/bin/python3 notebook/diagnostics/low_trade_count_four_arm.py
 Requires the candle cache notebook/.cv_cache/candles_*.pkl to already exist
@@ -42,14 +45,12 @@ not re-scan the raw parquet trade feed itself.
 from __future__ import annotations
 
 import datetime as dt
-import glob
 import json
 import pickle
 import sys
 from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -64,8 +65,7 @@ from orderflow_system.patterns.divergence import DivergenceDetector
 from orderflow_system.signals.profile_framing import ProfileFramingEngine
 from orderflow_system.signals.aggregator import SignalAggregator
 from orderflow_system.config.settings import get_btcusd_config
-from orderflow_system.data.models import SignalType, TradePhase
-import orderflow_system.signals.aggregator as agg_module
+from orderflow_system.utils.clock import Clock, RealClock, EventClock
 
 TICK_SIZE = 0.01
 SYMBOL = "BTCUSDT"
@@ -138,29 +138,10 @@ def build_instrument_config(params: dict):
     return replace(base, absorption=absorption, initiative=initiative, exhaustion=exhaustion, divergence=divergence)
 
 
-class _HistoricalClock:
-    """Backtest-only stand-in for time.time(): reports the current candle's
-    historical timestamp (seconds) instead of the real wall clock. Mirrors
-    notebook 01's HistoricalClock adapter. Never imported by orderflow_system."""
-
-    def __init__(self):
-        self.now_ms = 0
-
-    def time(self) -> float:
-        return self.now_ms / 1000.0
-
-
-def run_arm(
-    candles: list,
-    daily_profiles: dict,
-    instrument_config,
-    params: dict,
-    fix_stuck_phase: bool,
-    use_historical_clock: bool,
-) -> dict:
+def run_arm(candles: list, daily_profiles: dict, instrument_config, params: dict, clock: Clock) -> dict:
     de = DeltaEngine(tick_size=TICK_SIZE)
     fe = FootprintEngine(tick_size=TICK_SIZE)
-    absorption_d = AbsorptionDetector(instrument_config.absorption, tick_size=TICK_SIZE)
+    absorption_d = AbsorptionDetector(instrument_config.absorption, tick_size=TICK_SIZE, clock=clock)
     initiative_d = InitiativeDetector(instrument_config.initiative, tick_size=TICK_SIZE)
     exhaustion_d = ExhaustionDetector(instrument_config.exhaustion)
     divergence_d = DivergenceDetector(instrument_config.divergence)
@@ -169,28 +150,8 @@ def run_arm(
         min_composite_score=params["min_composite_score"],
         signal_cooldown_seconds=params["signal_cooldown_seconds"],
         price_proximity_pct=params["price_proximity_pct"],
+        clock=clock,
     )
-
-    if fix_stuck_phase:
-        # Diagnostic-only counterfactual: route ABSORPTION_DETECTED the same
-        # way WATCHING is routed, so a score-miss can be retried on the next
-        # absorption signal instead of permanently wedging the trade.
-        # Patches this SignalAggregator *instance* only -- never written to
-        # orderflow_system/signals/aggregator.py.
-        orig_process = agg.process_signal
-
-        def patched_process_signal(instrument, signal, bias, current_price, recent_candles):
-            active_trade = agg._active_trades.get(instrument)
-            if active_trade is not None and active_trade.phase == TradePhase.ABSORPTION_DETECTED:
-                if signal.signal_type == SignalType.ABSORPTION:
-                    return agg._handle_absorption_at_level(
-                        instrument, signal, bias, active_trade, current_price,
-                        int(agg_module.time.time() * 1000),
-                    )
-                return None
-            return orig_process(instrument, signal, bias, current_price, recent_candles)
-
-        agg.process_signal = patched_process_signal
 
     raw_signals = []
     raw_by_type = Counter()
@@ -199,52 +160,44 @@ def run_arm(
     current_day = None
     current_bias = None
 
-    hc = _HistoricalClock()
-    clock_patch = patch("orderflow_system.signals.aggregator.time.time", hc.time) if use_historical_clock else None
-    if clock_patch:
-        clock_patch.start()
-    try:
-        for c in candles:
-            if use_historical_clock:
-                hc.now_ms = c.timestamp_ms
+    for c in candles:
+        if isinstance(clock, EventClock):
+            clock.set(c.timestamp_ms)
 
-            day = dt.datetime.fromtimestamp(c.timestamp_ms / 1000, tz=dt.timezone.utc).date()
-            if day != current_day:
-                prev_day, current_day = current_day, day
-                if prev_day is not None and prev_day in daily_profiles:
-                    framing.add_profile(daily_profiles[prev_day])
-                    current_bias = framing.analyze(current_price=c.open)
-                    for level in current_bias.qualified_levels:
-                        if level.strength >= 50:
-                            agg.set_watching(SYMBOL, level, level.direction)
+        day = dt.datetime.fromtimestamp(c.timestamp_ms / 1000, tz=dt.timezone.utc).date()
+        if day != current_day:
+            prev_day, current_day = current_day, day
+            if prev_day is not None and prev_day in daily_profiles:
+                framing.add_profile(daily_profiles[prev_day])
+                current_bias = framing.analyze(current_price=c.open)
+                for level in current_bias.qualified_levels:
+                    if level.strength >= 50:
+                        agg.set_watching(SYMBOL, level, level.direction)
 
-            d = de.compute_from_candle(c)
-            fp_bar = fe.build_from_candle(c)
-            sig_list = [
-                absorption_d.check_candle(c, fp_bar, d, c.close),
-                initiative_d.check_candle(c, d, fp_bar),
-                exhaustion_d.check_candle(c, d, de, fp_bar, recent),
-                divergence_d.check_candle(c, de),
-            ]
-            signals = [s for s in sig_list if s is not None]
-            for s in signals:
-                raw_by_type[s.signal_type.value] += 1
-            raw_signals.extend(signals)
+        d = de.compute_from_candle(c)
+        fp_bar = fe.build_from_candle(c)
+        sig_list = [
+            absorption_d.check_candle(c, fp_bar, d, c.close),
+            initiative_d.check_candle(c, d, fp_bar),
+            exhaustion_d.check_candle(c, d, de, fp_bar, recent),
+            divergence_d.check_candle(c, de),
+        ]
+        signals = [s for s in sig_list if s is not None]
+        for s in signals:
+            raw_by_type[s.signal_type.value] += 1
+        raw_signals.extend(signals)
 
-            for sig in signals:
-                out = agg.process_signal(
-                    instrument=SYMBOL, signal=sig, bias=current_bias,
-                    current_price=c.close, recent_candles=recent[-5:],
-                )
-                if out is not None:
-                    actions.append((c.timestamp_ms, out))
+        for sig in signals:
+            out = agg.process_signal(
+                instrument=SYMBOL, signal=sig, bias=current_bias,
+                current_price=c.close, recent_candles=recent[-5:],
+            )
+            if out is not None:
+                actions.append((c.timestamp_ms, out))
 
-            recent.append(c)
-            if len(recent) > 20:
-                recent = recent[-20:]
-    finally:
-        if clock_patch:
-            clock_patch.stop()
+        recent.append(c)
+        if len(recent) > 20:
+            recent = recent[-20:]
 
     action_types = Counter(a.action for _, a in actions)
 
@@ -273,10 +226,8 @@ def run_arm(
 
 
 ARMS = [
-    ("1_neither_fix", False, False),
-    ("2_state_machine_fix_only", True, False),
-    ("3_candle_time_fix_only", False, True),
-    ("4_both_fixes", True, True),
+    ("A_default_real_clock", lambda: RealClock()),
+    ("B_injected_event_clock_candle_time", lambda: EventClock()),
 ]
 
 
@@ -292,14 +243,14 @@ def main():
     print(f"{len(candles):,} candles across {n_days} calendar days\n")
 
     results = {}
-    header = f"{'arm':30s} {'raw_signals':>11s} {'actions':>8s} {'entries':>8s} {'exits':>7s} {'completed':>10s} {'open_end':>9s}"
+    header = f"{'arm':38s} {'raw_signals':>11s} {'actions':>8s} {'entries':>8s} {'exits':>7s} {'completed':>10s} {'open_end':>9s}"
     print(header)
     print("-" * len(header))
-    for name, fix_stuck_phase, use_historical_clock in ARMS:
-        r = run_arm(candles, daily_profiles, instrument_config, BASELINE_PARAMS, fix_stuck_phase, use_historical_clock)
+    for name, clock_factory in ARMS:
+        r = run_arm(candles, daily_profiles, instrument_config, BASELINE_PARAMS, clock_factory())
         results[name] = r
         print(
-            f"{name:30s} {r['raw_signals']:11d} {r['actions']:8d} {r['entries']:8d} "
+            f"{name:38s} {r['raw_signals']:11d} {r['actions']:8d} {r['entries']:8d} "
             f"{r['exits']:7d} {r['completed_trades']:10d} {str(r['open_at_end']):>9s}"
         )
 
@@ -307,7 +258,7 @@ def main():
     for name, r in results.items():
         print(f"{name}: raw_by_type={r['raw_by_type']}  action_types={r['action_types']}")
 
-    out_path = Path(__file__).resolve().parent / "low_trade_count_four_arm_results.json"
+    out_path = Path(__file__).resolve().parent / "post_fix_verification_results.json"
     with open(out_path, "w") as f:
         json.dump(
             {
