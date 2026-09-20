@@ -26,3 +26,5 @@ Thumbs.db
 docs/
 
 graphify-out/
+notebook/.optuna_studies/
+notebook/.cv_cache/
