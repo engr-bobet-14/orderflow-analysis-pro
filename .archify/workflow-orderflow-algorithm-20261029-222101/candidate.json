@@ -1,0 +1,287 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Order-Flow Alert Engine: Tick to Telegram",
+    "quality_profile": "showcase",
+    "output": ".archify/workflow-orderflow-algorithm-20261029-222101/orderflow-algorithm.html",
+    "repository": {
+      "url": "https://github.com/engr-bobet-14/orderflow-analysis-pro.git",
+      "revision": "2ad37549120e833a9e6c94a54fbe2b0ca0c3891c"
+    },
+    "legend": {
+      "entries": {
+        "external": { "label": "Input feed" },
+        "backend": { "label": "Computation" },
+        "security": { "label": "Decision / gate" },
+        "database": { "label": "Held state" },
+        "messagebus": { "label": "Signal" },
+        "frontend": { "label": "Output channel" }
+      }
+    }
+  },
+  "lanes": [
+    { "id": "bars", "label": "Tick to candle to metrics (left to right)" },
+    { "id": "detect", "label": "Pattern detectors on candle close (right to left)" },
+    { "id": "ctx", "label": "Context: volume profile to bias (right to left)" },
+    { "id": "agg", "label": "Signal aggregator, trade state machine (left to right)" },
+    { "id": "book", "label": "Order-book path, sweep (right to left)" },
+    { "id": "out", "label": "Outputs" }
+  ],
+  "mainPath": ["feed", "builder", "roll", "delta", "fp"],
+  "nodes": [
+    {
+      "id": "feed", "lane": "bars", "col": 0, "type": "external", "label": "Tick feed",
+      "sublabel": "Bybit WS or MT5 poll", "tag": "Tick(px, size, side)",
+      "sources": [
+        { "path": "orderflow_system/main.py", "line": 258, "end_line": 292, "label": "feed selection by DATA_SOURCE" },
+        { "path": "orderflow_system/main.py", "line": 410, "end_line": 416, "label": "_on_tick routes to pipeline" }
+      ]
+    },
+    {
+      "id": "builder", "lane": "bars", "col": 1, "type": "backend", "label": "CandleBuilder",
+      "sublabel": "OHLCV + buy/sell vol, 1 min", "tag": "footprint[price]",
+      "sources": [{ "path": "orderflow_system/data/candle_builder.py", "line": 41, "end_line": 100, "label": "process_tick" }]
+    },
+    {
+      "id": "roll", "lane": "bars", "col": 2, "type": "security", "icon": "decision", "label": "New minute?",
+      "sublabel": "ts // 60s > candle.ts",
+      "sources": [{ "path": "orderflow_system/data/candle_builder.py", "line": 45, "end_line": 65, "label": "close candle, fire callback" }]
+    },
+    {
+      "id": "delta", "lane": "bars", "col": 3, "type": "backend", "label": "DeltaEngine",
+      "sublabel": "delta = buy - sell, CumDelta", "tag": "delta% = delta / vol",
+      "sources": [{ "path": "orderflow_system/analytics/delta.py", "line": 52, "end_line": 94, "label": "compute_from_candle" }]
+    },
+    {
+      "id": "fp", "lane": "bars", "col": 4, "type": "backend", "label": "FootprintEngine",
+      "sublabel": "bid/ask volume per price", "tag": "imbalance >= 3:1",
+      "sources": [
+        { "path": "orderflow_system/analytics/footprint.py", "line": 89, "end_line": 102, "label": "build_from_candle" },
+        { "path": "orderflow_system/analytics/footprint.py", "line": 42, "end_line": 58, "label": "imbalance_levels" }
+      ]
+    },
+    {
+      "id": "hub", "lane": "detect", "col": 4, "type": "backend", "label": "_on_candle_close",
+      "sublabel": "runs 4 checks in order", "tag": "collects signals[]",
+      "sources": [{ "path": "orderflow_system/main.py", "line": 126, "end_line": 174, "label": "InstrumentPipeline._on_candle_close" }]
+    },
+    {
+      "id": "absorb", "lane": "detect", "col": 3, "type": "security", "icon": "decision", "label": "Absorption?",
+      "sublabel": "delta vs close mismatch", "tag": "|delta| >= 50",
+      "sources": [
+        { "path": "orderflow_system/patterns/absorption.py", "line": 83, "end_line": 92, "label": "check_candle" },
+        { "path": "orderflow_system/patterns/absorption.py", "line": 105, "end_line": 143, "label": "delta/close mismatch" },
+        { "path": "orderflow_system/patterns/absorption.py", "line": 157, "end_line": 221, "label": "level absorption" }
+      ]
+    },
+    {
+      "id": "init", "lane": "detect", "col": 2, "type": "security", "icon": "decision", "label": "Initiative?",
+      "sublabel": "|delta|>=30, vol >= 1.5x avg", "tag": "body >= 3 ticks",
+      "sources": [{ "path": "orderflow_system/patterns/initiative.py", "line": 55, "end_line": 129, "label": "five criteria, then strength" }]
+    },
+    {
+      "id": "exh", "lane": "detect", "col": 1, "type": "security", "icon": "decision", "label": "Exhaustion?",
+      "sublabel": "3 bars: vol -30%, delta slope", "tag": "needs 4 candles",
+      "sources": [
+        { "path": "orderflow_system/patterns/exhaustion.py", "line": 44, "end_line": 126, "label": "check_candle, bullish case" },
+        { "path": "orderflow_system/patterns/exhaustion.py", "line": 214, "end_line": 228, "label": "_is_declining" },
+        { "path": "orderflow_system/analytics/delta.py", "line": 146, "end_line": 174, "label": "slopes via polyfit" }
+      ]
+    },
+    {
+      "id": "div", "lane": "detect", "col": 0, "type": "security", "icon": "decision", "label": "Divergence?",
+      "sublabel": "price new high, CumDelta lags", "tag": "peak < 0.8x prior",
+      "sources": [
+        { "path": "orderflow_system/patterns/divergence.py", "line": 39, "end_line": 111, "label": "bearish divergence" },
+        { "path": "orderflow_system/analytics/delta.py", "line": 176, "end_line": 197, "label": "detect_delta_peaks" }
+      ]
+    },
+    {
+      "id": "prof", "lane": "ctx", "col": 5, "type": "backend", "label": "VolumeProfileEngine",
+      "sublabel": "POC, 68% value area, LVN", "tag": "startup + hourly",
+      "sources": [
+        { "path": "orderflow_system/analytics/volume_profile.py", "line": 52, "end_line": 79, "label": "compute_from_candles" },
+        { "path": "orderflow_system/analytics/volume_profile.py", "line": 107, "end_line": 209, "label": "POC, value area, LVN" },
+        { "path": "orderflow_system/main.py", "line": 572, "end_line": 595, "label": "hourly rebuild, needs 10+ candles" }
+      ]
+    },
+    {
+      "id": "shape", "lane": "ctx", "col": 4, "type": "security", "icon": "decision", "label": "Profile shape?",
+      "sublabel": "POC >65% P, <35% b, else D",
+      "sources": [{ "path": "orderflow_system/analytics/volume_profile.py", "line": 211, "end_line": 258, "label": "_classify_shape" }]
+    },
+    {
+      "id": "bias", "lane": "ctx", "col": 3, "type": "backend", "label": "ProfileFramingEngine",
+      "sublabel": "LONG, SHORT, NEUTRAL, WARNING", "tag": "confidence 0-100",
+      "sources": [
+        { "path": "orderflow_system/signals/profile_framing.py", "line": 92, "end_line": 128, "label": "analyze" },
+        { "path": "orderflow_system/signals/profile_framing.py", "line": 130, "end_line": 154, "label": "direction from shape" },
+        { "path": "orderflow_system/signals/profile_framing.py", "line": 156, "end_line": 214, "label": "multi-day context" }
+      ]
+    },
+    {
+      "id": "levels", "lane": "ctx", "col": 2, "type": "database", "label": "Qualified levels",
+      "sublabel": "VAL, VAH, POC, LVN", "tag": "strength 30-100",
+      "sources": [
+        { "path": "orderflow_system/signals/profile_framing.py", "line": 216, "end_line": 281, "label": "_build_qualified_levels" },
+        { "path": "orderflow_system/main.py", "line": 611, "end_line": 616, "label": "strength >= 50 starts WATCHING" }
+      ]
+    },
+    {
+      "id": "cool", "lane": "agg", "col": 0, "type": "security", "icon": "decision", "label": "Cooldown over?",
+      "sublabel": "now - last signal >= 30 s", "tag": "raw signal saved",
+      "sources": [
+        { "path": "orderflow_system/signals/aggregator.py", "line": 86, "end_line": 92, "label": "cooldown check" },
+        { "path": "orderflow_system/main.py", "line": 211, "end_line": 214, "label": "min score 40, cooldown 30 s" },
+        { "path": "orderflow_system/main.py", "line": 493, "end_line": 514, "label": "_handle_signal" }
+      ]
+    },
+    {
+      "id": "phase", "lane": "agg", "col": 1, "type": "security", "icon": "decision", "label": "Trade phase?",
+      "sublabel": "none, WATCHING, OPEN, BE/TRAIL",
+      "sources": [{ "path": "orderflow_system/signals/aggregator.py", "line": 93, "end_line": 135, "label": "state machine routing" }]
+    },
+    {
+      "id": "entry", "lane": "agg", "col": 2, "type": "security", "icon": "decision", "label": "Entry qualifies?",
+      "sublabel": "absorption near level <= 0.2%", "tag": "same side as level",
+      "yOffset": -50,
+      "sources": [
+        { "path": "orderflow_system/signals/aggregator.py", "line": 169, "end_line": 237, "label": "_check_new_entry" },
+        { "path": "orderflow_system/signals/aggregator.py", "line": 239, "end_line": 275, "label": "absorption at watched level" }
+      ]
+    },
+    {
+      "id": "rules", "lane": "agg", "col": 2, "type": "security", "icon": "decision", "label": "Open-trade rules",
+      "sublabel": "initiative: BE, trail", "tag": "opposite sig >= 70: exit",
+      "yOffset": 50,
+      "sources": [
+        { "path": "orderflow_system/signals/aggregator.py", "line": 304, "end_line": 330, "label": "initiative moves to break even" },
+        { "path": "orderflow_system/signals/aggregator.py", "line": 332, "end_line": 369, "label": "initiative trails stop" },
+        { "path": "orderflow_system/signals/aggregator.py", "line": 371, "end_line": 403, "label": "exhaustion/divergence exit" }
+      ]
+    },
+    {
+      "id": "score", "lane": "agg", "col": 3, "type": "backend", "label": "Score + SL/TP",
+      "sublabel": "signal + level + bias weights", "tag": "score >= 40 to enter",
+      "yOffset": -50,
+      "sources": [{ "path": "orderflow_system/signals/aggregator.py", "line": 430, "end_line": 500, "label": "composite score, SL/TP" }]
+    },
+    {
+      "id": "aggsig", "lane": "agg", "col": 5, "type": "messagebus", "label": "AggregatedSignal",
+      "sublabel": "enter, BE, trail, exit, warn",
+      "sources": [{ "path": "orderflow_system/signals/aggregator.py", "line": 220, "end_line": 234, "label": "entry AggregatedSignal built" }]
+    },
+    {
+      "id": "bookfeed", "lane": "book", "col": 3, "type": "external", "label": "Orderbook feed",
+      "sublabel": "bid/ask ladder snapshots",
+      "sources": [{ "path": "orderflow_system/main.py", "line": 432, "end_line": 446, "label": "_on_orderbook" }]
+    },
+    {
+      "id": "tracker", "lane": "book", "col": 2, "type": "backend", "label": "OrderbookTracker",
+      "sublabel": "swept levels, thin book", "tag": "every book update",
+      "sources": [{ "path": "orderflow_system/main.py", "line": 111, "end_line": 124, "label": "process_orderbook" }]
+    },
+    {
+      "id": "sweepchk", "lane": "book", "col": 1, "type": "security", "icon": "decision", "label": "Sweep?",
+      "sublabel": ">= 3 levels in 2 s, low vol", "tag": "strength >= 30",
+      "sources": [{ "path": "orderflow_system/patterns/sweep.py", "line": 42, "end_line": 124, "label": "SweepDetector.check" }]
+    },
+    {
+      "id": "sweepsig", "lane": "book", "col": 0, "type": "messagebus", "label": "Sweep signal",
+      "sublabel": "needs open candle + footprint",
+      "sources": [
+        { "path": "orderflow_system/patterns/sweep.py", "line": 126, "end_line": 142, "label": "Signal(SWEEP)" },
+        { "path": "orderflow_system/main.py", "line": 448, "end_line": 449, "label": "goes straight to _handle_signal" }
+      ]
+    },
+    {
+      "id": "tg", "lane": "out", "col": 4, "type": "frontend", "label": "Telegram alert",
+      "sublabel": "enter, BE, trail, exit, warn",
+      "sources": [
+        { "path": "orderflow_system/alerts/telegram_bot.py", "line": 53, "end_line": 72, "label": "action to header map" },
+        { "path": "orderflow_system/alerts/telegram_bot.py", "line": 134, "end_line": 148, "label": "send or log locally" }
+      ]
+    },
+    {
+      "id": "ws", "lane": "out", "col": 5, "type": "frontend", "label": "Dashboard WebSocket",
+      "sublabel": "signal + trade state",
+      "sources": [{ "path": "orderflow_system/main.py", "line": 516, "end_line": 519, "label": "broadcast_signal, trade_state" }]
+    }
+  ],
+  "edges": [
+    { "id": "e-feed", "from": "feed", "to": "builder", "label": "tick", "variant": "emphasis" },
+    { "id": "e-builder", "from": "builder", "to": "roll", "variant": "default" },
+    { "id": "e-roll", "from": "roll", "to": "delta", "label": "yes: close", "variant": "emphasis" },
+    { "id": "e-delta", "from": "delta", "to": "fp", "variant": "default" },
+    { "id": "e-fp", "from": "fp", "to": "hub", "label": "closed candle", "variant": "emphasis" },
+    { "id": "e-hub", "from": "hub", "to": "absorb", "variant": "default" },
+    { "id": "e-absorb", "from": "absorb", "to": "init", "variant": "default" },
+    { "id": "e-init", "from": "init", "to": "exh", "variant": "default" },
+    { "id": "e-exh", "from": "exh", "to": "div", "variant": "default" },
+    { "id": "e-div", "from": "div", "to": "cool", "label": "signals[]", "variant": "emphasis" },
+    { "id": "e-prof", "from": "prof", "to": "shape", "variant": "default" },
+    { "id": "e-shape", "from": "shape", "to": "bias", "variant": "default" },
+    { "id": "e-bias", "from": "bias", "to": "levels", "variant": "default" },
+    { "id": "e-levels", "from": "levels", "to": "entry", "label": "nearest level", "variant": "dashed", "role": "async" },
+    { "id": "e-bias-score", "from": "bias", "to": "score", "label": "bias x0.20", "variant": "dashed", "role": "async" },
+    { "id": "e-cool", "from": "cool", "to": "phase", "label": "yes", "variant": "emphasis" },
+    { "id": "e-phase-entry", "from": "phase", "to": "entry", "label": "absorption", "variant": "default" },
+    { "id": "e-phase-rules", "from": "phase", "to": "rules", "label": "open", "variant": "default", "role": "branch" },
+    { "id": "e-entry", "from": "entry", "to": "score", "label": "yes", "variant": "emphasis" },
+    { "id": "e-score", "from": "score", "to": "aggsig", "label": "enter", "variant": "emphasis" },
+    { "id": "e-rules", "from": "rules", "to": "aggsig", "label": "BE, trail, exit", "variant": "default" },
+    { "id": "e-bookfeed", "from": "bookfeed", "to": "tracker", "variant": "default" },
+    { "id": "e-tracker", "from": "tracker", "to": "sweepchk", "variant": "default" },
+    { "id": "e-sweepchk", "from": "sweepchk", "to": "sweepsig", "label": "yes", "variant": "default" },
+    { "id": "e-sweepsig", "from": "sweepsig", "to": "cool", "label": "sweep", "variant": "emphasis", "role": "branch" },
+    { "id": "e-aggsig-tg", "from": "aggsig", "to": "tg", "variant": "emphasis" },
+    { "id": "e-aggsig-ws", "from": "aggsig", "to": "ws", "variant": "default" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Core calculations",
+      "items": [
+        "Delta = buy volume - sell volume; CumDelta adds each candle's delta",
+        "Imbalance level: ask/bid >= 3 (or one side empty) at a price",
+        "POC = max-volume price; value area grows from POC to 68% of volume",
+        "LVN = local volume minimum below max(mean - 1.5 sd, 0.2 mean)",
+        "Composite = 0.30 absorption (0.25 divergence, 0.20 initiative/sweep) + 0.25 level strength + 0.20 bias confidence if aligned"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Detector thresholds (defaults)",
+      "items": [
+        "Absorption: |delta| >= 50 against the candle colour; or level volume >= 50 within 2 ticks, 2+ attempts",
+        "Initiative: |delta| >= 30, volume >= 1.5x rolling average, body >= 3 ticks, delta agrees with colour",
+        "Exhaustion: 3 bars, volume down 30%, volume or delta slope negative",
+        "Divergence: 10-bar lookback, latest CumDelta peak < 80% of the previous",
+        "Sweep: >= 3 book levels in 2 s with low volume per level, strength >= 30"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Trade state machine",
+      "items": [
+        "No trade: only ABSORPTION near a qualified level (0.2%), same side, score >= 40 opens a trade",
+        "WATCHING a level: absorption can enter; a sweep only raises alert_only",
+        "Open: same-side initiative moves stop to break even, later ones trail it to the last candle's low/high",
+        "Opposite exhaustion or divergence: warning, or exit when strength >= 70",
+        "SL/TP from the profile: long SL under VAL, TP at VAH; short mirrored"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Found while tracing",
+      "items": [
+        "OrderflowSystem._on_candle_close_handler has no caller, so live candles are never saved and no candle/delta broadcast is sent",
+        "The hourly volume-profile rebuild reads candles from the database and skips when it finds fewer than 10",
+        "Telegram already formats break-even, trail and exit alerts",
+        "Divergence assumes a 0.1 tick size (hard-coded)",
+        "Runtime feeds are Bybit and MT5; Binance and information-driven bars are not wired in yet"
+      ]
+    }
+  ]
+}
