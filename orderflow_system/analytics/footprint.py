@@ -1,7 +1,12 @@
 """
 Footprint Engine
-Aggregates tick data into price-level bid/ask volume buckets.
-Detects imbalances, strong levels, and unfinished auction levels.
+Price-level bid/ask volume buckets, imbalances, strong levels.
+
+Price-level volume only exists when REAL trade-level data does
+(`build_from_ticks`). An information-driven bar carries bar totals only, so
+`build_from_bar` yields a FootprintBar with empty `levels`, bar-level
+buy/sell volume, and `has_price_levels == False`. Level-based queries then
+answer None ("unknown"), never 0 — nothing is ever interpolated.
 """
 
 from __future__ import annotations
@@ -10,26 +15,37 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from orderflow_system.data.models import Tick, Candle, FootprintLevel, Side
+from orderflow_system.data.models import Tick, InfoBar, FootprintLevel, Side
 
 
 @dataclass
 class FootprintBar:
-    """Complete footprint for a single time bar."""
+    """Footprint of a single bar. `levels` is empty for info bars (no price-level data)."""
     timestamp_ms: int = 0
     open: float = 0.0
     high: float = 0.0
     low: float = 0.0
     close: float = 0.0
     levels: dict[float, FootprintLevel] = field(default_factory=dict)
+    # Bar-level aggressive volume, used when there are no price levels.
+    bar_buy_volume: float = 0.0
+    bar_sell_volume: float = 0.0
+
+    @property
+    def has_price_levels(self) -> bool:
+        return bool(self.levels)
 
     @property
     def total_buy_volume(self) -> float:
-        return sum(lv.ask_volume for lv in self.levels.values())
+        if self.levels:
+            return sum(lv.ask_volume for lv in self.levels.values())
+        return self.bar_buy_volume
 
     @property
     def total_sell_volume(self) -> float:
-        return sum(lv.bid_volume for lv in self.levels.values())
+        if self.levels:
+            return sum(lv.bid_volume for lv in self.levels.values())
+        return self.bar_sell_volume
 
     @property
     def delta(self) -> float:
@@ -76,7 +92,7 @@ class FootprintBar:
 
 class FootprintEngine:
     """
-    Builds and analyzes footprint data from ticks or candles.
+    Builds and analyzes footprint data from real ticks or bar totals.
     The footprint shows executed buy and sell orders at each price level,
     revealing aggression, absorption, and imbalance.
     """
@@ -86,20 +102,24 @@ class FootprintEngine:
         self._bar_history: list[FootprintBar] = []
         self._max_history = 200
 
-    def build_from_candle(self, candle: Candle) -> FootprintBar:
-        """Build footprint bar from a candle that already has footprint data."""
-        bar = FootprintBar(
-            timestamp_ms=candle.timestamp_ms,
-            open=candle.open,
-            high=candle.high,
-            low=candle.low,
-            close=candle.close,
-            levels=dict(candle.footprint),
+    def build_from_bar(self, bar: InfoBar) -> FootprintBar:
+        """Footprint of an info bar: bar totals only, no price levels."""
+        fp = FootprintBar(
+            timestamp_ms=bar.timestamp_ms,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            bar_buy_volume=bar.buy_volume,
+            bar_sell_volume=bar.sell_volume,
         )
-        self._bar_history.append(bar)
+        self._remember(fp)
+        return fp
+
+    def _remember(self, fp: FootprintBar) -> None:
+        self._bar_history.append(fp)
         if len(self._bar_history) > self._max_history:
             self._bar_history = self._bar_history[-self._max_history:]
-        return bar
 
     def build_from_ticks(self, ticks: list[Tick], timestamp_ms: int = 0) -> FootprintBar:
         """Build footprint bar from raw ticks."""
@@ -129,11 +149,7 @@ class FootprintEngine:
             close=prices[-1],
             levels=levels,
         )
-
-        self._bar_history.append(bar)
-        if len(self._bar_history) > self._max_history:
-            self._bar_history = self._bar_history[-self._max_history:]
-
+        self._remember(bar)
         return bar
 
     @property
@@ -145,17 +161,21 @@ class FootprintEngine:
 
     def get_aggressive_volume_at_level(
         self, price: float, lookback_bars: int = 5
-    ) -> tuple[float, float]:
+    ) -> Optional[tuple[float, float]]:
         """
         Get total aggressive buy and sell volume at a price level
         across the last N bars. Used for absorption detection.
-        Returns (buy_volume, sell_volume) at that level.
+        Returns (buy_volume, sell_volume) at that level, or None when the
+        bars carry no price-level data (unknown, not zero).
         """
+        recent = self._bar_history[-lookback_bars:]
+        if not any(b.has_price_levels for b in recent):
+            return None
         total_buy = 0.0
         total_sell = 0.0
         tolerance = self.tick_size * 0.5
 
-        for bar in self._bar_history[-lookback_bars:]:
+        for bar in recent:
             lv = bar.absorption_at_level(price, tolerance)
             if lv:
                 total_buy += lv.ask_volume
@@ -165,13 +185,17 @@ class FootprintEngine:
 
     def count_consecutive_imbalances(
         self, direction: str, lookback: int = 5, threshold: float = 3.0
-    ) -> int:
+    ) -> Optional[int]:
         """
         Count consecutive bars with one-sided imbalance in a direction.
         Used for initiative auction detection — "constant aggression" signal.
+        None when the bars carry no price-level data.
         """
+        recent = self._bar_history[-lookback:]
+        if not any(b.has_price_levels for b in recent):
+            return None
         count = 0
-        for bar in reversed(self._bar_history[-lookback:]):
+        for bar in reversed(recent):
             imbalances = bar.imbalance_levels(threshold)
             has_directional = any(d == direction for _, d in imbalances)
             if has_directional:

@@ -1,6 +1,7 @@
 /**
- * Orderflow Trading Terminal — Simplified
- * Full-screen chart with info overlay + Scanner sidebar
+ * Orderflow Trading Terminal — information-driven bars
+ * Full-screen bar chart with info overlay + Scanner sidebar.
+ * The x-axis is bar sequence (each info bar closes on information, not on the clock).
  */
 
 // ════════════════════════════════════════════
@@ -12,31 +13,22 @@ const state = {
     activeSymbol: null,
     instruments: [],
     priceChart: null,
-    candleSeries: null,
+    barSeries: null,
     vpLines: [],
     tradeLines: [],
     signals: [],
     markers: [],
     reconnectTimer: null,
     reconnectDelay: 1000,
-    timeframe: 60,
-    range: 86400,
-    chartType: 'candles',
-    _candleBucket: null,
+    bars: 500,
+    barType: null,
+    sessionDate: null,
+    chartType: 'ohlc',
+    _barBucket: null,
     _deltaCumulative: null,
     _biasData: {},
     _vpData: {},
     _strategyData: {},
-    _microData: {},
-};
-
-// Asset class grouping
-const ASSET_GROUPS = {
-    'Forex':    ['EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','USDCHF','NZDUSD','EURGBP','EURJPY','GBPJPY'],
-    'Metals':   ['XAUUSDT','XAGUSD'],
-    'Indices':  ['NAS100USDT','SP500','DJ30','DAX40','UK100'],
-    'Crypto':   ['BTCUSDT','ETHUSDT','SOLUSDT','XRPUSDT','BNBUSDT'],
-    'Stocks':   ['AAPL','TSLA','AMZN','MSFT','NVDA','META','GOOGL'],
 };
 
 // ════════════════════════════════════════════
@@ -63,20 +55,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ════════════════════════════════════════════
 
 function initControls() {
-    document.querySelectorAll('.tf-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            state.timeframe = parseInt(btn.dataset.tf);
-            if (state.activeSymbol) loadSymbolData(state.activeSymbol);
-        });
-    });
-
     document.querySelectorAll('.range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            state.range = parseInt(btn.dataset.range);
+            state.bars = parseInt(btn.dataset.bars);
             if (state.activeSymbol) loadSymbolData(state.activeSymbol);
         });
     });
@@ -121,17 +104,12 @@ function renderInstrumentDropdown() {
     placeholder.selected = !state.activeSymbol;
     select.appendChild(placeholder);
 
-    for (const [groupName, symbols] of Object.entries(ASSET_GROUPS)) {
-        const group = document.createElement('optgroup');
-        group.label = groupName;
-        symbols.forEach(sym => {
-            const opt = document.createElement('option');
-            opt.value = sym;
-            opt.textContent = sym;
-            group.appendChild(opt);
-        });
-        if (group.children.length > 0) select.appendChild(group);
-    }
+    state.instruments.forEach(inst => {
+        const opt = document.createElement('option');
+        opt.value = inst.symbol;
+        opt.textContent = inst.symbol;
+        select.appendChild(opt);
+    });
 
     if (state.activeSymbol) select.value = state.activeSymbol;
 }
@@ -143,21 +121,21 @@ function renderInstrumentDropdown() {
 async function refreshFastData() {
     if (!state.activeSymbol) return;
     const sym = state.activeSymbol;
-    const tf = state.timeframe;
-    const range = state.range;
+    const n = state.bars;
 
     try {
-        const [candles, delta, micro] = await Promise.all([
-            fetchJSON(`/api/candles/${sym}?tf=${tf}&range=${range}`),
-            fetchJSON(`/api/delta/${sym}?tf=${tf}&range=${range}`),
-            fetchJSON(`/api/microstructure/${sym}`),
+        const [ohlc, delta, stats] = await Promise.all([
+            fetchJSON(`/api/bars/${sym}?bars=${n}`),
+            fetchJSON(`/api/delta/${sym}?bars=${n}`),
+            fetchJSON('/api/stats'),
         ]);
+        if (stats) applyStats(stats);
 
-        if (candles && candles.length > 0 && state.candleSeries) {
-            state.candleSeries.setData(mapCandleData(candles));
-            const last = candles[candles.length - 1];
+        if (ohlc && ohlc.length > 0 && state.barSeries) {
+            state.barSeries.setData(mapBarData(ohlc));
+            const last = ohlc[ohlc.length - 1];
             updatePriceDisplay(last.close, last.delta);
-            state._candleBucket = {
+            state._barBucket = {
                 time: last.time, open: last.open, high: last.high,
                 low: last.low, close: last.close,
             };
@@ -168,10 +146,6 @@ async function refreshFastData() {
             updateChartInfoOverlay();
         }
 
-        if (micro) {
-            state._microData = micro;
-            updateChartInfoOverlay();
-        }
     } catch (e) { /* silent */ }
 }
 
@@ -189,7 +163,7 @@ async function refreshSlowData() {
     try {
         const [strategy, vps, signals, bias] = await Promise.all([
             fetchJSON(`/api/strategy-status/${sym}`),
-            fetchJSON(`/api/volume-profile/${sym}?range=${state.range}`),
+            fetchJSON(`/api/volume-profile/${sym}?bars=${state.bars}`),
             fetchJSON(`/api/signals/${sym}`),
             fetchJSON(`/api/bias/${sym}`),
         ]);
@@ -211,6 +185,8 @@ async function refreshSlowData() {
             updateVPLines(bias);
             updateChartInfoOverlay();
         }
+        const markers = await fetchJSON(`/api/markers/${sym}?bars=${state.bars}`);
+        if (markers) { state.markers = markers; applyMarkers(); }
     } catch (e) { /* silent */ }
 }
 
@@ -231,31 +207,29 @@ async function switchInstrument(symbol) {
 }
 
 async function loadSymbolData(symbol) {
-    const tf = state.timeframe;
-    const range = state.range;
-    state._candleBucket = null;
+    const n = state.bars;
+    state._barBucket = null;
     state._deltaCumulative = null;
 
-    const [candles, delta, bias, vps, strategy, signals, micro] = await Promise.all([
-        fetchJSON(`/api/candles/${symbol}?tf=${tf}&range=${range}`),
-        fetchJSON(`/api/delta/${symbol}?tf=${tf}&range=${range}`),
+    const [ohlc, delta, bias, vps, strategy, signals] = await Promise.all([
+        fetchJSON(`/api/bars/${symbol}?bars=${n}`),
+        fetchJSON(`/api/delta/${symbol}?bars=${n}`),
         fetchJSON(`/api/bias/${symbol}`),
-        fetchJSON(`/api/volume-profile/${symbol}?range=${range}`),
+        fetchJSON(`/api/volume-profile/${symbol}?bars=${n}`),
         fetchJSON(`/api/strategy-status/${symbol}`),
         fetchJSON(`/api/signals/${symbol}`),
-        fetchJSON(`/api/microstructure/${symbol}`),
     ]);
 
     // Price chart
-    if (candles && candles.length > 0 && state.candleSeries) {
-        state.candleSeries.setData(mapCandleData(candles));
-        if (state.chartType === 'baseline' && candles.length > 0) {
-            state.candleSeries.applyOptions({
-                baseValue: { type: 'price', price: candles[0].open },
+    if (ohlc && ohlc.length > 0 && state.barSeries) {
+        state.barSeries.setData(mapBarData(ohlc));
+        if (state.chartType === 'baseline' && ohlc.length > 0) {
+            state.barSeries.applyOptions({
+                baseValue: { type: 'price', price: ohlc[0].open },
             });
         }
-    } else if (state.candleSeries) {
-        state.candleSeries.setData([]);
+    } else if (state.barSeries) {
+        state.barSeries.setData([]);
     }
 
     // Delta (for overlay)
@@ -271,20 +245,19 @@ async function loadSymbolData(symbol) {
     if (vps && vps.length > 0) state._vpData = vps[0];
     if (strategy) { state._strategyData = strategy; updateTradeLines(); }
     if (signals && signals.length > 0) state.signals = signals;
-    if (micro) state._microData = micro;
 
     // Price display
-    if (candles && candles.length > 0) {
-        const last = candles[candles.length - 1];
+    if (ohlc && ohlc.length > 0) {
+        const last = ohlc[ohlc.length - 1];
         updatePriceDisplay(last.close, last.delta);
-        state._candleBucket = {
+        state._barBucket = {
             time: last.time, open: last.open, high: last.high,
             low: last.low, close: last.close,
         };
     }
 
     // Chart markers
-    const markers = await fetchJSON(`/api/markers/${symbol}`);
+    const markers = await fetchJSON(`/api/markers/${symbol}?bars=${n}`);
     state.markers = markers || [];
     applyMarkers();
 
@@ -334,7 +307,7 @@ function createPriceChart() {
         handleScroll: { vertTouchDrag: false },
     });
 
-    state.candleSeries = state.priceChart.addCandlestickSeries({
+    state.barSeries = state.priceChart.addCandlestickSeries({
         upColor: '#3fb950',
         downColor: '#f85149',
         borderUpColor: '#3fb950',
@@ -350,26 +323,26 @@ function createPriceChart() {
 
 function switchChartType(type) {
     if (!state.priceChart) return;
-    if (state.candleSeries) {
-        state.priceChart.removeSeries(state.candleSeries);
-        state.candleSeries = null;
+    if (state.barSeries) {
+        state.priceChart.removeSeries(state.barSeries);
+        state.barSeries = null;
     }
 
     switch (type) {
         case 'line':
-            state.candleSeries = state.priceChart.addLineSeries({ color: '#58a6ff', lineWidth: 2 });
+            state.barSeries = state.priceChart.addLineSeries({ color: '#58a6ff', lineWidth: 2 });
             break;
         case 'area':
-            state.candleSeries = state.priceChart.addAreaSeries({
+            state.barSeries = state.priceChart.addAreaSeries({
                 lineColor: '#58a6ff', topColor: 'rgba(88, 166, 255, 0.25)',
                 bottomColor: 'rgba(88, 166, 255, 0.02)', lineWidth: 2,
             });
             break;
         case 'bars':
-            state.candleSeries = state.priceChart.addBarSeries({ upColor: '#3fb950', downColor: '#f85149' });
+            state.barSeries = state.priceChart.addBarSeries({ upColor: '#3fb950', downColor: '#f85149' });
             break;
         case 'baseline':
-            state.candleSeries = state.priceChart.addBaselineSeries({
+            state.barSeries = state.priceChart.addBaselineSeries({
                 baseValue: { type: 'price', price: 0 },
                 topLineColor: '#3fb950', topFillColor1: 'rgba(63, 185, 80, 0.2)',
                 topFillColor2: 'rgba(63, 185, 80, 0.02)', bottomLineColor: '#f85149',
@@ -378,7 +351,7 @@ function switchChartType(type) {
             });
             break;
         default:
-            state.candleSeries = state.priceChart.addCandlestickSeries({
+            state.barSeries = state.priceChart.addCandlestickSeries({
                 upColor: '#3fb950', downColor: '#f85149',
                 borderUpColor: '#3fb950', borderDownColor: '#f85149',
                 wickUpColor: '#3fb950', wickDownColor: '#f85149',
@@ -389,15 +362,15 @@ function switchChartType(type) {
     if (state.activeSymbol) loadSymbolData(state.activeSymbol);
 }
 
-function mapCandleData(candles) {
+function mapBarData(ohlc) {
     const type = state.chartType;
     if (type === 'line' || type === 'area' || type === 'baseline') {
-        return candles.map(c => ({ time: c.time, value: c.close }));
+        return ohlc.map(c => ({ time: c.time, value: c.close }));
     }
-    return candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }));
+    return ohlc.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }));
 }
 
-function mapCandleUpdate(bucket) {
+function mapBarUpdate(bucket) {
     const type = state.chartType;
     if (type === 'line' || type === 'area' || type === 'baseline') {
         return { time: bucket.time, value: bucket.close };
@@ -409,32 +382,11 @@ function mapCandleUpdate(bucket) {
 // Chart Markers
 // ════════════════════════════════════════════
 
-function signalToMarker(sig) {
-    const isBuy = (sig.direction === 'buy' || sig.direction === 'long');
-    const time = Math.floor((sig.timestamp_ms || sig.receivedAt || Date.now()) / 1000);
-    const sigType = (sig.signals && sig.signals[0] && sig.signals[0].signal_type) || sig.signal_type || '';
-    const action = sig.action || 'alert_only';
-
-    if (action === 'enter')        return { time, position: isBuy ? 'belowBar' : 'aboveBar', color: isBuy ? '#00e676' : '#ff1744', shape: 'circle', text: 'ENTRY' };
-    if (action === 'break_even')   return { time, position: 'aboveBar', color: '#42a5f5', shape: 'square', text: 'BE' };
-    if (action === 'trail')        return { time, position: 'aboveBar', color: '#26c6da', shape: 'square', text: 'TRAIL' };
-    if (action === 'exit')         return { time, position: 'aboveBar', color: '#ff1744', shape: 'circle', text: 'EXIT' };
-    if (action === 'exit_warning') return { time, position: 'aboveBar', color: '#ffeb3b', shape: 'circle', text: 'WARN' };
-
-    if (sigType.includes('absorption'))  return { time, position: isBuy ? 'belowBar' : 'aboveBar', color: isBuy ? '#26a69a' : '#ef5350', shape: isBuy ? 'arrowUp' : 'arrowDown', text: 'ABS' };
-    if (sigType.includes('initiative'))  return { time, position: isBuy ? 'belowBar' : 'aboveBar', color: isBuy ? '#66bb6a' : '#ffa726', shape: isBuy ? 'arrowUp' : 'arrowDown', text: 'INIT' };
-    if (sigType.includes('sweep'))       return { time, position: 'aboveBar', color: '#ab47bc', shape: 'arrowDown', text: 'SWEEP' };
-    if (sigType.includes('exhaustion'))  return { time, position: 'aboveBar', color: '#ffeb3b', shape: 'circle', text: 'EXHAUST' };
-    if (sigType.includes('divergence')) return { time, position: 'aboveBar', color: '#ff9800', shape: 'circle', text: 'DIV' };
-
-    return { time, position: 'aboveBar', color: '#9e9e9e', shape: 'circle', text: 'SIG' };
-}
-
 function applyMarkers() {
-    if (!state.candleSeries) return;
-    if (state.chartType !== 'candles' && state.chartType !== 'bars') return;
+    if (!state.barSeries) return;
+    if (state.chartType !== 'ohlc' && state.chartType !== 'bars') return;
     const sorted = [...state.markers].sort((a, b) => a.time - b.time);
-    state.candleSeries.setMarkers(sorted);
+    state.barSeries.setMarkers(sorted);
 }
 
 // ════════════════════════════════════════════
@@ -442,10 +394,10 @@ function applyMarkers() {
 // ════════════════════════════════════════════
 
 function updateVPLines(bias) {
-    if (!state.candleSeries) return;
+    if (!state.barSeries) return;
 
     state.vpLines.forEach(line => {
-        try { state.candleSeries.removePriceLine(line); } catch {}
+        try { state.barSeries.removePriceLine(line); } catch {}
     });
     state.vpLines = [];
 
@@ -468,7 +420,7 @@ function updateVPLines(bias) {
 
     lineConfigs.forEach(cfg => {
         if (cfg.price && cfg.price > 0) {
-            const line = state.candleSeries.createPriceLine({
+            const line = state.barSeries.createPriceLine({
                 price: cfg.price, color: cfg.color, lineWidth: cfg.width || 1,
                 lineStyle: cfg.style, axisLabelVisible: true, title: cfg.title,
             });
@@ -482,16 +434,16 @@ function updateVPLines(bias) {
 // ════════════════════════════════════════════
 
 function updateTradeLines() {
-    if (!state.candleSeries) return;
+    if (!state.barSeries) return;
 
     state.tradeLines.forEach(line => {
-        try { state.candleSeries.removePriceLine(line); } catch {}
+        try { state.barSeries.removePriceLine(line); } catch {}
     });
     state.tradeLines = [];
 
     const strategy = state._strategyData || {};
     const trade = strategy.trade || {};
-    const phase = (strategy.phase || trade.phase || '').toLowerCase();
+    const phase = (trade.phase_after || trade.phase || '').toLowerCase();
 
     // Only draw when there's an active trade
     if (!phase || phase === 'idle' || phase === 'none' || phase === 'closed' || phase === 'waiting_for_price') return;
@@ -508,7 +460,7 @@ function updateTradeLines() {
     }
 
     lines.forEach(cfg => {
-        const line = state.candleSeries.createPriceLine({
+        const line = state.barSeries.createPriceLine({
             price: cfg.price, color: cfg.color, lineWidth: cfg.width,
             lineStyle: cfg.style, axisLabelVisible: true, title: cfg.title,
         });
@@ -634,7 +586,6 @@ function updateChartInfoOverlay() {
     const bias = state._biasData || {};
     const strategy = state._strategyData || {};
     const vp = state._vpData || {};
-    const micro = state._microData || {};
 
     // ── Top-Left: Symbol + Bias + Strategy + Session ──
     const biasDir = bias.direction || 'neutral';
@@ -648,21 +599,14 @@ function updateChartInfoOverlay() {
     else if (overall.includes('SCANNING') || overall.includes('WATCHING')) stratClass = 'scanning';
     else if (overall.includes('IN TRADE') || overall.includes('TRAILING')) stratClass = 'in-trade';
 
-    const tfMap = { 60: '1m', 300: '5m', 900: '15m', 3600: '1H', 14400: '4H', 86400: '1D' };
-    const tfLabel = tfMap[state.timeframe] || state.timeframe + 's';
-
-    const hour = new Date().getUTCHours();
-    let sessionName = 'Off-Hours';
-    if (hour >= 0 && hour < 7) sessionName = 'Asia';
-    else if (hour >= 7 && hour < 12) sessionName = 'London';
-    else if (hour >= 12 && hour < 16) sessionName = 'NY AM';
-    else if (hour >= 16 && hour < 21) sessionName = 'NY PM';
+    const tfLabel = state.barType ? state.barType.replace('fixed_', '').replace('_', ' ') : 'info bars';
+    const sessionText = state.sessionDate ? `Session ${state.sessionDate} (UTC day)` : 'Session --';
 
     topLeft.innerHTML = `
         <div class="chart-wm-symbol">${sym} · ${tfLabel}</div>
         <div class="chart-bias-badge ${biasClass}">${biasArrow} ${biasDir.toUpperCase()} ${biasConf}%</div>
         <div class="chart-strategy-chip ${stratClass}">${overall}</div>
-        <div class="chart-session-info">${sessionName} Session</div>
+        <div class="chart-session-info">${sessionText}</div>
     `;
 
     // ── Top-Right: VP levels + qualified levels ──
@@ -706,29 +650,10 @@ function updateChartInfoOverlay() {
     if (strategy.trade && strategy.trade.pnl_ticks != null) {
         const pnl = strategy.trade.pnl_ticks;
         const pClass = pnl >= 0 ? 'bull' : 'bear';
-        rows.push(`<div class="chart-info-row"><span class="ci-label">P&L</span><span class="ci-val ${pClass}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)} ticks</span></div>`);
+        rows.push(`<div class="chart-info-row"><span class="ci-label">P&L</span><span class="ci-val ${pClass}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)} USDT</span></div>`);
     }
     bottomLeft.innerHTML = rows.join('');
-
-    // ── Bottom-Right: Microstructure snapshot ──
-    const brRows = [];
-    if (micro.spread != null) {
-        brRows.push(`<div class="chart-info-row"><span class="ci-label">SPREAD</span><span class="ci-val ${micro.spread <= 2 ? 'bull' : 'orange'}">${micro.spread}</span></div>`);
-    }
-    if (micro.ob_imbalance != null) {
-        const imb = micro.ob_imbalance;
-        const imbClass = imb >= 0.2 ? 'bull' : imb <= -0.2 ? 'bear' : 'neutral';
-        brRows.push(`<div class="chart-info-row"><span class="ci-label">OB IMB</span><span class="ci-val ${imbClass}">${(imb * 100).toFixed(0)}%</span></div>`);
-    }
-    if (micro.volume_ratio != null) {
-        const vr = micro.volume_ratio;
-        const vrClass = vr >= 1.5 ? 'orange' : vr >= 1.0 ? 'bull' : 'neutral';
-        brRows.push(`<div class="chart-info-row"><span class="ci-label">VOL %</span><span class="ci-val ${vrClass}">${(vr * 100).toFixed(0)}%</span></div>`);
-    }
-    if (micro.volatility != null) {
-        brRows.push(`<div class="chart-info-row"><span class="ci-label">VOLA</span><span class="ci-val purple">${micro.volatility.toFixed(2)}</span></div>`);
-    }
-    if (bottomRight) bottomRight.innerHTML = brRows.join('');
+    if (bottomRight) bottomRight.innerHTML = '';
 }
 
 // ════════════════════════════════════════════
@@ -810,15 +735,15 @@ function handleMessage(msg) {
     }
 
     switch (channel) {
-        case 'tick':       handleTick(data); break;
-        case 'candle':     handleCandle(data); break;
         case 'signal':     handleSignal(symbol, data); break;
         case 'bias':       state._biasData = data; updateVPLines(data); updateChartInfoOverlay(); break;
         case 'volume_profile': if (data) { state._vpData = data; updateChartInfoOverlay(); } break;
-        case 'microstructure': if (data) { state._microData = data; updateChartInfoOverlay(); } break;
-        case 'delta':      handleDelta(data); break;
         case 'stats':      handleStats(symbol, data); break;
-        case 'trade_state': fetchJSON(`/api/strategy-status/${state.activeSymbol}`).then(s => { if (s) { state._strategyData = s; updateTradeLines(); updateChartInfoOverlay(); } }); break;
+        case 'trade_state':
+            state._strategyData = { ...(state._strategyData || {}), trade: data };
+            updateTradeLines();
+            updateChartInfoOverlay();
+            break;
         case 'pong': break;
     }
 }
@@ -827,75 +752,32 @@ function handleMessage(msg) {
 // Data Handlers
 // ════════════════════════════════════════════
 
-function handleTick(data) {
-    const price = data.price;
-    updatePriceDisplay(price, null);
-
-    if (state.candleSeries && state._candleBucket) {
-        const b = state._candleBucket;
-        b.high = Math.max(b.high, price);
-        b.low = Math.min(b.low, price);
-        b.close = price;
-        state.candleSeries.update(mapCandleUpdate(b));
-    }
-
-    // Live delta from ticks
-    if (state._deltaCumulative != null) {
-        const tickDelta = data.side === 'buy' ? (data.size || 0) : -(data.size || 0);
-        if (tickDelta !== 0) {
-            state._deltaCumulative += tickDelta;
-            updateChartInfoOverlay();
-        }
-    }
-}
-
-function handleCandle(data) {
-    if (!state.candleSeries) return;
-    const tfSec = state.timeframe;
-    const bucketTime = Math.floor((data.time || data.timestamp_ms / 1000) / tfSec) * tfSec;
-
-    if (!state._candleBucket || state._candleBucket.time !== bucketTime) {
-        state._candleBucket = {
-            time: bucketTime, open: data.open, high: data.high,
-            low: data.low, close: data.close,
-        };
-    } else {
-        const b = state._candleBucket;
-        b.high = Math.max(b.high, data.high);
-        b.low = Math.min(b.low, data.low);
-        b.close = data.close;
-    }
-
-    state.candleSeries.update(mapCandleUpdate(state._candleBucket));
-    updatePriceDisplay(data.close, data.delta);
-}
-
-function handleDelta(data) {
-    const barDelta = data.bar_delta || data.value || 0;
-    state._deltaCumulative = (state._deltaCumulative || 0) + barDelta;
-    updateChartInfoOverlay();
-}
-
 function handleSignal(symbol, data) {
     state.signals.unshift({ symbol, ...data, receivedAt: Date.now() });
     if (state.signals.length > 100) state.signals.pop();
 
-    if (symbol === state.activeSymbol) {
-        const marker = signalToMarker(data);
-        if (marker) {
-            state.markers.push(marker);
-            applyMarkers();
-        }
-    }
+    // Markers are rebuilt from the server (bar-aligned display times) by refreshSlowData.
 }
 
 function handleStats(symbol, data) {
-    if (symbol === state.activeSymbol || !symbol) {
-        if (data.ticks !== undefined) document.getElementById('tickCount').textContent = `Ticks: ${formatNumber(data.ticks)}`;
-        if (data.candles !== undefined) document.getElementById('candleCount').textContent = `Candles: ${formatNumber(data.candles)}`;
-    }
-    if (data.data_source) document.getElementById('dataSource').textContent = data.data_source;
+    applyStats(data);
     document.getElementById('lastUpdate').textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+}
+
+function applyStats(data) {
+    if (!data) return;
+    const inst = (data.instruments || []).find(i => i.symbol === state.activeSymbol) || (data.instruments || [])[0];
+    if (inst) {
+        state.barType = inst.bar_type;
+        state.sessionDate = inst.session;
+        document.getElementById('barCount').textContent = `Bars: ${formatNumber(inst.bars)}`;
+        const t = inst.last_bar_ms ? new Date(inst.last_bar_ms).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : '--';
+        document.getElementById('barTime').textContent = `Last bar: ${t}`;
+    }
+    if (data.data_source) {
+        document.getElementById('dataSource').textContent =
+            data.data_source + (data.replay_finished ? ' (replay done)' : ' (replaying)');
+    }
 }
 
 // ════════════════════════════════════════════

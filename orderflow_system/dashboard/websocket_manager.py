@@ -20,14 +20,10 @@ logger = logging.getLogger(__name__)
 
 class Channel(str, Enum):
     """WebSocket broadcast channels."""
-    TICK = "tick"
-    CANDLE = "candle"
     SIGNAL = "signal"
     TRADE_STATE = "trade_state"
     VOLUME_PROFILE = "volume_profile"
     BIAS = "bias"
-    ORDERBOOK = "orderbook"
-    DELTA = "delta"
     STATS = "stats"
 
 
@@ -66,14 +62,10 @@ class WebSocketManager:
         # Throttle: channel → {symbol → last_broadcast_time}
         self._last_broadcast: dict[str, dict[str, float]] = {}
         self._throttle_ms: dict[str, int] = {
-            Channel.TICK: 200,           # Max 5 ticks/sec per symbol
-            Channel.CANDLE: 0,           # No throttle — only on close
             Channel.SIGNAL: 0,           # Never throttle signals
             Channel.TRADE_STATE: 0,
             Channel.VOLUME_PROFILE: 0,
             Channel.BIAS: 0,
-            Channel.ORDERBOOK: 500,      # Max 2 book updates/sec
-            Channel.DELTA: 200,
             Channel.STATS: 5000,         # Max every 5s
         }
 
@@ -145,18 +137,6 @@ class WebSocketManager:
         if dead:
             logger.debug(f"Removed {len(dead)} dead WebSocket connection(s)")
 
-    async def broadcast_tick(self, symbol: str, price: float, size: float, side: str):
-        """Broadcast a tick update (throttled)."""
-        await self.broadcast(
-            Channel.TICK,
-            {"price": price, "size": size, "side": side},
-            symbol=symbol,
-        )
-
-    async def broadcast_candle(self, symbol: str, candle_data: dict):
-        """Broadcast a closed candle."""
-        await self.broadcast(Channel.CANDLE, candle_data, symbol=symbol)
-
     async def broadcast_signal(self, symbol: str, signal_data: Any):
         """Broadcast a new aggregated signal (never throttled)."""
         await self.broadcast(Channel.SIGNAL, signal_data, symbol=symbol)
@@ -172,14 +152,6 @@ class WebSocketManager:
     async def broadcast_bias(self, symbol: str, bias_data: Any):
         """Broadcast daily bias update."""
         await self.broadcast(Channel.BIAS, bias_data, symbol=symbol)
-
-    async def broadcast_orderbook(self, symbol: str, book_data: dict):
-        """Broadcast orderbook snapshot (throttled)."""
-        await self.broadcast(Channel.ORDERBOOK, book_data, symbol=symbol)
-
-    async def broadcast_delta(self, symbol: str, delta_data: dict):
-        """Broadcast delta update (throttled)."""
-        await self.broadcast(Channel.DELTA, delta_data, symbol=symbol)
 
     async def broadcast_stats(self, stats_data: dict):
         """Broadcast system stats."""

@@ -171,7 +171,7 @@ class SignalCards {
         const qualityColor = confidence >= 70 ? 'var(--green)' : confidence >= 50 ? 'var(--orange)' : 'var(--red)';
         const cardId = `sig-${signal.id}`;
 
-        // Multi-timeframe confluence indicators
+        // Profile confluence indicators
         const mtf = signal.mtf_confluence || {};
         const mtfItems = Object.entries(mtf).filter(([,v]) => v).map(([k, v]) => {
             const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -258,12 +258,12 @@ class SignalCards {
                     <div class="section-body">${signal.edge}</div>
                 </div>` : ''}
 
-                <!-- ── Multi-Timeframe Confluence ── -->
+                <!-- ── Profile Confluence ── -->
                 ${mtfItems ? `
                 <div class="signal-section signal-mtf">
                     <div class="section-hdr" onclick="this.parentElement.classList.toggle('collapsed')">
                         <span class="section-icon">🔗</span>
-                        <span class="section-title">Timeframe Confluence</span>
+                        <span class="section-title">Profile Confluence</span>
                         <span class="section-toggle">▾</span>
                     </div>
                     <div class="section-body">
@@ -276,7 +276,7 @@ class SignalCards {
                 <div class="signal-section signal-htf">
                     <div class="section-hdr" onclick="this.parentElement.classList.toggle('collapsed')">
                         <span class="section-icon">📈</span>
-                        <span class="section-title">Higher Timeframe</span>
+                        <span class="section-title">Multi-session Context</span>
                         <span class="section-toggle">▾</span>
                     </div>
                     <div class="section-body">${signal.htf_context}</div>
@@ -406,7 +406,7 @@ class SignalCards {
     }
 
     /**
-     * Check if a multi-timeframe component aligns with the trade direction
+     * Check if a profile component aligns with the trade direction
      */
     _isMtfAligned(key, value, direction) {
         const v = (value || '').toLowerCase();

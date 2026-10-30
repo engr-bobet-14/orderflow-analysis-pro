@@ -21,7 +21,7 @@ What should have happened?
 
 ## Environment
 
-- Data source: [MT5 / Bybit / Both]
+- Bar type (e.g. fixed_dollar_imbalance) and replay window:
 - Python version:
 - OS:
 - Any error messages:

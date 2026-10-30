@@ -11,21 +11,23 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from orderflow_system.data.models import Tick, Candle, Side
+from orderflow_system.data.models import Tick, InfoBar, Side
 
 
 @dataclass
 class DeltaResult:
-    """Delta analysis for a single candle or time window."""
+    """Delta analysis for a single bar or tick window."""
     vertical_delta: float = 0.0          # buy_vol - sell_vol for this bar
     cumulative_delta: float = 0.0        # Running total across bars
     horizontal_delta: dict[float, float] = field(default_factory=dict)
-    # per-price: buy_vol - sell_vol
-    max_delta_price: float = 0.0         # Price with strongest buy delta
-    min_delta_price: float = 0.0         # Price with strongest sell delta
+    # per-price: buy_vol - sell_vol. EMPTY (= unknown) for info bars: only
+    # real trade-level data (compute_from_ticks) can populate it.
+    max_delta_price: Optional[float] = None   # Price with strongest buy delta (None if no price levels)
+    min_delta_price: Optional[float] = None   # Price with strongest sell delta (None if no price levels)
     buy_volume: float = 0.0
     sell_volume: float = 0.0
     delta_pct: float = 0.0              # delta / total_volume
+    volume_rate: Optional[float] = None  # participation: volume per second (None = unknown)
 
 
 class DeltaEngine:
@@ -33,9 +35,9 @@ class DeltaEngine:
     Computes delta metrics used throughout the strategy.
 
     Key concepts from Fabio:
-      - Horizontal delta: buy_vol - sell_vol at EACH price level within a candle
-      - Vertical delta: total aggressive buys - total aggressive sells per candle
-      - Cumulative delta: running sum across candles, used for divergence detection
+      - Horizontal delta: buy_vol - sell_vol at EACH price level within a bar (trade-level data only)
+      - Vertical delta: total aggressive buys - total aggressive sells per bar
+      - Cumulative delta: running sum across bars, used for divergence detection
       - Delta divergence: price makes new high but cum_delta doesn't → weakening
     """
 
@@ -49,49 +51,27 @@ class DeltaEngine:
         self._cumulative_delta = 0.0
         self._delta_history.clear()
 
-    def compute_from_candle(self, candle: Candle) -> DeltaResult:
-        """Compute delta from a candle with footprint data."""
-        buy_vol = candle.buy_volume
-        sell_vol = candle.sell_volume
-        vertical_delta = buy_vol - sell_vol
-
+    def compute_from_bar(self, bar: InfoBar) -> DeltaResult:
+        """Vertical + cumulative delta of an info bar (no price-level delta exists)."""
+        vertical_delta = bar.buy_volume - bar.sell_volume
         self._cumulative_delta += vertical_delta
 
-        # Horizontal delta from footprint
-        h_delta: dict[float, float] = {}
-        max_delta = float("-inf")
-        min_delta = float("inf")
-        max_delta_price = candle.close
-        min_delta_price = candle.close
-
-        if candle.footprint:
-            for price, fp in candle.footprint.items():
-                d = fp.ask_volume - fp.bid_volume
-                h_delta[price] = d
-                if d > max_delta:
-                    max_delta = d
-                    max_delta_price = price
-                if d < min_delta:
-                    min_delta = d
-                    min_delta_price = price
-
-        total = buy_vol + sell_vol
+        total = bar.buy_volume + bar.sell_volume
         result = DeltaResult(
             vertical_delta=vertical_delta,
             cumulative_delta=self._cumulative_delta,
-            horizontal_delta=h_delta,
-            max_delta_price=max_delta_price,
-            min_delta_price=min_delta_price,
-            buy_volume=buy_vol,
-            sell_volume=sell_vol,
+            buy_volume=bar.buy_volume,
+            sell_volume=bar.sell_volume,
             delta_pct=vertical_delta / total if total > 0 else 0.0,
+            volume_rate=bar.volume_rate,
         )
+        self._remember(result)
+        return result
 
+    def _remember(self, result: DeltaResult) -> None:
         self._delta_history.append(result)
         if len(self._delta_history) > self._max_history:
             self._delta_history = self._delta_history[-self._max_history:]
-
-        return result
 
     def compute_from_ticks(
         self, ticks: list[Tick], tick_size: Optional[float] = None
@@ -114,13 +94,15 @@ class DeltaEngine:
         vertical_delta = buy_vol - sell_vol
         self._cumulative_delta += vertical_delta
 
-        max_delta_price = max(h_delta, key=lambda k: h_delta[k]) if h_delta else 0.0
-        min_delta_price = min(h_delta, key=lambda k: h_delta[k]) if h_delta else 0.0
+        max_delta_price = max(h_delta, key=lambda k: h_delta[k]) if h_delta else None
+        min_delta_price = min(h_delta, key=lambda k: h_delta[k]) if h_delta else None
         total = buy_vol + sell_vol
+        span_s = (ticks[-1].timestamp_ms - ticks[0].timestamp_ms) / 1000.0 if ticks else 0.0
 
         result = DeltaResult(
             vertical_delta=vertical_delta,
             cumulative_delta=self._cumulative_delta,
+            volume_rate=total / max(span_s, 1.0) if ticks else None,
             horizontal_delta=dict(h_delta),
             max_delta_price=max_delta_price,
             min_delta_price=min_delta_price,
@@ -129,10 +111,7 @@ class DeltaEngine:
             delta_pct=vertical_delta / total if total > 0 else 0.0,
         )
 
-        self._delta_history.append(result)
-        if len(self._delta_history) > self._max_history:
-            self._delta_history = self._delta_history[-self._max_history:]
-
+        self._remember(result)
         return result
 
     @property
@@ -159,13 +138,14 @@ class DeltaEngine:
         return slope
 
     def get_volume_trend(self, lookback: int = 5) -> float:
-        """Slope of total volume over last N bars. Declining = exhaustion clue."""
+        """Slope of participation rate (volume/sec) over last N bars.
+        Declining = exhaustion clue. Rate, not raw volume: volume/dollar bars
+        have near-constant volume, their effort shows up as time compression."""
         if len(self._delta_history) < lookback:
             return 0.0
-        recent = [
-            d.buy_volume + d.sell_volume
-            for d in self._delta_history[-lookback:]
-        ]
+        recent = [d.volume_rate for d in self._delta_history[-lookback:]]
+        if any(r is None for r in recent):
+            return 0.0      # unknown rate in the window: no trend claimed
         x = np.arange(len(recent), dtype=float)
         y = np.array(recent, dtype=float)
         if np.std(x) == 0:

@@ -1,11 +1,16 @@
 """
 Core data models used across the entire system.
-Tick, OrderbookSnapshot, Candle, Signal, TradeState — the common language.
+InfoBar, Tick, OrderbookSnapshot, Signal, TradeState — the common language.
+
+The primary market-data unit is the information-driven bar (`InfoBar`): a bar
+that closes when the market's own information content (tick / volume / dollar
+imbalance or run) crosses a threshold, not when a clock interval elapses.
+`Tick` and `OrderbookSnapshot` model genuine trade-level / L2 data and exist
+only for feeds that really provide them; info-bar datasets do not.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -14,6 +19,16 @@ from typing import Optional
 # ──────────────────────────────────────────────
 # Enums
 # ──────────────────────────────────────────────
+
+class BarType(str, Enum):
+    """The six information-driven bar types (directory names of the dataset)."""
+    TICK_IMBALANCE = "fixed_tick_imbalance"
+    VOLUME_IMBALANCE = "fixed_volume_imbalance"
+    DOLLAR_IMBALANCE = "fixed_dollar_imbalance"
+    TICK_RUN = "fixed_tick_run"
+    VOLUME_RUN = "fixed_volume_run"
+    DOLLAR_RUN = "fixed_dollar_run"
+
 
 class Side(Enum):
     BUY = "buy"
@@ -118,7 +133,7 @@ class OrderbookSnapshot:
 
 @dataclass
 class FootprintLevel:
-    """Bid/Ask volume at a single price level within a candle."""
+    """Bid/Ask volume at a single price level (requires real trade-level data)."""
     price: float
     bid_volume: float = 0.0    # Aggressive sell volume hitting this bid
     ask_volume: float = 0.0    # Aggressive buy volume hitting this ask
@@ -140,24 +155,63 @@ class FootprintLevel:
         return self.ask_volume / self.bid_volume
 
 
-@dataclass
-class Candle:
-    """OHLCV candle enriched with orderflow data."""
-    timestamp_ms: int
+@dataclass(slots=True)
+class InfoBar:
+    """
+    One information-driven bar, stamped at its CLOSE time (UTC).
+
+    A bar is only known once it has closed, so `timestamp_ms` is also the
+    moment the bar becomes available to the strategy (no look-ahead).
+    `timestamp_ms` is not unique: several bars can close in the same
+    millisecond. `seq` (cumulative trade index at the bar's last trade) is
+    strictly increasing and breaks those ties.
+
+    Only bar-level aggregates exist. There is NO price-level (footprint) or
+    trade-level data; nothing in the system may invent it.
+    """
+    timestamp_ms: int              # Bar close, Unix ms UTC
     open: float
     high: float
     low: float
     close: float
-    volume: float = 0.0
-    buy_volume: float = 0.0       # Aggressive buy volume
-    sell_volume: float = 0.0      # Aggressive sell volume
-    tick_count: int = 0
-    footprint: dict[float, FootprintLevel] = field(default_factory=dict)
+    volume: float = 0.0            # Base-asset volume in the bar
+    buy_volume: float = 0.0        # Aggressive buy volume
+    sell_volume: float = 0.0       # Aggressive sell volume
+    tick_count: int = 0            # Trades in the bar
+    dollar_value: float = 0.0      # Quote-currency value traded (sum price*size)
+    threshold: float = 0.0         # Bar-closing threshold recorded by the bar builder
+    seq: int = 0                   # Cumulative trade index at bar close (strictly increasing)
+    bar_type: Optional[BarType] = None
+    duration_ms: Optional[int] = None  # Close-to-close time since previous bar; None for the first bar
+    data_gap: bool = False         # Bar spans an hour the dataset reports as trade-less (unreliable duration)
 
     @property
     def delta(self) -> float:
-        """Vertical delta for this candle."""
+        """Vertical delta for this bar."""
         return self.buy_volume - self.sell_volume
+
+    @property
+    def delta_pct(self) -> float:
+        """Delta as a fraction of bar volume (scale-free, -1..+1)."""
+        return self.delta / self.volume if self.volume > 0 else 0.0
+
+    @property
+    def vwap(self) -> float:
+        """Volume-weighted average price of the bar (genuine: dollar_value / volume)."""
+        if self.volume > 0 and self.dollar_value > 0:
+            return self.dollar_value / self.volume
+        return self.close
+
+    @property
+    def volume_rate(self) -> Optional[float]:
+        """Participation rate: volume per second (duration floored at 1s, so
+        sub-second bars saturate). None when the duration is unknown (first bar
+        of a stream) or spans a data gap — unknown is never turned into a number.
+        Info bars compress time when activity is high, so this is the
+        info-bar analogue of 'volume acceleration'."""
+        if self.duration_ms is None or self.data_gap:
+            return None
+        return self.volume / max(self.duration_ms / 1000.0, 1.0)
 
     @property
     def is_green(self) -> bool:
@@ -188,6 +242,9 @@ class VolumeProfileResult:
     lvn_levels: list[float] = field(default_factory=list)
     shape: str = "unknown"                         # p_shape, b_shape, d_shape, double_dist
     poc_position_pct: float = 0.5                  # POC position within range (0=bottom, 1=top)
+    # Where the price axis came from: "ticks" = real trade prices, "bar_vwap" =
+    # each info bar's volume placed at the bar's own VWAP (coarse, genuine).
+    source: str = "ticks"
 
     @property
     def value_area_range(self) -> float:
@@ -245,6 +302,9 @@ class TradeState:
     rr_ratio: float = 0.0
     pnl_ticks: float = 0.0
     notes: str = ""
+    trade_id: int = 0
+    exit_price: Optional[float] = None
+    exit_time_ms: Optional[int] = None
 
     def advance_to_absorption(self, signal: Signal):
         """Absorption detected at qualified level — entry signal."""
@@ -256,17 +316,16 @@ class TradeState:
         entry_price: float,
         stop_loss: float,
         take_profit: float,
-        entry_time_ms: Optional[int] = None,
+        *,
+        entry_time_ms: int,
     ):
-        """Trade entered. `entry_time_ms` defaults to wall-clock time (live
-        behavior unchanged); event-driven callers pass the entry event's own
-        timestamp instead."""
+        """Trade entered at the explicitly supplied event timestamp."""
         self.phase = TradePhase.POSITION_OPEN
         self.entry_price = entry_price
         self.stop_loss = stop_loss
         self.take_profit = take_profit
         self.break_even_price = entry_price
-        self.entry_time_ms = entry_time_ms if entry_time_ms is not None else int(time.time() * 1000)
+        self.entry_time_ms = entry_time_ms
         risk = abs(entry_price - stop_loss)
         if risk > 0:
             self.rr_ratio = abs(take_profit - entry_price) / risk
@@ -279,7 +338,7 @@ class TradeState:
         self.initiative_signals.append(signal)
 
     def update_trail(self, new_trail_level: float, signal: Signal):
-        """New initiative print — trail stop to the candle's extreme."""
+        """New initiative print — trail stop to the bar's extreme."""
         self.phase = TradePhase.TRAILING
         if self.direction == Side.BUY:
             self.trail_stop = max(self.trail_stop, new_trail_level)
@@ -288,11 +347,43 @@ class TradeState:
         self.stop_loss = self.trail_stop
         self.initiative_signals.append(signal)
 
-    def close_trade(self, exit_price: float, reason: str = ""):
-        """Trade finished."""
+    def close_trade(self, exit_price: float, reason: str = "", *, exit_time_ms: int):
+        """Trade finished at the explicitly supplied event timestamp."""
         self.phase = TradePhase.CLOSED
+        self.exit_price = exit_price
+        self.exit_time_ms = exit_time_ms
         if self.direction == Side.BUY:
             self.pnl_ticks = exit_price - self.entry_price
         else:
             self.pnl_ticks = self.entry_price - exit_price
         self.notes = reason
+
+
+@dataclass(frozen=True)
+class ExecutionLevel:
+    """Immutable profile level as it was selected for an execution."""
+    price: float
+    direction: Side
+    level_type: str = ""
+    strength: float = 0.0
+    source_dates: tuple[str, ...] = ()
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class ExecutionSnapshot:
+    """Trade state captured at one action, independent of subsequent actions."""
+    trade_id: int
+    instrument: str
+    direction: Side
+    phase_after: TradePhase
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    rr_ratio: float
+    fill_price: Optional[float]
+    exit_reason: Optional[str]
+    pnl: Optional[float]
+    qualified_level: Optional[ExecutionLevel]
+    bar_seq: int
+    timestamp_ms: int

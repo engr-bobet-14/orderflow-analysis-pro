@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Orderflow Trading Terminal</title>
-    <link rel="stylesheet" href="/static/style.css?v=8">
+    <title>Orderflow Terminal — Info Bars</title>
+    <link rel="stylesheet" href="/static/style.css?v=10">
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -19,30 +19,19 @@
                 <select id="symbolSelect" class="terminal-select"></select>
             </div>
             <div class="control-group">
-                <label class="control-label">TF</label>
-                <div class="btn-group" id="tfGroup">
-                    <button class="tf-btn active" data-tf="60">1m</button>
-                    <button class="tf-btn" data-tf="300">5m</button>
-                    <button class="tf-btn" data-tf="900">15m</button>
-                    <button class="tf-btn" data-tf="3600">1H</button>
-                    <button class="tf-btn" data-tf="14400">4H</button>
-                    <button class="tf-btn" data-tf="86400">1D</button>
-                </div>
-            </div>
-            <div class="control-group">
-                <label class="control-label">RANGE</label>
+                <label class="control-label">BARS</label>
                 <div class="btn-group" id="rangeGroup">
-                    <button class="range-btn" data-range="3600">1H</button>
-                    <button class="range-btn" data-range="14400">4H</button>
-                    <button class="range-btn active" data-range="86400">1D</button>
-                    <button class="range-btn" data-range="604800">1W</button>
-                    <button class="range-btn" data-range="2592000">1M</button>
+                    <button class="range-btn" data-bars="200">200</button>
+                    <button class="range-btn active" data-bars="500">500</button>
+                    <button class="range-btn" data-bars="1000">1000</button>
+                    <button class="range-btn" data-bars="2000">2000</button>
+                    <button class="range-btn" data-bars="5000">5000</button>
                 </div>
             </div>
             <div class="control-group">
                 <label class="control-label">CHART</label>
                 <div class="btn-group" id="chartTypeGroup">
-                    <button class="chart-btn active" data-chart="candles">Candles</button>
+                    <button class="chart-btn active" data-chart="ohlc">OHLC</button>
                     <button class="chart-btn" data-chart="line">Line</button>
                     <button class="chart-btn" data-chart="area">Area</button>
                     <button class="chart-btn" data-chart="bars">Bars</button>
@@ -105,8 +94,8 @@
 
     <!-- ═══ Footer ═══ -->
     <footer id="footer">
-        <span id="tickCount">Ticks: --</span>
-        <span id="candleCount">Candles: --</span>
+        <span id="barCount">Bars: --</span>
+        <span id="barTime">Last bar: --</span>
         <span class="footer-separator">|</span>
         <span id="sessionInfo">Session: --</span>
         <span class="footer-separator">|</span>
@@ -116,6 +105,6 @@
         </span>
     </footer>
 
-    <script src="/static/app.js?v=8"></script>
+    <script src="/static/app.js?v=10"></script>
 </body>
 </html>

@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from orderflow_system.signals.aggregator import AggregatedSignal
 from orderflow_system.signals.profile_framing import DailyBias
-from orderflow_system.data.models import Side, TradeState, TradePhase
+from orderflow_system.data.models import Side, ExecutionSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,11 @@ class TelegramAlertBot:
         instrument: str,
         agg_signal: AggregatedSignal,
         bias: Optional[DailyBias] = None,
-        trade: Optional[TradeState] = None,
+        trade: Optional[ExecutionSnapshot] = None,
     ):
         """Send a formatted alert for a trading signal."""
-        direction = "🟢 LONG" if agg_signal.direction == Side.BUY else "🔴 SHORT"
+        execution = agg_signal.execution
+        direction = "🟢 LONG" if execution.direction == Side.BUY else "🔴 SHORT"
 
         # Action-specific emoji and header
         action_map = {
@@ -67,6 +69,8 @@ class TelegramAlertBot:
             "trail": "📈 TRAIL UPDATE",
             "exit": "🚪 EXIT SIGNAL",
             "exit_warning": "⚠️ EXIT WARNING",
+            "stop": "🛑 STOP HIT",
+            "target": "✅ TARGET HIT",
             "alert_only": "📊 ALERT",
         }
         header = action_map.get(agg_signal.action, "📊 SIGNAL")
@@ -75,7 +79,9 @@ class TelegramAlertBot:
         lines = [
             f"━━━ {header} ━━━",
             f"📌 {instrument} | {direction}",
-            f"💪 Score: {agg_signal.composite_score:.0f}/100",
+            f"🕒 Bar close: {datetime.fromtimestamp(agg_signal.timestamp_ms / 1000, tz=timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+            *([] if agg_signal.action in ("stop", "target")
+              else [f"💪 Score: {agg_signal.composite_score:.0f}/100"]),
             "",
         ]
 
@@ -91,24 +97,27 @@ class TelegramAlertBot:
 
         # Entry action details
         if agg_signal.action == "enter":
+            entry = execution.entry_price
             lines.extend([
                 "📊 TRADE SETUP:",
-                f"   Entry: ~{agg_signal.signals[0].price_level:.2f}" if agg_signal.signals else "",
-                f"   Stop Loss: {agg_signal.suggested_sl:.2f}",
-                f"   Take Profit: {agg_signal.suggested_tp:.2f}",
+                f"   Entry: ~{entry:.2f} (bar close)" if entry else "",
+                f"   Stop Loss: {execution.stop_loss:.2f}",
+                f"   Take Profit: {execution.take_profit:.2f}",
             ])
-            if agg_signal.suggested_sl and agg_signal.signals:
-                entry = agg_signal.signals[0].price_level
-                risk = abs(entry - agg_signal.suggested_sl)
-                reward = abs(agg_signal.suggested_tp - entry)
+            if execution.stop_loss and entry:
+                risk = abs(entry - execution.stop_loss)
+                reward = abs(execution.take_profit - entry)
                 if risk > 0:
                     lines.append(f"   R:R = 1:{reward/risk:.1f}")
 
-        elif agg_signal.action == "break_even" and trade:
-            lines.append(f"🔒 Move SL to {trade.break_even_price:.2f}")
+        elif agg_signal.action == "break_even":
+            lines.append(f"🔒 Move SL to {execution.stop_loss:.2f}")
 
-        elif agg_signal.action == "trail" and trade:
-            lines.append(f"📈 Trail SL to {trade.trail_stop:.2f}")
+        elif agg_signal.action == "trail":
+            lines.append(f"📈 Trail SL to {execution.stop_loss:.2f}")
+
+        elif agg_signal.action in ("stop", "target", "exit"):
+            lines.append(f"   Exit: {execution.fill_price:.2f} | PnL: {execution.pnl:.2f}")
 
         lines.append("")
 

@@ -9,14 +9,20 @@ From Fabio:
 Logic:
   Bearish divergence: Price new high + cumulative delta lower high
   Bullish divergence: Price new low + cumulative delta higher low
+
+  Cumulative delta is an unbounded running sum (its sign and magnitude depend
+  on where the replay started), so "failed to confirm" is measured against the
+  cumulative-delta RANGE of the lookback window, never as a ratio of levels.
   → REVERSAL warning or filter to reduce confidence in current direction
 """
 
 from __future__ import annotations
 
+from collections import deque
+
 from typing import Optional
 
-from orderflow_system.data.models import Candle, Signal, SignalType, Side
+from orderflow_system.data.models import InfoBar, Signal, SignalType, Side
 from orderflow_system.analytics.delta import DeltaEngine
 from orderflow_system.config.settings import DivergenceConfig
 
@@ -33,16 +39,16 @@ class DivergenceDetector:
         self.config = config
         self._price_history: list[tuple[int, float, float]] = []
         # (timestamp_ms, high, low)
-        self._signal_history: list[Signal] = []
+        self._signal_history: deque[Signal] = deque(maxlen=5000)
         self._max_history = 100
 
-    def check_candle(
+    def check_bar(
         self,
-        candle: Candle,
+        bar: InfoBar,
         delta_engine: DeltaEngine,
     ) -> Optional[Signal]:
-        """Check for delta divergence after a completed candle."""
-        self._price_history.append((candle.timestamp_ms, candle.high, candle.low))
+        """Check for delta divergence after a completed bar."""
+        self._price_history.append((bar.timestamp_ms, bar.high, bar.low))
         if len(self._price_history) > self._max_history:
             self._price_history = self._price_history[-self._max_history:]
 
@@ -52,17 +58,21 @@ class DivergenceDetector:
 
         # Get delta peaks and troughs
         peaks, troughs = delta_engine.detect_delta_peaks(lookback=lookback)
+        window = [d.cumulative_delta for d in delta_engine.history[-lookback:]]
+        cd_range = max(window) - min(window) if window else 0.0
+        if cd_range <= 0:
+            return None
 
         # ── Bearish divergence: price higher high, delta lower high ──
-        bear_signal = self._check_bearish_divergence(candle, peaks)
+        bear_signal = self._check_bearish_divergence(bar, peaks, cd_range)
         if bear_signal:
             return bear_signal
 
         # ── Bullish divergence: price lower low, delta higher low ──
-        return self._check_bullish_divergence(candle, troughs)
+        return self._check_bullish_divergence(bar, troughs, cd_range)
 
     def _check_bearish_divergence(
-        self, candle: Candle, delta_peaks: list[tuple[int, float]]
+        self, bar: InfoBar, delta_peaks: list[tuple[int, float]], cd_range: float
     ) -> Optional[Signal]:
         """Price new high but delta peak is lower than previous."""
         if len(delta_peaks) < 2:
@@ -74,34 +84,34 @@ class DivergenceDetector:
             return None
 
         max_prev_high = max(prev_highs)
-        tick = self.config.min_price_new_extreme_ticks * 0.1  # Approx tick
+        margin = max_prev_high * self.config.min_price_new_extreme_bps / 1e4
 
         # Price must make new high
-        if candle.high < max_prev_high + tick:
+        if bar.high < max_prev_high + margin:
             return None
 
-        # Delta peak must be lower than previous peak
+        # Delta peak must be lower than previous peak by a share of the window range
         latest_delta_peak = delta_peaks[-1][1]
         prev_delta_peak = delta_peaks[-2][1]
-
-        if latest_delta_peak >= prev_delta_peak * self.config.delta_failure_pct:
+        shortfall = (prev_delta_peak - latest_delta_peak) / cd_range
+        if shortfall < 1 - self.config.delta_failure_pct:
             return None  # Delta confirmed the move — no divergence
 
         strength = min(100.0, (
             30  # Base divergence
-            + (1 - latest_delta_peak / max(prev_delta_peak, 0.01)) * 40
-            + (candle.high - max_prev_high) / max(tick, 0.01) * 10
+            + shortfall * 40
+            + (bar.high - max_prev_high) / max(margin, 1e-9) * 10
         ))
 
         signal = Signal(
-            timestamp_ms=candle.timestamp_ms,
+            timestamp_ms=bar.timestamp_ms,
             signal_type=SignalType.DIVERGENCE,
             direction=Side.SELL,   # Bearish divergence → weakening buyers
-            price_level=candle.high,
+            price_level=bar.high,
             strength=strength,
             details={
                 "type": "bearish_divergence",
-                "price_high": candle.high,
+                "price_high": bar.high,
                 "prev_price_high": max_prev_high,
                 "delta_peak": round(latest_delta_peak, 2),
                 "prev_delta_peak": round(prev_delta_peak, 2),
@@ -111,7 +121,7 @@ class DivergenceDetector:
         return signal
 
     def _check_bullish_divergence(
-        self, candle: Candle, delta_troughs: list[tuple[int, float]]
+        self, bar: InfoBar, delta_troughs: list[tuple[int, float]], cd_range: float
     ) -> Optional[Signal]:
         """Price new low but delta trough is higher than previous."""
         if len(delta_troughs) < 2:
@@ -123,33 +133,34 @@ class DivergenceDetector:
             return None
 
         min_prev_low = min(prev_lows)
-        tick = self.config.min_price_new_extreme_ticks * 0.1
+        margin = min_prev_low * self.config.min_price_new_extreme_bps / 1e4
 
-        if candle.low > min_prev_low - tick:
+        if bar.low > min_prev_low - margin:
             return None
 
         latest_delta_trough = delta_troughs[-1][1]
         prev_delta_trough = delta_troughs[-2][1]
 
-        # Trough should be HIGHER (less negative) than previous — divergence
-        if latest_delta_trough <= prev_delta_trough * self.config.delta_failure_pct:
+        # Trough should be HIGHER than previous by a share of the window range — divergence
+        improvement = (latest_delta_trough - prev_delta_trough) / cd_range
+        if improvement < 1 - self.config.delta_failure_pct:
             return None
 
         strength = min(100.0, (
             30
-            + (1 - abs(latest_delta_trough) / max(abs(prev_delta_trough), 0.01)) * 40
-            + (min_prev_low - candle.low) / max(tick, 0.01) * 10
+            + improvement * 40
+            + (min_prev_low - bar.low) / max(margin, 1e-9) * 10
         ))
 
         signal = Signal(
-            timestamp_ms=candle.timestamp_ms,
+            timestamp_ms=bar.timestamp_ms,
             signal_type=SignalType.DIVERGENCE,
             direction=Side.BUY,   # Bullish divergence → weakening sellers
-            price_level=candle.low,
+            price_level=bar.low,
             strength=strength,
             details={
                 "type": "bullish_divergence",
-                "price_low": candle.low,
+                "price_low": bar.low,
                 "prev_price_low": min_prev_low,
                 "delta_trough": round(latest_delta_trough, 2),
                 "prev_delta_trough": round(prev_delta_trough, 2),

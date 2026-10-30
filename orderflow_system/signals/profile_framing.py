@@ -19,7 +19,7 @@ from enum import Enum
 from typing import Optional
 
 from orderflow_system.data.models import VolumeProfileResult, Side
-from orderflow_system.config.settings import BiasDirection, ProfileShape
+from orderflow_system.config.settings import BiasDirection, ProfileShape, VolumeProfileConfig
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,8 @@ class ProfileFramingEngine:
       - Failed auction / hook: price tries to break VA boundary, gets rejected
     """
 
-    def __init__(self):
+    def __init__(self, config: Optional[VolumeProfileConfig] = None):
+        self.config = config if config is not None else VolumeProfileConfig()
         self._profile_history: list[VolumeProfileResult] = []
         self._bias_history: list[DailyBias] = []
         self._max_history = 30
@@ -286,12 +287,9 @@ class ProfileFramingEngine:
         Fabio merges 2-3 day profiles when value areas overlap to get
         more precise VAL/VAH.
         """
-        from orderflow_system.analytics.volume_profile import (
-            VolumeProfileEngine,
-            VolumeProfileConfig,
-        )
+        from orderflow_system.analytics.volume_profile import VolumeProfileEngine
 
-        recent = self._profile_history[-3:]
+        recent = self._profile_history[-self.config.merge_max_days:] if self.config.merge_max_days > 1 else []
         if len(recent) < 2:
             return
 
@@ -309,7 +307,7 @@ class ProfileFramingEngine:
             return
 
         # Merge the overlapping profiles
-        engine = VolumeProfileEngine(VolumeProfileConfig())
+        engine = VolumeProfileEngine(self.config)
         merged = engine.merge_profiles(to_merge)
 
         bias.merged_vah = merged.vah

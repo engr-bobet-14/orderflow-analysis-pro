@@ -123,7 +123,7 @@ html, body {
     border: 1px solid var(--border);
 }
 
-.tf-btn, .range-btn {
+.range-btn {
     padding: 4px 10px;
     border: none;
     border-radius: 3px;
@@ -135,8 +135,8 @@ html, body {
     color: var(--text-secondary);
     transition: all 0.12s;
 }
-.tf-btn:hover, .range-btn:hover { background: var(--bg-panel); color: var(--text-primary); }
-.tf-btn.active, .range-btn.active { background: var(--border-active); color: #fff; }
+.range-btn:hover { background: var(--bg-panel); color: var(--text-primary); }
+.range-btn.active { background: var(--border-active); color: #fff; }
 
 .chart-btn {
     background: transparent;

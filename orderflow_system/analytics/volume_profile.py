@@ -1,8 +1,14 @@
 """
 Volume Profile Engine
-Computes POC, VAH, VAL, LVN, and profile shape classification from tick data.
+Computes POC, VAH, VAL, LVN, and profile shape classification.
+Two inputs, with different (and honestly labelled) price resolution:
+  - `compute_from_ticks`: real trade prices            -> source="ticks"
+  - `compute_from_bars`:  each info bar's volume placed at the bar's own VWAP
+    (dollar_value / volume), a genuine but coarse price axis -> source="bar_vwap".
+    Volume is NEVER spread across a bar's high-low range: that would invent
+    price-level volume the data does not contain.
 Implements Fabio's methodology:
-  - Cash session profiles (NY session only for US indices)
+  - Session profiles (BTC trades 24/7: one UTC-day session)
   - Multi-day profile merging
   - Profile shape: P-shape, b-shape, D-shape, double distribution
   - 68% value area rule
@@ -14,13 +20,13 @@ import numpy as np
 from collections import defaultdict
 from typing import Optional
 
-from orderflow_system.data.models import Tick, VolumeProfileResult, Candle
+from orderflow_system.data.models import Tick, VolumeProfileResult, InfoBar
 from orderflow_system.config.settings import VolumeProfileConfig
 
 
 class VolumeProfileEngine:
     """
-    Builds volume profiles from tick data or candles.
+    Builds volume profiles from tick data or info bars.
 
     Core logic from Fabio's teaching:
       - Volume at each price level → histogram
@@ -49,34 +55,21 @@ class VolumeProfileEngine:
 
         return self._compute_profile(dict(volume_at_price), session_date)
 
-    def compute_from_candles(
-        self, candles: list[Candle], session_date: str = ""
+    def compute_from_bars(
+        self, bars: list[InfoBar], session_date: str = ""
     ) -> VolumeProfileResult:
-        """Build volume profile from candle footprint data."""
-        if not candles:
-            return VolumeProfileResult(session_date=session_date)
+        """Build a volume profile from info bars, bucketing each bar's volume at its VWAP."""
+        if not bars:
+            return VolumeProfileResult(session_date=session_date, source="bar_vwap")
 
         volume_at_price: dict[float, float] = defaultdict(float)
         tick_size = self.config.tick_size
 
-        for candle in candles:
-            if candle.footprint:
-                for price, fp in candle.footprint.items():
-                    # Re-bucket footprint prices to VP tick_size
-                    rounded = round(round(price / tick_size) * tick_size, 10)
-                    volume_at_price[rounded] += fp.total_volume
-            else:
-                # Fallback: distribute candle volume evenly across OHLC range
-                low = round(round(candle.low / tick_size) * tick_size, 10)
-                high = round(round(candle.high / tick_size) * tick_size, 10)
-                n_levels = max(1, int((high - low) / tick_size) + 1)
-                vol_per_level = candle.volume / n_levels
-                price = low
-                while price <= high + tick_size / 2:
-                    volume_at_price[round(price, 10)] += vol_per_level
-                    price += tick_size
+        for bar in bars:
+            rounded = round(round(bar.vwap / tick_size) * tick_size, 10)
+            volume_at_price[rounded] += bar.volume
 
-        return self._compute_profile(dict(volume_at_price), session_date)
+        return self._compute_profile(dict(volume_at_price), session_date, source="bar_vwap")
 
     def merge_profiles(
         self, profiles: list[VolumeProfileResult]
@@ -98,25 +91,27 @@ class VolumeProfileEngine:
             for price, vol in vp.volume_at_price.items():
                 merged_vap[price] += vol
 
+        sources = {vp.source for vp in profiles}
         result = self._compute_profile(
             dict(merged_vap),
             session_date=f"{dates[0]}_to_{dates[-1]}",
+            source=sources.pop() if len(sources) == 1 else "mixed",
         )
         return result
 
     def _compute_profile(
-        self, volume_at_price: dict[float, float], session_date: str
+        self, volume_at_price: dict[float, float], session_date: str, source: str = "ticks"
     ) -> VolumeProfileResult:
         """Core computation: POC, Value Area, LVN, shape."""
         if not volume_at_price:
-            return VolumeProfileResult(session_date=session_date)
+            return VolumeProfileResult(session_date=session_date, source=source)
 
         prices = sorted(volume_at_price.keys())
         volumes = np.array([volume_at_price[p] for p in prices])
         total_volume = float(volumes.sum())
 
         if total_volume == 0:
-            return VolumeProfileResult(session_date=session_date)
+            return VolumeProfileResult(session_date=session_date, source=source)
 
         # ── POC: price with maximum volume ──
         poc_idx = int(np.argmax(volumes))
@@ -141,6 +136,7 @@ class VolumeProfileEngine:
             lvn_levels=lvn_levels,
             shape=shape,
             poc_position_pct=poc_pct,
+            source=source,
         )
 
     def _compute_value_area(

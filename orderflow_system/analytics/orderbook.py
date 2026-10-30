@@ -9,12 +9,12 @@ Maintains real-time L2 orderbook state and detects structural features:
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
 from orderflow_system.data.models import OrderbookSnapshot, OrderbookLevel
+from orderflow_system.utils.clock import Clock, RealClock
 
 
 @dataclass
@@ -55,8 +55,12 @@ class OrderbookTracker:
       - Tracking level consumption reveals how aggressive orders eat the book
     """
 
-    def __init__(self, thin_threshold: float = 10.0, max_consumption_history: int = 200):
+    def __init__(
+        self, thin_threshold: float = 10.0, max_consumption_history: int = 200,
+        clock: Optional[Clock] = None,
+    ):
         self.thin_threshold = thin_threshold
+        self._clock = clock if clock is not None else RealClock()
         self._prev_snapshot: Optional[OrderbookSnapshot] = None
         self._consumption_history: deque[LevelConsumption] = deque(
             maxlen=max_consumption_history
@@ -173,14 +177,16 @@ class OrderbookTracker:
                 ))
 
     def get_recent_consumptions(
-        self, time_window_ms: int = 5000, side: Optional[str] = None
+        self, time_window_ms: int = 5000, side: Optional[str] = None,
+        clock: Optional[Clock] = None,
     ) -> list[LevelConsumption]:
         """
         Get recent level consumptions within a time window.
         Used by sweep detector to count how many levels were eaten recently.
+        A detector may pass its event clock without changing this tracker's clock.
         """
-        now = int(time.time() * 1000)
-        cutoff = now - time_window_ms
+        query_clock = clock if clock is not None else self._clock
+        cutoff = query_clock.now_ms() - time_window_ms
         result = [
             c for c in self._consumption_history
             if c.timestamp_ms >= cutoff
@@ -190,17 +196,19 @@ class OrderbookTracker:
         return result
 
     def count_swept_levels(
-        self, time_window_ms: int = 3000, side: Optional[str] = None
+        self, time_window_ms: int = 3000, side: Optional[str] = None,
+        clock: Optional[Clock] = None,
     ) -> int:
         """Count distinct price levels consumed within time window."""
-        consumptions = self.get_recent_consumptions(time_window_ms, side)
+        consumptions = self.get_recent_consumptions(time_window_ms, side, clock)
         return len(set(c.price for c in consumptions))
 
     def total_consumed_volume(
-        self, time_window_ms: int = 3000, side: Optional[str] = None
+        self, time_window_ms: int = 3000, side: Optional[str] = None,
+        clock: Optional[Clock] = None,
     ) -> float:
         """Total volume consumed from the book within time window."""
-        consumptions = self.get_recent_consumptions(time_window_ms, side)
+        consumptions = self.get_recent_consumptions(time_window_ms, side, clock)
         return sum(c.consumed_quantity for c in consumptions)
 
     @property
