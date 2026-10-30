@@ -146,7 +146,8 @@ Research software; not financial advice.
 
 Install the research dependencies with `python -m pip install -e '.[tuning]'`, then
 run `python scripts/optimize_orderflow.py --help`. The runner ports notebook 02's
-six parameter dimensions without changing the pipeline or the notebooks:
+six parameter dimensions, plus the absorption/initiative thresholds and the fallback
+stop width and target R:R, without changing the pipeline defaults or the notebooks:
 
 ```bash
 python scripts/optimize_orderflow.py \
@@ -199,32 +200,46 @@ stop-loss sizing, a 0.05% minimum stop distance, and notional capped at equity.
 Default costs are 5 bps taker fee and 1 bp slippage per side; `--fee-bps` and
 `--slippage-bps` are part of study identity. There are no capital or risk flags.
 
-The objective is mean daily-return Sharpe (365 periods) across RiskLabAI
-`PurgedKFold` blocks on the search segment. One causal replay per trial produces
+The objective is mean daily-return Sharpe (365 periods) across five
+chronological, equal-bar-count blocks of the search segment (no model is fitted, so
+nothing is purged). One causal replay per trial produces
 the same closed trades and sizing as the notebook's repeated prefix replays.
 Each fold selects trades by **exit** sequence; entries may precede its scoring
 window, and open trades at its end stay open. Accounting compounds over the
-prefix, while each fold's metrics use a $5,000 anchor. The daily metric anchor
+prefix, and each fold's daily returns start from the **account equity at the
+fold's start** (the equity after the last trade that exited earlier, $5,000 for
+the first fold), so returns agree with the position sizing; a fold that opens with
+a depleted account is infeasible. (Earlier versions re-anchored every fold at
+$5,000, which could report returns below -100%; the study identity is versioned
+`continuous_equity_anchor_v2`.) The daily metric anchor
 is on the day before the scored window, and daily equity extends through its
 last day: this fixes the notebook's loss of day-one PnL and includes trailing
 flat days. Undefined metrics become JSON null with a status; a no-loss profit
-factor has status `no_losses`. Fewer than `--min-trades-per-fold` trades (default
-2), account depletion or non-finite Sharpe penalise that fold at -5. Raising the
-minimum is advisable because daily Sharpe from very few trades is noisy.
+factor has status `no_losses`.
 
-This is a rule-based strategy with no fitted training set. Point-in-time
-information ranges make purging a no-op; the training complement is unused
-except to describe strictly past context. As in notebook 02, `--embargo` (default
+The objective is two-tier. A trial is feasible when all folds exist and each has
+at least `--min-trades-per-fold` trades (default 2), no account depletion and a
+finite Sharpe, and the pooled trades reach `--min-total-trades` (default 0). A
+feasible trial scores the day-weighted mean fold Sharpe (floored at -50); an
+infeasible one scores `-100 + 49 * progress`, so no infeasible trial can outrank a
+feasible one. The reported best is the best feasible trial; with none,
+`best_degenerate` is true. The provisional floors for `fixed_tick_imbalance` are
+105 pooled and 11 per fold: a guard against starved folds, not a significance
+test. Daily Sharpe from very few trades is noisy.
+
+This is a rule-based strategy with no fitted training set. The folds are
+chronological sub-periods of one continuous replay; nothing is purged and the
+bars before a fold serve only as past context. As in notebook 02, `--embargo` (default
 0.02) is repurposed as a **scoring blackout** at each test block's start, rather
 than AFML's exclusion of future training observations. Fold zero starts cold;
 exit attribution and continuous equity make adjacent folds weakly dependent.
-Best CV performance is optimistically biased because those folds were used
-for tuning. CPCV, PBO, nested CV and RiskLabAI's estimator-based HPO wrapper
+Fold scores are in-sample for the tuned parameters and optimistically biased;
+the only out-of-sample evidence is 2024+ data (see USAGE.md, dataset policy). CPCV, PBO, nested CV and RiskLabAI's estimator-based HPO wrapper
 are intentionally not used.
 
 The chronological tail (`--holdout-fraction 0.2`, or 0 to disable) is never
 replayed during search. Add `--evaluate-holdout` for an explicit replay
-with the best trial having at least one unpenalised fold. The holdout starts
+with the best feasible trial. The holdout starts
 scoring after `int(N * embargo)` tail bars; impossible CV/holdout geometry is
 refused before trials. Each evaluation gets a distinct timestamp/UUID study
 attribute and is retained in JSON history, including `prior_evaluations` and the
@@ -235,14 +250,18 @@ end-to-end validation: `bar_construction_independent: false` and the upstream
 hyperparameters/configuration/creation/git metadata are preserved. Time bars
 have no calibrated construction parameters.
 
-Holdout daily returns feed RiskLabAI's `deflated_sharpe_gate`. Its multiplicity
-is all COMPLETE trials in this study; its dispersion is the sample standard
-deviation of finite raw daily Sharpes from COMPLETE trials with unpenalised folds.
-Insufficient or zero dispersion produces `passes: null`, `status: indeterminate`.
+Holdout daily returns feed RiskLabAI's `deflated_sharpe_gate` as a **diagnostic
+only**, never a selection criterion. It is evaluated at two multiplicities, all
+COMPLETE trials in this study and all COMPLETE trials for the symbol across studies
+(`sensitivity`); the dispersion is the sample standard deviation of finite raw daily
+Sharpes from the same trials with unpenalised folds. If the two disagree, `passes`
+is `null`. Insufficient or zero dispersion produces `passes: null`,
+`status: indeterminate`. `n_nonzero_days`, skew and excess kurtosis are reported
+beside it because mostly-zero daily returns strain the gate's assumptions.
 Holdouts below the minimum trade count, with account depletion or with non-finite
 Sharpe also receive an indeterminate gate and an explicit reason.
-This does not count searches on other symbols, bar types or identities, and
-repeated holdout evaluation after more tuning erodes holdout independence.
+The effective number of independent trials is unknown (many trials differ only
+in the score threshold), and repeated holdout evaluation after more tuning erodes holdout independence.
 
 SQLite initialization has a database-wide lock. Optimization and holdout have
 a non-blocking study admission lock: a second invocation for the same study

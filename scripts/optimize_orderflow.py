@@ -20,6 +20,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import re
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from orderflow_system.data.infobar_feed import open_bars
 from orderflow_system.data.models import BarType, InfoBar
 from orderflow_system.ledger import TradeLedger
 from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest
+from scripts.dataset_policy import DEV_END
 
 
 def json_safe(value):
@@ -306,14 +308,25 @@ INITIAL_CAPITAL_USD = 5000.0
 RISK_PER_TRADE_PCT = 0.01
 MIN_STOP_LOSS_PCT = 0.0005
 ANNUALIZATION_PERIODS = 365
-PENALTY_SHARPE = -5.0
+# Two-tier objective: every infeasible trial scores in [INFEASIBLE_BASE, FEASIBLE_FLOOR) and every
+# feasible trial scores >= FEASIBLE_FLOOR, so no infeasible trial can outrank a feasible one.
+INFEASIBLE_BASE = -100.0
+FEASIBLE_FLOOR = -50.0
+OBJECTIVE_VERSION = "two_tier_day_weighted_v2"
+ACCOUNTING_VERSION = "continuous_equity_anchor_v2"   # fold returns start from the account equity at the fold start
 SEARCH_SPACE_BOUNDS = {
-    "price_proximity_pct": (0.0005, 0.02, "float_log"),
+    "price_proximity_pct": (0.0005, 0.005, "float_log"),
     "min_composite_score": (10.0, 70.0, "float"),
     "signal_cooldown_seconds": (5.0, 120.0, "float"),
     "volume_decline_pct": (0.05, 0.6, "float"),
     "lookback_bars": (5, 30, "int"),
     "delta_failure_pct": (0.5, 0.95, "float"),
+    "absorption_min_delta_pct": (0.20, 0.60, "float"),
+    "initiative_min_delta_pct": (0.20, 0.60, "float"),
+    "initiative_min_body_bps": (1.0, 8.0, "float_log"),
+    "initiative_volume_acceleration_min": (1.0, 3.0, "float"),
+    "default_stop_pct": (0.001, 0.01, "float_log"),
+    "target_rr": (1.0, 4.0, "float"),
 }
 
 
@@ -329,10 +342,27 @@ def build_instrument_config(params, symbol="BTCUSDT"):
     base = instrument_config(symbol)
     return replace(base,
         risk=replace(base.risk, min_composite_score=params["min_composite_score"],
-                     signal_cooldown_seconds=params["signal_cooldown_seconds"]),
+                     signal_cooldown_seconds=params["signal_cooldown_seconds"],
+                     default_stop_pct=params["default_stop_pct"],
+                     default_target_pct=params["default_stop_pct"] * params["target_rr"]),
         exhaustion=replace(base.exhaustion, volume_decline_pct=params["volume_decline_pct"]),
         divergence=replace(base.divergence, lookback_bars=params["lookback_bars"],
-                           delta_failure_pct=params["delta_failure_pct"]))
+                           delta_failure_pct=params["delta_failure_pct"]),
+        absorption=replace(base.absorption, min_delta_pct=params["absorption_min_delta_pct"]),
+        initiative=replace(base.initiative, min_delta_pct=params["initiative_min_delta_pct"],
+                           min_body_bps=params["initiative_min_body_bps"],
+                           volume_acceleration_min=params["initiative_volume_acceleration_min"]))
+
+
+def baseline_extra_params(symbol="BTCUSDT"):
+    """Baseline values of the dimensions added after the first study, for replaying older trials."""
+    base = instrument_config(symbol)
+    return {"absorption_min_delta_pct": base.absorption.min_delta_pct,
+            "initiative_min_delta_pct": base.initiative.min_delta_pct,
+            "initiative_min_body_bps": base.initiative.min_body_bps,
+            "initiative_volume_acceleration_min": base.initiative.volume_acceleration_min,
+            "default_stop_pct": base.risk.default_stop_pct,
+            "target_rr": base.risk.default_target_pct / base.risk.default_stop_pct}
 
 
 def suggest_params(trial, space=None):
@@ -449,21 +479,24 @@ def compute_profit_factor(trades):
     return float(gains / losses) if losses else None
 
 
-def build_cv_folds(bars, n_splits=5, embargo=0.02):
-    from RiskLabAI.backtest.validation.purged_kfold import PurgedKFold
-    sequence = pd.Index(bars.array["seq"] if isinstance(bars, CachedBars) else [bar.seq for bar in bars])
-    if not sequence.is_unique or not sequence.is_monotonic_increasing:
+def build_chronological_folds(bars, n_splits=5, embargo=0.02):
+    """Contiguous equal-bar-count blocks of one chronological replay.
+
+    No model is fitted, so nothing is purged. `embargo` is the fraction of bars at the start of each
+    block that is replayed (warm-up, open-trade carryover) but not scored. `context_idx` is every
+    bar before the block.
+    """
+    sequence = np.asarray(bars.array["seq"] if isinstance(bars, CachedBars) else [bar.seq for bar in bars])
+    if len(sequence) > 1 and not (np.diff(sequence) > 0).all():
         raise ValueError("seq must be unique and strictly increasing")
     if len(bars) < n_splits:
         raise ValueError(f"Search segment N={len(bars)} is smaller than n_splits={n_splits}")
-    times = pd.Series(sequence.to_numpy(), index=sequence)
     folds = []
-    splitter = PurgedKFold(n_splits=n_splits, times=times, embargo=embargo)
-    for train, test in splitter.split(pd.DataFrame(index=sequence)):
+    for test in np.array_split(np.arange(len(bars)), n_splits):
         start = int(test.min()) + int(len(bars) * embargo)
         if start > int(test.max()):
             raise ValueError("Embargo consumed the fold; use a longer research window or lower embargo")
-        folds.append({"context_idx": train[train < test.min()], "test_idx": test, "score_start_idx": start})
+        folds.append({"context_idx": np.arange(0, test.min()), "test_idx": test, "score_start_idx": start})
     return folds
 
 
@@ -474,24 +507,65 @@ def split_timeline(bars, args):
         raise ValueError(f"N={n}: holdout bars={holdout} must exceed holdout blackout bars={blackout}")
     n_search = n - holdout
     try:
-        folds = build_cv_folds(bars[:n_search], args.n_splits, args.embargo)
+        folds = build_chronological_folds(bars[:n_search], args.n_splits, args.embargo)
     except ValueError as exc:
         raise ValueError(f"N={n}, holdout bars={holdout}, blackout bars={blackout}: {exc}") from exc
     return n_search, folds
 
 
+def fold_feasible(metrics, min_trades):
+    return (metrics["n_trades"] >= min_trades and not metrics["account_blown"]
+            and math.isfinite(metrics["sharpe_ratio"]))
+
+
+def fold_progress(metrics, min_trades):
+    """0 for a blown or non-finite fold, else the share of the per-fold trade floor reached."""
+    if metrics["account_blown"] or not math.isfinite(metrics["sharpe_ratio"]):
+        return 0.0
+    return min(metrics["n_trades"] / min_trades, 1.0)
+
+
+def trial_score(results, n_splits, min_trades, min_total_trades):
+    """(objective value, feasible). Feasible: all folds present, each feasible, pooled floor met."""
+    total = sum(r["n_trades"] for r in results)
+    feasible = (len(results) == n_splits and all(fold_feasible(r, min_trades) for r in results)
+                and total >= min_total_trades)
+    if feasible:
+        mean = float(np.average([r["sharpe_ratio"] for r in results], weights=[r["n_days"] for r in results]))
+        return max(FEASIBLE_FLOOR, mean), True
+    progress = sum(fold_progress(r, min_trades) for r in results) / n_splits
+    if min_total_trades:
+        progress = min(progress, total / min_total_trades)
+    return INFEASIBLE_BASE + (FEASIBLE_FLOOR - 1 - INFEASIBLE_BASE) * min(progress, 1.0), False
+
+
+def window_start_equity(full, first_seq):
+    """Account equity when the window opens: equity after the last trade that exited earlier, else the initial capital."""
+    prior = full.loc[full["exit_seq"] < first_seq, "equity_after"]
+    return float(prior.iloc[-1]) if len(prior) else INITIAL_CAPITAL_USD
+
+
 def score_window(full, bars, start, end, min_trades):
+    """Metrics for trades exiting in [start, end]. Trades were sized on the continuous account, so the daily
+    returns start from the equity at the window open, not from a fresh $5,000."""
     trades = full.loc[full["exit_seq"].between(bars[start].seq, bars[end].seq)].reset_index(drop=True)
     first, last = [pd.Timestamp(bars[i].timestamp_ms, unit="ms", tz="UTC") for i in (start, end)]
-    metrics = compute_financial_metrics(trades, start_ts=first, end_ts=last)
+    start_equity = window_start_equity(full, bars[start].seq)
+    if start_equity > 0:
+        metrics = compute_financial_metrics(trades, initial_capital=start_equity, start_ts=first, end_ts=last)
+    else:                                     # depleted before the window: returns are undefined
+        metrics = {"n_trades": len(trades), "total_pnl": float(trades["net_pnl"].sum()),
+                   "win_rate_pct": float((trades["net_pnl"] > 0).mean() * 100) if len(trades) else 0.0,
+                   "sharpe_ratio": math.nan, "sortino_ratio": math.nan, "max_drawdown_pct": math.nan}
+    metrics["start_equity"] = start_equity
     metrics["profit_factor"] = compute_profit_factor(trades)
     if metrics["profit_factor"] is None:
         metrics["profit_factor_status"] = "no_losses"
-    blown = bool((trades["equity_after"] <= 0).any())
-    score = metrics["sharpe_ratio"]
-    penalized = len(trades) < min_trades or blown or not math.isfinite(score)
-    return {**metrics, "account_blown": blown, "penalized": penalized,
-            "fold_sharpe": PENALTY_SHARPE if penalized else score,
+    blown = bool((trades["equity_after"] <= 0).any()) or start_equity <= 0
+    metrics["account_blown"] = blown
+    n_days = max(1, (last.floor("D") - first.floor("D")).days + 1)
+    return {**metrics, "penalized": not fold_feasible(metrics, min_trades),
+            "fold_sharpe": metrics["sharpe_ratio"], "n_days": n_days,
             "n_scored_bars": end - start + 1}, trades
 
 
@@ -511,11 +585,14 @@ def objective(trial, bars, folds, args):
                           params["price_proximity_pct"], bars[0].bar_type)
     full = simulate_trades_risk_based(result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     results = [evaluate_fold(fold, bars, params, args, full) for fold in folds]
-    scores = [r["fold_sharpe"] for r in results]
-    raw = [r["sharpe_ratio"] / np.sqrt(ANNUALIZATION_PERIODS) for r in results
-           if not r["penalized"] and math.isfinite(r["sharpe_ratio"])]
-    attrs = {"params": params, "fold_results": results, "cv_sharpe_mean": float(np.mean(scores)),
-             "cv_sharpe_std": float(np.std(scores)), "total_trades": sum(r["n_trades"] for r in results),
+    value, feasible = trial_score(results, args.n_splits, args.min_trades_per_fold, args.min_total_trades)
+    finite = [r for r in results if math.isfinite(r["sharpe_ratio"])]
+    raw = [r["sharpe_ratio"] / np.sqrt(ANNUALIZATION_PERIODS) for r in finite if not r["penalized"]]
+    attrs = {"params": params, "fold_results": results, "cv_sharpe_mean": value, "feasible": feasible,
+             "cv_sharpe_raw": float(np.average([r["sharpe_ratio"] for r in finite],
+                                               weights=[r["n_days"] for r in finite])) if finite else None,
+             "cv_sharpe_std": float(np.std([r["sharpe_ratio"] for r in finite])) if finite else None,
+             "total_trades": sum(r["n_trades"] for r in results),
              "n_scored_bars": sum(r["n_scored_bars"] for r in results), "n_bars_search": len(bars),
              "n_penalized_folds": sum(r["penalized"] for r in results),
              "raw_daily_sharpe": float(np.mean(raw)) if raw else None, "replay_digest": result["replay_digest"]}
@@ -557,7 +634,8 @@ def study_identity(args, metadata):
                 "instrument_defaults": asdict(instrument_config(args.symbol)),
                 "initial_capital_usd": INITIAL_CAPITAL_USD, "risk_per_trade_pct": RISK_PER_TRADE_PCT,
                 "min_stop_loss_pct": MIN_STOP_LOSS_PCT, "annualization_periods": ANNUALIZATION_PERIODS,
-                "penalty_sharpe": PENALTY_SHARPE, "fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps,
+                "objective": OBJECTIVE_VERSION, "accounting": ACCOUNTING_VERSION, "infeasible_base": INFEASIBLE_BASE,
+                "feasible_floor": FEASIBLE_FLOOR, "min_total_trades": args.min_total_trades, "fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps,
                 "n_splits": args.n_splits, "embargo": args.embargo,
                 "holdout_fraction": args.holdout_fraction, "min_trades_per_fold": args.min_trades_per_fold,
                 "seed": args.seed}
@@ -621,7 +699,7 @@ def worker_main(args, name, identity, cache_path, n_search, parent_pid, index):
         args.worker_index = index
         study = open_study(args, name, identity, index)
         bars = CachedBars(cache_path, args.bar_type, stop=n_search)
-        folds = build_cv_folds(bars, args.n_splits, args.embargo)
+        folds = build_chronological_folds(bars, args.n_splits, args.embargo)
         optimize_loop(study, bars, folds, args, parent_pid)
 
 
@@ -647,27 +725,73 @@ def run_workers(study, args, name, identity, cache_path, n_search):
             worker.join()
 
 
-def deflated_gate(study, returns, *, ineligible_reason=None):
+def campaign_trials(study_db, symbol):
+    """COMPLETE trials over every study of the symbol (all bar types and strategy fingerprints), read-only."""
+    empty = {"n_symbol_all_studies": 0, "n_dispersion_trials": 0, "trial_sharpe_std": None}
+    path = Path(study_db)
+    if not path.is_file():
+        return empty
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = con.execute("""select t.trial_id, a.value_json from trials t
+            join studies s on s.study_id = t.study_id
+            left join trial_user_attributes a on a.trial_id = t.trial_id and a.key = 'raw_daily_sharpe'
+            where t.state = 'COMPLETE' and s.study_name like ? escape '\\'""",
+                           (symbol.replace("_", "\\_") + "\\_\\_%",)).fetchall()
+    finally:
+        con.close()
+    raw = [v for v in (json.loads(r[1]) if r[1] is not None else None for r in rows)
+           if v is not None and math.isfinite(v)]
+    return {"n_symbol_all_studies": len(rows), "n_dispersion_trials": len(raw),
+            "trial_sharpe_std": float(np.std(raw, ddof=1)) if len(raw) >= 2 else None}
+
+
+def return_diagnostics(values):
+    """Distribution facts that strain the gate's assumptions (sparse daily returns are mostly zero)."""
+    from scipy.stats import kurtosis, skew
+    finite = len(values) >= 3 and np.isfinite(values).all() and np.std(values) > 0
+    return {"n_nonzero_days": int((values != 0).sum()),
+            "skew": float(skew(values)) if finite else None,
+            "excess_kurtosis": float(kurtosis(values)) if finite else None}
+
+
+def deflated_gate(study, returns, *, ineligible_reason=None, campaign=None):
+    """Deflated Sharpe at several trial counts. Diagnostic only: never a selection criterion."""
     from RiskLabAI.backtest.validation.leakage_aware_hpo import deflated_sharpe_gate
     trials = complete_trials(study)
     raw = [t.user_attrs.get("raw_daily_sharpe") for t in trials]
     raw = [s for s in raw if s is not None and math.isfinite(s)]
     std = float(np.std(raw, ddof=1)) if len(raw) >= 2 else None
-    counts = {"n_trials": len(trials), "n_dispersion_trials": len(raw), "trial_sharpe_std": std}
-    if ineligible_reason:
-        return json_safe({**counts, "passes": None, "status": "indeterminate", "reason": ineligible_reason})
-    if std is None or not math.isfinite(std) or std <= 0:
-        return json_safe({**counts, "passes": None, "status": "indeterminate",
-                          "reason": "Need at least two finite raw trial Sharpes with positive sample dispersion"})
     values = np.asarray(returns, dtype=float)
+    base = {"n_trials": len(trials), "n_dispersion_trials": len(raw), "trial_sharpe_std": std,
+            "diagnostic": True, "use": "diagnostic only; not a selection criterion",
+            **return_diagnostics(values), "sensitivity": []}
+    if ineligible_reason:
+        return json_safe({**base, "passes": None, "status": "indeterminate", "reason": ineligible_reason})
+    scopes = [("study", len(trials), std)]
+    if campaign and campaign["n_symbol_all_studies"] > 0:
+        scopes.append(("symbol_all_studies", campaign["n_symbol_all_studies"], campaign["trial_sharpe_std"]))
+    if all(sd is None or not math.isfinite(sd) or sd <= 0 for _, _, sd in scopes):
+        return json_safe({**base, "passes": None, "status": "indeterminate",
+                          "reason": "Need at least two finite raw trial Sharpes with positive sample dispersion"})
     if len(values) < 3 or not np.isfinite(values).all() or np.std(values) <= 0:
-        return {**counts, "passes": None, "status": "indeterminate", "reason": "Insufficient varying finite daily returns"}
-    gate = deflated_sharpe_gate(values, n_trials=len(trials), trial_sharpe_std=std)
-    if not math.isfinite(gate["deflated_sharpe"]):
-        gate.update(passes=None, status="indeterminate", reason="RiskLabAI returned a non-finite deflated Sharpe")
+        return json_safe({**base, "passes": None, "status": "indeterminate",
+                          "reason": "Insufficient varying finite daily returns"})
+    entries = []
+    for scope, n, sd in scopes:
+        if sd is None or not math.isfinite(sd) or sd <= 0:
+            continue
+        gate = deflated_sharpe_gate(values, n_trials=n, trial_sharpe_std=sd)
+        if not math.isfinite(gate["deflated_sharpe"]):
+            gate = {**gate, "passes": None}
+        entries.append({**gate, "scope": scope, "n_trials": n, "trial_sharpe_std": sd})
+    verdicts = {e["passes"] for e in entries}
+    if not entries or None in verdicts:
+        passes, status = None, "indeterminate"
     else:
-        gate["status"] = "evaluated"
-    return json_safe({**gate, **counts})
+        passes, status = (verdicts.pop() if len(verdicts) == 1 else None), "evaluated"
+    return json_safe({**entries[0], **base, "sensitivity": entries, "passes": passes, "status": status}
+                     if entries else {**base, "passes": None, "status": "indeterminate"})
 
 
 def evaluate_holdout(study, bars, n_search, args):
@@ -676,15 +800,14 @@ def evaluate_holdout(study, bars, n_search, args):
         print("Warning: repeated looks erode holdout independence "
               f"({prior_evaluations} prior evaluations)")
     trials = complete_trials(study)
-    candidates = [t for t in trials
-                  if t.user_attrs.get("n_penalized_folds", args.n_splits) < args.n_splits]
+    candidates = [t for t in trials if t.user_attrs.get("feasible") is True]
     independent = args.bar_type == "time_1m"
     base = {"prior_evaluations": prior_evaluations, "trials_at_evaluation": len(trials),
             "bar_construction_independent": independent,
             "caveat": ("Time bars have no calibrated construction parameters" if independent else
                        "Conditional on bars calibrated on the full history; not independent end-to-end validation")}
     if not candidates:
-        return {**base, "status": "not_evaluated", "reason": "No non-all-penalized trial"}
+        return {**base, "status": "not_evaluated", "reason": "no feasible trial to evaluate"}
     best = max(candidates, key=lambda t: t.value)
     replay = run_backtest(bars, build_instrument_config(best.params, args.symbol),
                            best.params["price_proximity_pct"], bars[0].bar_type)
@@ -692,7 +815,8 @@ def evaluate_holdout(study, bars, n_search, args):
     start = n_search + int(len(bars) * args.embargo)
     metrics, trades = score_window(full, bars, start, len(bars) - 1, args.min_trades_per_fold)
     returns = daily_returns(trades, pd.Timestamp(bars[start].timestamp_ms, unit="ms", tz="UTC"),
-                             pd.Timestamp(bars[-1].timestamp_ms, unit="ms", tz="UTC"))
+                             pd.Timestamp(bars[-1].timestamp_ms, unit="ms", tz="UTC"),
+                             initial_capital=metrics["start_equity"] if metrics["start_equity"] > 0 else INITIAL_CAPITAL_USD)
     reasons = []
     if metrics["n_trades"] < args.min_trades_per_fold:
         reasons.append("Holdout trade count is below min_trades_per_fold")
@@ -703,7 +827,9 @@ def evaluate_holdout(study, bars, n_search, args):
     return json_safe({**base, **metrics, "status": "evaluated", "trial_number": best.number,
                       "n_bars": len(bars) - n_search, "replay_digest": replay["replay_digest"],
                       "daily_returns": [{"day": str(day.date()), "return": float(r)} for day, r in returns.items()],
-                      "deflated_sharpe_gate": deflated_gate(study, returns, ineligible_reason="; ".join(reasons))})
+                      "deflated_sharpe_gate": deflated_gate(
+                          study, returns, ineligible_reason="; ".join(reasons),
+                          campaign=campaign_trials(args.study_db, args.symbol))})
 
 
 def git_state():
@@ -717,13 +843,16 @@ def git_state():
 
 def study_result(study, args, metadata, identity):
     trials = complete_trials(study)
-    best = max(trials, key=lambda t: t.value) if trials else None
-    best_degenerate = best is not None and best.user_attrs.get("n_penalized_folds") == args.n_splits
+    feasible = [t for t in trials if t.user_attrs.get("feasible") is True]
+    best = max(feasible, key=lambda t: t.value) if feasible else None
+    best_degenerate = bool(trials) and best is None
+    best_infeasible = max(trials, key=lambda t: t.value).number if best_degenerate else None
     if best_degenerate:
-        print(f"Warning: {study.study_name}: reported best trial has all folds penalised")
+        print(f"Warning: {study.study_name}: no feasible trial; best_* fields are empty")
     return json_safe({"study_name": study.study_name, "symbol": args.symbol, "bar_type": args.bar_type,
         "best_params": best.params if best else None, "best_objective": best.value if best else None,
         "best_trial_number": best.number if best else None, "best_degenerate": best_degenerate,
+        "best_infeasible_trial_number": best_infeasible,
         "n_scored_bars": best.user_attrs["n_scored_bars"] if best else 0,
         "total_trades": best.user_attrs["total_trades"] if best else 0,
         "best_trial_attrs": best.user_attrs if best else {},
@@ -732,12 +861,13 @@ def study_result(study, args, metadata, identity):
         "identity": identity, "dataset": metadata, "seed": args.seed, "versions": study.user_attrs["versions"],
         "git": git_state(), "holdout_history": {key: value for key, value in study.user_attrs.items()
                                                  if key.startswith("holdout::")},
-        "limitations": ["point-in-time purge is a no-op; no fitted training set",
-                         "embargo is a scoring blackout; outcomes attributed by exit bar; no forced liquidation",
-                         "cold fold 0; compounded prefix sizing; metrics anchored at $5000 per scored window",
-                         "tuned CV is optimistically biased; adjacent folds are weakly dependent",
-                         "DSR multiplicity counts only this study; repeated holdout evaluation erodes independence",
-                         "small trade counts give noisy daily Sharpe",
+        "limitations": ["folds are chronological sub-periods of one continuous replay; no model is fitted, so nothing is purged",
+                         "the scoring blackout is a warm-up at the start of each fold, not an AFML post-test embargo; outcomes attributed by exit bar; no forced liquidation",
+                         "fold scores are in-sample with respect to the tuned hyperparameters; only 2024+ data is out-of-sample",
+                         "the 20% pseudo-holdout is an internal selection check inside 2019-2023, not the policy's out-of-sample set",
+                         "deflated Sharpe is diagnostic only: effective trial count and return-distribution assumptions are unverified",
+                         "cold fold 0; compounded prefix sizing; fold returns start from the continuous account equity at the fold start",
+                         "small trade counts give noisy daily Sharpe; the trade floors are a starved-fold guard, not a significance test",
                          "parallel proposals depend on completion order; target overshoot <= n_jobs-1"]})
 
 
@@ -788,6 +918,13 @@ def positive_int(value):
     n = int(value)
     if n <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
+
+
+def nonnegative_int(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
     return n
 
 
@@ -852,6 +989,8 @@ def build_parser():
     parser.add_argument("--end-date", type=date.fromisoformat, default=os.getenv("END_DATE", "2023-12-31"), help="inclusive UTC day")
     for flag, default in (("n-trials", 50), ("n-jobs", 1), ("n-splits", 5), ("min-trades-per-fold", 2)):
         parser.add_argument("--" + flag, type=positive_int, default=default)
+    parser.add_argument("--min-total-trades", type=nonnegative_int, default=0,
+                        help="pooled trade floor across all folds; a trial below it is infeasible")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--embargo", type=fraction, default=0.02)
     parser.add_argument("--holdout-fraction", type=fraction, default=0.2)
@@ -876,6 +1015,9 @@ def main(argv=None):
             setattr(args, name, getattr(args, name).expanduser().resolve())
         if args.start_date > args.end_date:
             raise ValueError("start-date must not be after end-date")
+        if args.end_date > DEV_END:
+            print(f"Warning: end-date is after {DEV_END}; 2024+ is reserved for out-of-sample validation "
+                  "(dataset policy)", file=sys.stderr)
         if args.n_splits < 2:
             raise ValueError("n-splits must be >= 2")
         if not 0 <= args.seed <= 2**32 - 1:

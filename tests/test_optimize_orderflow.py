@@ -87,7 +87,8 @@ def test_help_defaults_and_env(monkeypatch):
     args = p.parse_args([])
     assert args.bar_type == [b.value for b in BarType]
     assert args.symbol == ["BTCUSDT"]
-    assert len(opt.SEARCH_SPACE_BOUNDS) == 6
+    assert len(opt.SEARCH_SPACE_BOUNDS) == 12
+    assert (args.min_trades_per_fold, args.min_total_trades) == (2, 0)
     assert not any("risk" in k or "capital" in k for k in opt.SEARCH_SPACE_BOUNDS)
     monkeypatch.setenv("START_DATE", "2023-01-02")
     monkeypatch.setenv("END_DATE", "2023-02-03")
@@ -122,9 +123,12 @@ def notebook_namespace():
 
 
 def params():
-    return {"price_proximity_pct": .01, "min_composite_score": 10,
+    return {"price_proximity_pct": .004, "min_composite_score": 10,
             "signal_cooldown_seconds": 5, "volume_decline_pct": .3,
-            "lookback_bars": 5, "delta_failure_pct": .7}
+            "lookback_bars": 5, "delta_failure_pct": .7,
+            "absorption_min_delta_pct": .35, "initiative_min_delta_pct": .35,
+            "initiative_min_body_bps": 3.0, "initiative_volume_acceleration_min": 1.5,
+            "default_stop_pct": .003, "target_rr": 2.0}
 
 
 def test_sizing_and_costs_match_notebook(tmp_path):
@@ -187,7 +191,7 @@ def test_all_winning_metrics_serialize():
 
 def assert_prefix_parity(bars, args):
     p = params()
-    folds = opt.build_cv_folds(bars, 3, .02)
+    folds = opt.build_chronological_folds(bars, 3, .02)
     ends = {int(f["test_idx"].max()) for f in folds}
     whole = opt.run_backtest(bars, opt.build_instrument_config(p), p["price_proximity_pct"],
                              bars[0].bar_type, prefix_ends=ends)
@@ -214,7 +218,11 @@ def assert_prefix_parity(bars, args):
         end_day = pd.Timestamp(bars[end].timestamp_ms, unit="ms", tz="UTC").floor("D")
         if len(scored) and scored.exit_time.max().floor("D") == end_day:
             shifted = pd.Timestamp(bars[start].timestamp_ms, unit="ms", tz="UTC") - pd.Timedelta(days=1)
-            metrics = ns["compute_financial_metrics"](scored, start_ts=shifted)
+            # Corrected oracle: the notebook's own function, anchored on the account equity at the fold start.
+            prior = all_trades.loc[all_trades.exit_seq < bars[start].seq, "equity_after"]
+            start_equity = float(prior.iloc[-1]) if len(prior) else opt.INITIAL_CAPITAL_USD
+            assert actual["start_equity"] == start_equity
+            metrics = ns["compute_financial_metrics"](scored, initial_capital=start_equity, start_ts=shifted)
             for key in ("sharpe_ratio", "sortino_ratio", "max_drawdown_pct"):
                 assert actual[key] == pytest.approx(metrics[key], nan_ok=True)
         assert all(fold["context_idx"] < fold["test_idx"].min())
@@ -242,9 +250,9 @@ def test_fold_validation_and_holdout_rounding(tmp_path):
     with pytest.raises(ValueError, match="holdout bars=2.*blackout bars=3"):
         opt.split_timeline(bars, args)
     with pytest.raises(ValueError, match="consumed"):
-        opt.build_cv_folds(bars, 5, .2)
+        opt.build_chronological_folds(bars, 5, .2)
     with pytest.raises(ValueError, match="strictly increasing"):
-        opt.build_cv_folds([bars[0], bars[0]], 2, 0)
+        opt.build_chronological_folds([bars[0], bars[0]], 2, 0)
 
 
 class CaptureTrial:
@@ -691,13 +699,16 @@ def test_dsr_raw_trial_dispersion_and_gate_wiring(tmp_path, monkeypatch):
 def test_objective_raw_sharpe_excludes_penalties(tmp_path, monkeypatch):
     args = args_for(tmp_path)
     bars = synth_bars(30)
-    folds = opt.build_cv_folds(bars, 3, .02)
-    results = iter([{"fold_sharpe": -5., "sharpe_ratio": 40., "penalized": True, "n_trades": 1, "n_scored_bars": 10},
-                    {"fold_sharpe": 2., "sharpe_ratio": 2., "penalized": False, "n_trades": 3, "n_scored_bars": 10},
-                    {"fold_sharpe": 4., "sharpe_ratio": 4., "penalized": False, "n_trades": 3, "n_scored_bars": 10}])
+    folds = opt.build_chronological_folds(bars, 3, .02)
+    base = {"account_blown": False, "n_scored_bars": 10, "n_days": 10}
+    results = iter([{**base, "sharpe_ratio": 40., "penalized": True, "n_trades": 1},
+                    {**base, "sharpe_ratio": 2., "penalized": False, "n_trades": 3},
+                    {**base, "sharpe_ratio": 4., "penalized": False, "n_trades": 3}])
     monkeypatch.setattr(opt, "evaluate_fold", lambda *a, **kw: next(results))
     trial = CaptureTrial()
-    assert opt.objective(trial, bars, folds, args) == pytest.approx(1/3)
+    # fold 1 has 1 < 2 trades, so the trial is infeasible: tier score -100 + 49 * mean(1/2, 1, 1)
+    assert opt.objective(trial, bars, folds, args) == pytest.approx(-100 + 49 * (0.5 + 1 + 1) / 3)
+    assert trial.user_attrs["feasible"] is False
     assert trial.user_attrs["raw_daily_sharpe"] == pytest.approx(3/np.sqrt(365))
 
 
@@ -711,7 +722,7 @@ def test_holdout_all_winning_and_history_merge(tmp_path, monkeypatch):
         distributions={k: optuna.distributions.IntDistribution(5,30) if k=="lookback_bars" else
                        optuna.distributions.FloatDistribution(opt.SEARCH_SPACE_BOUNDS[k][0], opt.SEARCH_SPACE_BOUNDS[k][1],
                                                              log=opt.SEARCH_SPACE_BOUNDS[k][2]=="float_log") for k in params()},
-        user_attrs={"n_penalized_folds": 0, "raw_daily_sharpe": .1}))
+        user_attrs={"n_penalized_folds": 0, "feasible": True, "raw_daily_sharpe": .1}))
     full = trade_table([10.,20.], [pd.Timestamp(bars[i].timestamp_ms, unit="ms", tz="UTC") for i in (85,95)])
     full["exit_seq"] = [bars[i].seq for i in (85,95)]
     full["equity_after"] = [5010.,5030.]
@@ -748,9 +759,9 @@ def test_ineligible_holdout_gate_is_indeterminate(tmp_path, monkeypatch, overrid
                      for k, (lo, hi, kind) in opt.SEARCH_SPACE_BOUNDS.items()}
     for raw in (.1, .3):
         study.add_trial(optuna.trial.create_trial(value=1., params=params(), distributions=distributions,
-                        user_attrs={"n_penalized_folds": 0, "raw_daily_sharpe": raw}))
+                        user_attrs={"n_penalized_folds": 0, "feasible": True, "raw_daily_sharpe": raw}))
     trades = trade_table([10., -5.], [pd.Timestamp(bars[i].timestamp_ms, unit="ms", tz="UTC") for i in (85,95)])
-    metrics = {"n_trades": 2, "sharpe_ratio": 1., "account_blown": False, **overrides}
+    metrics = {"n_trades": 2, "sharpe_ratio": 1., "account_blown": False, "start_equity": 5000., **overrides}
     monkeypatch.setattr(opt, "run_backtest", lambda *a, **kw: {"ledger": None, "replay_digest": "digest"})
     monkeypatch.setattr(opt, "simulate_trades_risk_based", lambda *a, **kw: trades)
     monkeypatch.setattr(opt, "score_window", lambda *a, **kw: (metrics, trades))
@@ -812,6 +823,7 @@ def test_repeated_holdout_warns_and_records_counts(tmp_path, monkeypatch, capsys
     def eligible(trial, *a):
         value = original(trial, *a)
         trial.set_user_attr("n_penalized_folds", 0)
+        trial.set_user_attr("feasible", True)
         return value
     monkeypatch.setattr(opt, "objective", eligible)
     argv = cli_args(tmp_path) + ["--evaluate-holdout"]
@@ -856,20 +868,24 @@ def test_info_study_without_duckdb_metadata(tmp_path, monkeypatch):
     assert {"optuna", "RiskLabAI", "quantstats", "pandas", "numpy"} <= resumed["versions"].keys()
 
 
-@pytest.mark.parametrize("n_penalized, degenerate", [(3, True), (0, False)])
-def test_best_degenerate_flag_and_warning(tmp_path, capsys, n_penalized, degenerate):
+@pytest.mark.parametrize("feasible, degenerate", [(False, True), (True, False)])
+def test_best_degenerate_flag_and_warning(tmp_path, capsys, feasible, degenerate):
     import optuna
     args = args_for(tmp_path)
     study = optuna.create_study(direction="maximize")
     study.set_user_attr("versions", {})
-    attrs = {"n_scored_bars": 10, "total_trades": 0, "n_penalized_folds": n_penalized}
-    study.add_trial(optuna.trial.create_trial(value=-5., user_attrs=attrs))
-    study.add_trial(optuna.trial.create_trial(value=-6., user_attrs={**attrs, "n_penalized_folds": 0}))
+    attrs = {"n_scored_bars": 10, "total_trades": 0, "n_penalized_folds": 0 if feasible else 3, "feasible": feasible}
+    study.add_trial(optuna.trial.create_trial(value=-60., user_attrs=attrs))
+    study.add_trial(optuna.trial.create_trial(value=-70., user_attrs={**attrs, "feasible": False}))
     result = opt.study_result(study, args, {}, {})
     assert result["best_degenerate"] is degenerate
-    assert result["best_trial_number"] == 0 and result["best_objective"] == -5.
+    if degenerate:
+        assert result["best_params"] is None and result["best_trial_number"] is None
+        assert result["best_infeasible_trial_number"] == 0
+    else:
+        assert result["best_trial_number"] == 0 and result["best_objective"] == -60.
     output = capsys.readouterr().out.lower()
-    assert ("warning" in output and "all folds penalised" in output) is degenerate
+    assert ("warning" in output and "no feasible trial" in output) is degenerate
     opt.save_results(args.output, result)
     assert entry_of(json.loads(args.output.read_text()))["best_degenerate"] is degenerate
 
@@ -887,3 +903,443 @@ def test_bar_type_all_token_expansion(value, capsys):
                 "fixed_tick_run,all": ["fixed_tick_run"] + [bar for bar in info if bar != "fixed_tick_run"]}
     actual = parser.parse_args(["--bar-type", value]).bar_type
     assert actual == expected[value] and len(actual) == len(set(actual))
+
+
+# ---- D8: chronological splitter replaces PurgedKFold (behavior-preserving) -------------------------
+
+def reference_purgedkfold_folds(bars, n_splits, embargo):
+    """The pre-D8 implementation, kept only as the parity oracle."""
+    from RiskLabAI.backtest.validation.purged_kfold import PurgedKFold
+    sequence = pd.Index(bars.array["seq"] if isinstance(bars, opt.CachedBars) else [bar.seq for bar in bars])
+    if not sequence.is_unique or not sequence.is_monotonic_increasing:
+        raise ValueError("seq must be unique and strictly increasing")
+    if len(bars) < n_splits:
+        raise ValueError(f"Search segment N={len(bars)} is smaller than n_splits={n_splits}")
+    times = pd.Series(sequence.to_numpy(), index=sequence)
+    folds = []
+    for train, test in PurgedKFold(n_splits=n_splits, times=times, embargo=embargo).split(pd.DataFrame(index=sequence)):
+        start = int(test.min()) + int(len(bars) * embargo)
+        if start > int(test.max()):
+            raise ValueError("Embargo consumed the fold; use a longer research window or lower embargo")
+        folds.append({"context_idx": train[train < test.min()], "test_idx": test, "score_start_idx": start})
+    return folds
+
+
+def assert_same_folds(actual, expected):
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        np.testing.assert_array_equal(got["context_idx"], want["context_idx"])
+        np.testing.assert_array_equal(got["test_idx"], want["test_idx"])
+        assert got["score_start_idx"] == want["score_start_idx"]
+
+
+@pytest.mark.parametrize("n", [7, 11, 100, 1000])
+@pytest.mark.parametrize("n_splits", [2, 3, 5])
+@pytest.mark.parametrize("embargo", [0.0, 0.02])
+def test_chronological_folds_match_purgedkfold_reference(n, n_splits, embargo):
+    bars = synth_bars(n)
+    assert_same_folds(opt.build_chronological_folds(bars, n_splits, embargo),
+                      reference_purgedkfold_folds(bars, n_splits, embargo))
+
+
+@pytest.mark.parametrize("n, n_splits, embargo", [(3, 5, 0.02), (100, 5, 0.2)])
+def test_chronological_folds_raise_like_the_reference(n, n_splits, embargo):
+    bars = synth_bars(n)
+    with pytest.raises(ValueError) as reference:
+        reference_purgedkfold_folds(bars, n_splits, embargo)
+    with pytest.raises(ValueError) as actual:
+        opt.build_chronological_folds(bars, n_splits, embargo)
+    assert str(actual.value) == str(reference.value)
+
+
+def test_chronological_folds_do_not_import_purgedkfold():
+    code = ("import sys; sys.path.insert(0, 'tests'); "
+            "from scripts import optimize_orderflow as opt; from test_pipeline import synth_bars; "
+            "opt.build_chronological_folds(synth_bars(30), 3, .02); "
+            "assert 'RiskLabAI.backtest.validation.purged_kfold' not in sys.modules")
+    subprocess.run([sys.executable, "-c", code], cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)}, check=True)
+
+
+CACHED_BAR_MANIFESTS = sorted((ROOT / "output/optimize/cache").glob("bars-*.json"))
+
+
+@pytest.mark.real_data
+@pytest.mark.skipif(not CACHED_BAR_MANIFESTS, reason="optimizer cache not built")
+def test_real_folds_match_reference():
+    """Dev-window cache only (never the market-data volume)."""
+    manifest = json.loads(CACHED_BAR_MANIFESTS[0].read_text())
+    bars = opt.CachedBars(CACHED_BAR_MANIFESTS[0].with_suffix(".bin"), manifest["bar_type"])
+    n_search = len(bars) - int(len(bars) * 0.2)
+    assert_same_folds(opt.build_chronological_folds(bars[:n_search], 5, 0.02),
+                      reference_purgedkfold_folds(bars[:n_search], 5, 0.02))
+
+
+# ---- Task 5: two-tier objective, fold-level feasibility, best-feasible selection ------------------
+
+def fold_result(n=30, sharpe=-1.0, blown=False, days=100):
+    return {"n_trades": n, "sharpe_ratio": sharpe, "account_blown": blown, "n_days": days}
+
+
+def test_infeasible_never_outranks_feasible():
+    feasible_score, feasible = opt.trial_score([fold_result(30, -1.0)] * 5, 5, 30, 0)
+    infeasible_score, infeasible = opt.trial_score([fold_result(29, -3.0)] * 5, 5, 30, 0)
+    assert (feasible, infeasible) == (True, False)
+    assert feasible_score == pytest.approx(-1.0)
+    assert infeasible_score == pytest.approx(-100 + 49 * 29 / 30)
+    assert infeasible_score < opt.FEASIBLE_FLOOR <= feasible_score
+
+
+def test_ranking_property_random_fold_sets():
+    rng = np.random.default_rng(7)
+    feasible_scores, infeasible_scores = [], []
+    for _ in range(200):
+        folds = [fold_result(int(rng.integers(0, 61)), float(rng.uniform(-10, 5)),
+                             bool(rng.random() < .05), int(rng.integers(1, 400))) for _ in range(5)]
+        if rng.random() < .05:
+            folds[0]["sharpe_ratio"] = float("nan")
+        score, feasible = opt.trial_score(folds, 5, 30, 0)
+        (feasible_scores if feasible else infeasible_scores).append(score)
+    assert feasible_scores and infeasible_scores
+    assert max(infeasible_scores) < min(feasible_scores)
+
+
+def test_tier_boundaries_are_not_flipped():
+    """Mirror-image check: the floor is reachable, the gradient is monotone, extreme Sharpes stay in tier."""
+    assert opt.trial_score([fold_result(30)] * 5, 5, 30, 0)[1] is True
+    assert opt.trial_score([fold_result(29)] * 5, 5, 30, 0)[1] is False
+    low, _ = opt.trial_score([fold_result(10)] * 5, 5, 30, 0)
+    high, _ = opt.trial_score([fold_result(20)] * 5, 5, 30, 0)
+    assert low < high < opt.FEASIBLE_FLOOR
+    assert opt.trial_score([fold_result(30, -500.0)] * 5, 5, 30, 0)[0] == opt.FEASIBLE_FLOOR
+
+
+@pytest.mark.parametrize("folds", [
+    [fold_result(0)] + [fold_result(38)] * 4,                         # empty fold, 152 pooled trades
+    [fold_result(38, blown=True)] + [fold_result(38)] * 4,            # bankrupt fold
+    [fold_result(38, float("nan"))] + [fold_result(38)] * 4,          # non-finite Sharpe
+    [fold_result(38, float("inf"))] + [fold_result(38)] * 4,
+    [fold_result(40)] * 4,                                            # missing fold
+], ids=["empty", "bankrupt", "nan", "inf", "missing"])
+def test_invalid_folds_make_trial_infeasible(folds):
+    score, feasible = opt.trial_score(folds, 5, 30, 100)
+    assert feasible is False and score < opt.FEASIBLE_FLOOR
+
+
+def test_pooled_floor_enforced():
+    assert opt.trial_score([fold_result(10)] * 5, 5, 5, 100)[1] is False
+    assert opt.trial_score([fold_result(10)] * 5, 5, 5, 50)[1] is True
+
+
+def test_fold_progress_zero_for_blown_or_non_finite():
+    assert opt.fold_progress(fold_result(30, blown=True), 30) == 0.0
+    assert opt.fold_progress(fold_result(30, float("nan")), 30) == 0.0
+    assert opt.fold_progress(fold_result(15), 30) == 0.5
+    assert opt.fold_progress(fold_result(99), 30) == 1.0
+
+
+def test_day_weighted_mean_of_fold_sharpes():
+    folds = [fold_result(30, 1.0, days=1), fold_result(30, 3.0, days=3)] + [fold_result(30, 3.0, days=0 + 1)] * 3
+    expected = np.average([1.0, 3.0, 3.0, 3.0, 3.0], weights=[1, 3, 1, 1, 1])
+    assert opt.trial_score(folds, 5, 30, 0)[0] == pytest.approx(expected)
+
+
+def test_score_window_reports_days_and_all_zero_returns_are_infeasible(tmp_path):
+    bars = synth_bars(100)
+    trades = trade_table([0., 0., 0.], [pd.Timestamp(bars[i].timestamp_ms, unit="ms", tz="UTC") for i in (50, 60, 70)])
+    trades["exit_seq"] = [bars[i].seq for i in (50, 60, 70)]
+    trades["equity_after"] = 5000.
+    metrics, _ = opt.score_window(trades, bars, 40, 90, 2)
+    first = pd.Timestamp(bars[40].timestamp_ms, unit="ms", tz="UTC").floor("D")
+    last = pd.Timestamp(bars[90].timestamp_ms, unit="ms", tz="UTC").floor("D")
+    assert metrics["n_days"] == (last - first).days + 1 >= 1
+    assert metrics["penalized"] == (not np.isfinite(metrics["sharpe_ratio"]) or metrics["n_trades"] < 2)
+    assert metrics["fold_sharpe"] == metrics["sharpe_ratio"] or not np.isfinite(metrics["sharpe_ratio"])
+
+
+def test_objective_records_feasibility_and_raw_fold_scores(tmp_path, monkeypatch):
+    args = args_for(tmp_path, min_trades_per_fold=2, min_total_trades=0)
+    bars = synth_bars(30)
+    folds = opt.build_chronological_folds(bars, 3, .02)
+    base = {"account_blown": False, "n_scored_bars": 10, "n_days": 10, "penalized": False, "n_trades": 3}
+    results = iter([{**base, "sharpe_ratio": s} for s in (1., 2., 3.)])
+    monkeypatch.setattr(opt, "evaluate_fold", lambda *a, **kw: next(results))
+    trial = CaptureTrial()
+    assert opt.objective(trial, bars, folds, args) == pytest.approx(2.0)
+    assert trial.user_attrs["feasible"] is True
+    assert trial.user_attrs["cv_sharpe_raw"] == pytest.approx(2.0)
+    assert len(trial.user_attrs["fold_results"]) == 3
+
+
+def test_zero_feasible_study_holdout_not_evaluated(tmp_path):
+    import optuna
+    args = args_for(tmp_path)
+    study = optuna.create_study(direction="maximize")
+    study.add_trial(optuna.trial.create_trial(value=-60., user_attrs={"n_penalized_folds": 2, "feasible": False}))
+    result = opt.evaluate_holdout(study, synth_bars(100), 80, args)
+    assert result["status"] == "not_evaluated" and "no feasible trial" in result["reason"]
+
+
+def test_objective_definition_is_part_of_study_identity(tmp_path):
+    meta = {"fingerprint": "f" * 64}
+    base = args_for(tmp_path)
+    name, identity = opt.study_identity(base, meta)
+    other_name, other = opt.study_identity(args_for(tmp_path, min_total_trades=105), meta)
+    assert name != other_name and identity["min_total_trades"] == 0 and other["min_total_trades"] == 105
+    assert identity["infeasible_base"] == opt.INFEASIBLE_BASE and identity["feasible_floor"] == opt.FEASIBLE_FLOOR
+    assert "penalty_sharpe" not in identity
+
+
+def test_min_total_trades_flag_parses_nonnegative_integers():
+    assert opt.build_parser().parse_args(["--min-total-trades", "105"]).min_total_trades == 105
+    with pytest.raises(SystemExit):
+        opt.build_parser().parse_args(["--min-total-trades", "-1"])
+    with pytest.raises(SystemExit):
+        opt.build_parser().parse_args(["--min-total-trades", "1.5"])
+
+
+# ---- Task 6: search-space rework and development-window boundary -----------------------------------
+
+def test_default_space_has_twelve_dims_and_narrow_proximity():
+    assert set(opt.SEARCH_SPACE_BOUNDS) == {"default_stop_pct", "target_rr",
+        "price_proximity_pct", "min_composite_score", "signal_cooldown_seconds", "volume_decline_pct",
+        "lookback_bars", "delta_failure_pct", "absorption_min_delta_pct", "initiative_min_delta_pct",
+        "initiative_min_body_bps", "initiative_volume_acceleration_min"}
+    assert opt.SEARCH_SPACE_BOUNDS["price_proximity_pct"] == (0.0005, 0.005, "float_log")
+    assert opt.SEARCH_SPACE_BOUNDS["initiative_min_body_bps"][2] == "float_log"
+
+
+def test_build_instrument_config_applies_detector_params():
+    chosen = {**params(), "absorption_min_delta_pct": .42, "initiative_min_delta_pct": .28,
+              "initiative_min_body_bps": 2.5, "initiative_volume_acceleration_min": 1.8}
+    config = opt.build_instrument_config(chosen)
+    base = get_btcusd_config()
+    assert config.absorption.min_delta_pct == .42
+    assert (config.initiative.min_delta_pct, config.initiative.min_body_bps,
+            config.initiative.volume_acceleration_min) == (.28, 2.5, 1.8)
+    assert replace(config.absorption, min_delta_pct=base.absorption.min_delta_pct) == base.absorption
+    assert replace(config.initiative, min_delta_pct=base.initiative.min_delta_pct,
+                   min_body_bps=base.initiative.min_body_bps,
+                   volume_acceleration_min=base.initiative.volume_acceleration_min) == base.initiative
+    assert config.sweep == base.sweep and config.volume_profile == base.volume_profile
+
+
+def test_dev_window_excludes_validation_period(tmp_path):
+    rows = make_rows(6, t0="2023-12-31T23:58:30", step_s=30)    # closes 23:58:30 .. 00:01:00
+    source = tmp_path / "boundary_source"       # args_for() also writes its own dataset to tmp_path/"source"
+    write_dataset(source, rows)
+    args = args_for(tmp_path, start_date=date(2023, 12, 31), end_date=date(2023, 12, 31),
+                    data_root=source, cache_dir=tmp_path / "cache")
+    _, metadata = opt.build_cache(args, "BTCUSDT", "fixed_dollar_imbalance")
+    boundary_ms = int(pd.Timestamp("2024-01-01", tz="UTC").timestamp() * 1000)
+    assert metadata["n_bars"] == 3 and metadata["last_ts_ms"] < boundary_ms
+
+
+# ---- Task 7: stop/target knobs ---------------------------------------------------------------------
+
+def test_stop_and_target_dimensions_bounds():
+    assert opt.SEARCH_SPACE_BOUNDS["default_stop_pct"] == (0.001, 0.01, "float_log")
+    assert opt.SEARCH_SPACE_BOUNDS["target_rr"] == (1.0, 4.0, "float")
+
+
+def test_target_rr_applied_in_config():
+    config = opt.build_instrument_config({**params(), "default_stop_pct": 0.004, "target_rr": 2.5})
+    assert config.risk.default_stop_pct == pytest.approx(0.004)
+    assert config.risk.default_target_pct == pytest.approx(0.01)
+
+
+def test_default_stop_and_rr_reproduce_the_baseline_config():
+    config = opt.build_instrument_config(params())            # 0.3% stop, 2R target
+    base = get_btcusd_config().risk
+    assert config.risk.default_stop_pct == base.default_stop_pct == pytest.approx(0.003)
+    assert config.risk.default_target_pct == pytest.approx(base.default_target_pct) == pytest.approx(0.006)
+
+
+def test_baseline_extra_params_come_from_the_config():
+    extra = opt.baseline_extra_params()
+    base = get_btcusd_config()
+    assert set(extra) == {"absorption_min_delta_pct", "initiative_min_delta_pct", "initiative_min_body_bps",
+                          "initiative_volume_acceleration_min", "default_stop_pct", "target_rr"}
+    assert extra["absorption_min_delta_pct"] == base.absorption.min_delta_pct
+    assert extra["default_stop_pct"] == base.risk.default_stop_pct
+    assert extra["target_rr"] == pytest.approx(base.risk.default_target_pct / base.risk.default_stop_pct)
+    assert opt.build_instrument_config({**params(), **extra}) == opt.build_instrument_config(params())
+
+
+# ---- Task 8: Deflated Sharpe as a diagnostic with trial-count sensitivity --------------------------
+
+def make_sharpe_studies(db):
+    import optuna
+    layout = {"BTCUSDT__a": [.1, .2, .3], "BTCUSDT__b": [.4, None], "ETHUSDT__c": [.9]}
+    for name, raws in layout.items():
+        study = optuna.create_study(study_name=name, storage=f"sqlite:///{db}", direction="maximize")
+        for raw in raws:
+            study.add_trial(optuna.trial.create_trial(value=-5., user_attrs={"raw_daily_sharpe": raw}))
+    optuna.load_study(study_name="BTCUSDT__a", storage=f"sqlite:///{db}").add_trial(
+        optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL, user_attrs={"raw_daily_sharpe": .7}))
+
+
+def test_campaign_trials_counts_all_symbol_studies(tmp_path):
+    db = tmp_path / "campaign.db"
+    make_sharpe_studies(db)
+    campaign = opt.campaign_trials(db, "BTCUSDT")
+    assert campaign["n_symbol_all_studies"] == 5            # 3 + 2 COMPLETE; FAIL and other symbol excluded
+    assert campaign["n_dispersion_trials"] == 4
+    assert campaign["trial_sharpe_std"] == pytest.approx(np.std([.1, .2, .3, .4], ddof=1))
+
+
+def test_campaign_trials_missing_database_is_empty(tmp_path):
+    assert opt.campaign_trials(tmp_path / "absent.db", "BTCUSDT") == {
+        "n_symbol_all_studies": 0, "n_dispersion_trials": 0, "trial_sharpe_std": None}
+
+
+def dsr_study(raws=(.1, .2, .3)):
+    import optuna
+    study = optuna.create_study(direction="maximize")
+    for raw in raws:
+        study.add_trial(optuna.trial.create_trial(value=-5., user_attrs={"raw_daily_sharpe": raw}))
+    return study
+
+
+def patch_gate(monkeypatch, decide):
+    from importlib import import_module
+    hpo = import_module("RiskLabAI.backtest.validation.leakage_aware_hpo")
+    calls = []
+
+    def gate(r, n_trials, trial_sharpe_std):
+        calls.append(n_trials)
+        return {"passes": decide(n_trials), "deflated_sharpe": .9 if decide(n_trials) else .1}
+    monkeypatch.setattr(hpo, "deflated_sharpe_gate", gate)
+    return calls
+
+
+RETURNS = np.array([0., .01, -.02, .03, -.01, 0., 0.])
+
+
+def test_deflated_gate_is_diagnostic_with_sensitivity(monkeypatch):
+    calls = patch_gate(monkeypatch, lambda n: True)
+    campaign = {"n_symbol_all_studies": 700, "n_dispersion_trials": 650, "trial_sharpe_std": .05}
+    result = opt.deflated_gate(dsr_study(), RETURNS, campaign=campaign)
+    assert calls == [3, 700]
+    assert result["diagnostic"] is True and "not a selection criterion" in result["use"]
+    assert [(e["scope"], e["n_trials"]) for e in result["sensitivity"]] == [("study", 3), ("symbol_all_studies", 700)]
+    assert result["n_nonzero_days"] == 4
+    assert np.isfinite(result["skew"]) and np.isfinite(result["excess_kurtosis"])
+    assert result["passes"] is True and result["status"] == "evaluated"
+
+
+def test_disagreeing_sensitivity_gives_no_pass(monkeypatch):
+    patch_gate(monkeypatch, lambda n: n < 100)
+    campaign = {"n_symbol_all_studies": 700, "n_dispersion_trials": 650, "trial_sharpe_std": .05}
+    result = opt.deflated_gate(dsr_study(), RETURNS, campaign=campaign)
+    assert [e["passes"] for e in result["sensitivity"]] == [True, False]
+    assert result["passes"] is None
+
+
+def test_gate_without_campaign_has_single_study_scope(monkeypatch):
+    patch_gate(monkeypatch, lambda n: False)
+    result = opt.deflated_gate(dsr_study(), RETURNS)
+    assert [e["scope"] for e in result["sensitivity"]] == ["study"] and result["passes"] is False
+
+
+def test_ineligible_gate_is_still_labelled_diagnostic():
+    result = opt.deflated_gate(dsr_study(), RETURNS, ineligible_reason="Holdout account blown")
+    assert result["diagnostic"] is True and result["status"] == "indeterminate" and result["passes"] is None
+
+
+# ---- Task 12: dataset-policy warning and honest limitations ----------------------------------------
+
+def test_post_dev_end_date_warns_not_fails(tmp_path, capsys):
+    opt.main(cli_args(tmp_path) + ["--end-date", "2024-02-01"])
+    captured = capsys.readouterr()
+    assert "Warning: end-date is after 2023-12-31; 2024+ is reserved for out-of-sample validation (dataset policy)" in captured.err
+
+
+def test_dev_end_date_does_not_warn(tmp_path, capsys):
+    opt.main(cli_args(tmp_path) + ["--end-date", "2023-12-31"])
+    assert "dataset policy" not in capsys.readouterr().err
+
+
+def test_limitations_state_in_sample_no_model_and_diagnostic_dsr(tmp_path):
+    import optuna
+    study = optuna.create_study(direction="maximize")
+    study.set_user_attr("versions", {})
+    study.add_trial(optuna.trial.create_trial(value=-60., user_attrs={"feasible": False, "n_scored_bars": 1, "total_trades": 0}))
+    text = " | ".join(opt.study_result(study, args_for(tmp_path), {}, {})["limitations"])
+    for phrase in ("chronological sub-periods of one continuous replay; no model is fitted",
+                   "not an AFML post-test embargo",
+                   "in-sample with respect to the tuned hyperparameters",
+                   "pseudo-holdout is an internal selection check",
+                   "deflated Sharpe is diagnostic only"):
+        assert phrase in text
+    assert "purge is a no-op" not in text
+
+
+# ---- Codex review: fold returns must follow the continuous account equity -------------------------
+
+def daily_bars(n=10):
+    """synth_bars with one bar per UTC day so each trade exits on its own day."""
+    bars = synth_bars(n)
+    for i, bar in enumerate(bars):
+        bar.timestamp_ms = 1_700_000_000_000 + i * 86_400_000
+    return bars
+
+
+def prefix_then_losses_table(bars):
+    """A profitable prefix (equity 10,000) followed by in-fold losses, sized by the continuous account."""
+    pnl, equity, rows = [5000., -3000., -2500., 200.], [10000., 7000., 4500., 4700.], []
+    for i, bar_index in enumerate((1, 4, 5, 6)):
+        rows.append({"exit_seq": bars[bar_index].seq, "exit_time": pd.Timestamp(bars[bar_index].timestamp_ms, unit="ms", tz="UTC"),
+                     "net_pnl": pnl[i], "equity_after": equity[i]})
+    return pd.DataFrame(rows)
+
+
+def test_fold_returns_follow_the_continuous_equity_path():
+    import quantstats as qs
+    bars = daily_bars()
+    metrics, trades = opt.score_window(prefix_then_losses_table(bars), bars, 3, 6, 1)
+    assert metrics["start_equity"] == 10000.0 and metrics["n_trades"] == 3
+    expected = pd.Series([0., 0., -0.3, -2500 / 7000, 200 / 4500])
+    assert metrics["sharpe_ratio"] == pytest.approx(qs.stats.sharpe(expected, periods=365))
+    assert metrics["max_drawdown_pct"] == pytest.approx(-55.0, abs=0.01)         # 10,000 -> 4,500
+    assert metrics["max_drawdown_pct"] > -100.0                                   # no return below -100% on a positive account
+
+
+def test_first_window_without_prefix_keeps_the_initial_capital_anchor():
+    bars = daily_bars()
+    table = prefix_then_losses_table(bars).iloc[1:].reset_index(drop=True)       # nothing exits before the window
+    metrics, _ = opt.score_window(table, bars, 3, 6, 1)
+    assert metrics["start_equity"] == opt.INITIAL_CAPITAL_USD
+
+
+def test_depleted_prefix_makes_the_fold_infeasible_not_a_distorted_sharpe():
+    bars = daily_bars()
+    table = prefix_then_losses_table(bars)
+    table.loc[0, ["net_pnl", "equity_after"]] = [-5000., 0.]                       # the account was wiped out before the fold
+    metrics, _ = opt.score_window(table, bars, 3, 6, 1)
+    assert metrics["start_equity"] == 0.0 and metrics["account_blown"] is True and metrics["penalized"] is True
+    assert not np.isfinite(metrics["sharpe_ratio"])
+
+
+def test_holdout_returns_are_anchored_on_the_continuous_equity(tmp_path, monkeypatch):
+    import optuna
+    args = args_for(tmp_path)
+    bars = daily_bars(100)
+    study = optuna.create_study(direction="maximize")
+    distributions = {k: optuna.distributions.IntDistribution(5, 30) if k == "lookback_bars" else
+                     optuna.distributions.FloatDistribution(lo, hi, log=kind == "float_log")
+                     for k, (lo, hi, kind) in opt.SEARCH_SPACE_BOUNDS.items()}
+    study.add_trial(optuna.trial.create_trial(value=1., params=params(), distributions=distributions,
+                    user_attrs={"n_penalized_folds": 0, "feasible": True, "raw_daily_sharpe": .1}))
+    rows = [{"exit_seq": bars[i].seq, "exit_time": pd.Timestamp(bars[i].timestamp_ms, unit="ms", tz="UTC"),
+             "net_pnl": pnl, "equity_after": eq} for i, pnl, eq in ((10, 5000., 10000.), (90, -1000., 9000.))]
+    monkeypatch.setattr(opt, "simulate_trades_risk_based", lambda *a, **kw: pd.DataFrame(rows))
+    monkeypatch.setattr(opt, "run_backtest", lambda *a, **kw: {"ledger": None, "replay_digest": "d"})
+    result = opt.evaluate_holdout(study, bars, 80, args)
+    traded = [r["return"] for r in result["daily_returns"] if r["return"] != 0]
+    assert traded == [pytest.approx(-0.1)]                                          # -1000 / 10,000, not -1000 / 5,000
+
+
+def test_accounting_change_is_versioned_in_the_study_identity(tmp_path):
+    _, identity = opt.study_identity(args_for(tmp_path), {"fingerprint": "f" * 64})
+    assert identity["objective"] == "two_tier_day_weighted_v2"
+    assert identity["accounting"] == "continuous_equity_anchor_v2"
