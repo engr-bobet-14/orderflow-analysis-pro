@@ -382,3 +382,34 @@ def test_ledger_audit_keeps_protective_gap_fills_and_counts_gap_targets(directio
     assert report["ok"], report
     assert report["counters"]["protective_gap_exits"] == 1
     assert report["counters"]["target_gap_through"] == (action == "target")
+
+
+# ---- configurable fallback stop/target (percentage defaults) --------------------------------------
+
+def test_default_sl_tp_unchanged():
+    agg = SignalAggregator()
+    assert agg._compute_sl_tp(Side.BUY, None, None, 100.0) == (100.0 * 0.997, 100.0 * 1.006)
+    assert agg._compute_sl_tp(Side.SELL, None, None, 100.0) == (100.0 * 1.003, 100.0 * 0.994)
+
+
+def test_custom_default_sl_tp():
+    agg = SignalAggregator(default_stop_pct=0.005, default_target_pct=0.01)
+    assert agg._compute_sl_tp(Side.BUY, None, None, 100.0) == pytest.approx((99.5, 101.0))
+    assert agg._compute_sl_tp(Side.SELL, None, None, 100.0) == pytest.approx((100.5, 99.0))
+
+
+def test_custom_default_applies_to_wrong_side_profile_fallback():
+    from orderflow_system.signals.profile_framing import DailyBias
+    agg = SignalAggregator(default_stop_pct=0.005, default_target_pct=0.01)
+    bias = DailyBias(date="d", poc=100, vah=100, val=90)       # price (120) is above VAH
+    assert agg._compute_sl_tp(Side.BUY, None, bias, 120.0) == pytest.approx((119.4, 121.2))
+
+
+def test_pipeline_passes_risk_defaults_to_aggregator():
+    from dataclasses import replace
+    config = get_btcusd_config()
+    config = replace(config, risk=replace(config.risk, default_stop_pct=0.005, default_target_pct=0.012))
+    p = InfoBarPipeline(config, BarType.DOLLAR_IMBALANCE)
+    assert (p.aggregator.default_stop_pct, p.aggregator.default_target_pct) == (0.005, 0.012)
+    baseline = InfoBarPipeline(get_btcusd_config(), BarType.DOLLAR_IMBALANCE)
+    assert (baseline.aggregator.default_stop_pct, baseline.aggregator.default_target_pct) == (0.003, 0.006)

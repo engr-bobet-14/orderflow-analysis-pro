@@ -65,10 +65,14 @@ class SignalAggregator:
         signal_cooldown_seconds: float = 60.0,
         price_proximity_pct: float = 0.002,  # 0.2% proximity to qualified level
         clock: Optional[Clock] = None,
+        default_stop_pct: float = 0.003,
+        default_target_pct: float = 0.006,
     ):
         self.min_composite_score = min_composite_score
         self.signal_cooldown_seconds = signal_cooldown_seconds
         self.price_proximity_pct = price_proximity_pct
+        self.default_stop_pct = default_stop_pct
+        self.default_target_pct = default_target_pct
         self._clock = clock or RealClock()
         self._active_trades: dict[str, TradeState] = {}  # instrument → trade
         self._watched_levels: dict[str, list[QualifiedLevel]] = {}  # instrument → watched levels
@@ -466,11 +470,12 @@ class SignalAggregator:
         current_price: float,
     ) -> tuple[float, float]:
         """Compute suggested stop loss and take profit."""
-        # Default: 0.3% SL, 0.6% TP
+        # Default: default_stop_pct SL, default_target_pct TP (0.3% / 0.6%)
+        stop, target = self.default_stop_pct, self.default_target_pct
         if direction == Side.BUY:
-            default = (current_price * 0.997, current_price * 1.006)
+            default = (current_price * (1 - stop), current_price * (1 + target))
         else:
-            default = (current_price * 1.003, current_price * 0.994)
+            default = (current_price * (1 + stop), current_price * (1 - target))
         if bias is None:
             return default
 
