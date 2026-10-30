@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27"]
-tuning = ["RiskLabAI[hpo]>=3.1,<4", "optuna>=4.9,<5"]
+tuning = ["RiskLabAI[hpo]>=3.1,<4", "optuna>=4.9,<5", "quantstats>=0.0.81", "duckdb>=1.0"]
 
 [project.scripts]
 orderflow = "orderflow_system.main:main"
@@ -37,5 +37,6 @@ include = ["orderflow_system*"]
 orderflow_system = ["dashboard/static/*"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests", "orderflow_system"]
 markers = ["real_data: needs the external info-bar dataset mounted at /Volumes/Market-Data"]
