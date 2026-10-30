@@ -19,10 +19,12 @@ python scripts/optimize_orderflow.py --bar-type fixed_dollar_imbalance --n-trial
 
 ```bash
 source .venv_orderflow/bin/activate
-pip install -e ".[dev,tuning]"            # tuning = RiskLabAI, optuna, quantstats, duckdb
-pytest tests/test_optimize_orderflow.py   # optional sanity check, ~30 s
+pip install -e ".[tuning]"                # REQUIRED once per venv: RiskLabAI, optuna, quantstats, duckdb
+pytest tests/test_optimize_orderflow.py   # optional sanity check, ~30 s (needs: pip install -e ".[dev,tuning]")
 python scripts/optimize_orderflow.py --help
 ```
+
+`pip install -e ".[tuning]"` installs this project in editable mode (`-e`: code edits take effect without reinstalling) plus the optional `tuning` dependency group from `pyproject.toml`. Without it the script fails at import. Keep the quotes: zsh treats bare `[...]` as a wildcard. `.[dev,tuning]` also adds pytest.
 
 ## Step 1 - Data
 
@@ -66,14 +68,26 @@ python scripts/optimize_orderflow.py ...same arguments... --n-jobs 4            
 
 ## Step 4 - Holdout (explicit, rare)
 
+**What it is.** The search (steps 2-3) only ever replays the first 80% of bars (`--holdout-fraction 0.2`), scoring trials on purged CV blocks of that segment. Because the same folds both rank and report the trials, the best CV score is optimistic. The last 20% (the holdout) is never replayed during the search, so `--evaluate-holdout` is the one honest "final exam" of the winning parameters. Run it once, after the search has settled.
+
 ```bash
 python scripts/optimize_orderflow.py ...same arguments... --evaluate-holdout
 ```
+
+The same arguments resume the same study and add no trials; the only extra cost is one full replay (~1 min per bar type). It needs `--holdout-fraction` above 0 and a tail large enough to score.
 
 - Replays the whole timeline with the best trial that has an unpenalised fold and scores only the held-out tail.
 - RiskLabAI `deflated_sharpe_gate` is applied at this study's COMPLETE trial count; with too little dispersion the gate is `indeterminate`, never a silent pass.
 - Every evaluation is kept as a record; repeating it prints a warning because repeated looks erode independence.
 - For info bars the result is flagged `bar_construction_independent: false`: those bars were calibrated on the full 2019-2023 history, so the holdout is not independent end-to-end validation.
+
+Reading the gate in `results.json` (holdout record):
+
+| `passes` | Meaning |
+|---|---|
+| `true` | Held-out Sharpe beats the expected best-of-N Sharpe for this study's trial count. Encouraging, not proof. |
+| `false` | The tuned result is not distinguishable from picking the luckiest of N trials. |
+| `null` (`status: indeterminate`, with a `reason`) | Not enough information: too few trials with unpenalised folds, zero Sharpe dispersion, or a holdout with too few trades, a blown account or a non-finite Sharpe. Never read it as a pass. |
 
 ## Step 5 - Read the results
 
