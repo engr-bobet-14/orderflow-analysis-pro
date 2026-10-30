@@ -141,3 +141,121 @@ python -m orderflow_system.validate_infobars --bar-type all [--start 2023-01-01 
 ## Disclaimer
 
 Research software; not financial advice.
+
+## Orderflow parameter search
+
+Install the research dependencies with `python -m pip install -e '.[tuning]'`, then
+run `python scripts/optimize_orderflow.py --help`. The runner ports notebook 02's
+six parameter dimensions without changing the pipeline or the notebooks:
+
+```bash
+python scripts/optimize_orderflow.py \
+  --symbol BTCUSDT --bar-type fixed_dollar_imbalance,fixed_tick_run \
+  --start-date 2023-06-01 --end-date 2023-07-31 \
+  --n-trials 50 --n-jobs 2 \
+  --study-db /tmp/orderflow/studies.db \
+  --cache-dir /tmp/orderflow/cache --output /tmp/orderflow/results.json
+```
+
+Dates are inclusive UTC days; `START_DATE` and `END_DATE` supply defaults.
+`--bar-type all` is the default and selects the six fixed information-bar types.
+`all` also expands within comma lists, which are deduplicated in first occurrence
+order; use `--bar-type all,time_1m` for all seven types. `time_1m` must be selected
+explicitly. Only BTCUSDT has a registered instrument configuration; other symbols
+are refused. `--symbol` and `--bar-type` accept comma lists. Defaults for local
+artifacts are under ignored `output/optimize/`.
+`--data-root` defaults to the configured info-bar root. `--trades-root` defaults
+to `/Volumes/Market-Data/orderbook-data_binance/futures_trades` (or
+`ORDERFLOW_TRADES_ROOT`). Missing roots are refused before output work begins.
+Sources are read-only.
+
+`time_1m` derives candles from those raw trades with DuckDB, one UTC day at a
+time, with spills confined to a temporary subdirectory of `--cache-dir`.
+Exact duplicate rows are removed first; conflicting trade IDs and invalid
+volumes fail closed. Candles become actionable at minute close, skip empty
+minutes, and flag gaps longer than one hour. Binary monthly staging files always
+cover whole UTC months, including a preceding month for the midnight close and
+predecessor. Stages are resumable and keyed by the source inventory and builder
+fingerprint. Final range caches publish atomically and workers share read-only
+memmaps. Observed coverage is counted from actual bars, rather than inferred
+from sidecar dates. A missing day's cause remains unknown.
+
+Rerun with the same arguments to resume. `--n-trials` is the total number of
+COMPLETE trials to reach, not an increment. No trial is deleted; stale RUNNING
+and failed trials remain visible. Each symbol/bar-type pair gets a study whose
+name includes data and strategy identity hashes. Identity includes source
+inventory/sidecar identity, reader and transformation code, all execution-affecting
+strategy modules, accounting/objective code, non-searched instrument defaults,
+search bounds, costs, CV geometry, holdout fraction, minimum trades and seed.
+Changing an identity input starts a new study. Changing `--n-trials`, `--n-jobs`,
+output paths or the holdout evaluation flag keeps the study. Resume is refused
+if Optuna, RiskLabAI or quantstats major.minor versions changed; use a new
+study database in that case. Versions and git SHA/dirty state are recorded.
+
+Search-space overrides are a JSON file supplied with `--search-space`, for
+example `{"lookback_bars": {"low": 8, "high": 20}}`. Unknown dimensions are
+refused. Capital and risk are fixed at $5,000 and 1% equity per trade, with
+stop-loss sizing, a 0.05% minimum stop distance, and notional capped at equity.
+Default costs are 5 bps taker fee and 1 bp slippage per side; `--fee-bps` and
+`--slippage-bps` are part of study identity. There are no capital or risk flags.
+
+The objective is mean daily-return Sharpe (365 periods) across RiskLabAI
+`PurgedKFold` blocks on the search segment. One causal replay per trial produces
+the same closed trades and sizing as the notebook's repeated prefix replays.
+Each fold selects trades by **exit** sequence; entries may precede its scoring
+window, and open trades at its end stay open. Accounting compounds over the
+prefix, while each fold's metrics use a $5,000 anchor. The daily metric anchor
+is on the day before the scored window, and daily equity extends through its
+last day: this fixes the notebook's loss of day-one PnL and includes trailing
+flat days. Undefined metrics become JSON null with a status; a no-loss profit
+factor has status `no_losses`. Fewer than `--min-trades-per-fold` trades (default
+2), account depletion or non-finite Sharpe penalise that fold at -5. Raising the
+minimum is advisable because daily Sharpe from very few trades is noisy.
+
+This is a rule-based strategy with no fitted training set. Point-in-time
+information ranges make purging a no-op; the training complement is unused
+except to describe strictly past context. As in notebook 02, `--embargo` (default
+0.02) is repurposed as a **scoring blackout** at each test block's start, rather
+than AFML's exclusion of future training observations. Fold zero starts cold;
+exit attribution and continuous equity make adjacent folds weakly dependent.
+Best CV performance is optimistically biased because those folds were used
+for tuning. CPCV, PBO, nested CV and RiskLabAI's estimator-based HPO wrapper
+are intentionally not used.
+
+The chronological tail (`--holdout-fraction 0.2`, or 0 to disable) is never
+replayed during search. Add `--evaluate-holdout` for an explicit replay
+with the best trial having at least one unpenalised fold. The holdout starts
+scoring after `int(N * embargo)` tail bars; impossible CV/holdout geometry is
+refused before trials. Each evaluation gets a distinct timestamp/UUID study
+attribute and is retained in JSON history, including `prior_evaluations` and the
+COMPLETE trial count `trials_at_evaluation`. Repeated evaluations are allowed and
+print a warning that repeated looks erode holdout independence. For information
+bars the holdout is **conditional on bars calibrated on the entire history**, not independent
+end-to-end validation: `bar_construction_independent: false` and the upstream
+hyperparameters/configuration/creation/git metadata are preserved. Time bars
+have no calibrated construction parameters.
+
+Holdout daily returns feed RiskLabAI's `deflated_sharpe_gate`. Its multiplicity
+is all COMPLETE trials in this study; its dispersion is the sample standard
+deviation of finite raw daily Sharpes from COMPLETE trials with unpenalised folds.
+Insufficient or zero dispersion produces `passes: null`, `status: indeterminate`.
+Holdouts below the minimum trade count, with account depletion or with non-finite
+Sharpe also receive an indeterminate gate and an explicit reason.
+This does not count searches on other symbols, bar types or identities, and
+repeated holdout evaluation after more tuning erodes holdout independence.
+
+SQLite initialization has a database-wide lock. Optimization and holdout have
+a non-blocking study admission lock: a second invocation for the same study
+exits clearly; different studies may run concurrently. Workers use **spawn**,
+open their own SQLite connections, hold shared lifetime locks, handle SIGTERM,
+and check for parent death between trials. Admission refuses lingering orphan
+workers; wait for their current trial to finish or terminate them. Worker errors
+propagate with nonzero exit status and failed trials are retained. Parallel
+completion can overshoot the total by at most `n_jobs - 1`; proposals depend on
+completion order. With one worker, per-trial seeding makes resumed proposals
+reproducible. Parallel worker seeds use separate streams spaced by 1,000,003.
+Artifact paths are expanded and resolved before deriving lock paths.
+An already-complete study starts no workers. Holdout runs after
+all workers join. JSON results merge atomically under a separate lock at
+`symbols → symbol → bar_type → study_name`, including best parameters/objective,
+scored-bar sample count, trade count, trial states, fingerprints and provenance.

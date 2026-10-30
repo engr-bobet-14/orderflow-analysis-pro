@@ -28,3 +28,4 @@ docs/
 graphify-out/
 notebook/.optuna_studies/
 notebook/.cv_cache/
+output/
