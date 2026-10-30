@@ -10,23 +10,26 @@ From Fabio:
    is being absorbed. This is a perfect example of absorption."
 
 Logic:
-  Effort (aggressive volume at a level)  vs  Result (price displacement)
+  Effort (aggressive volume)  vs  Result (price displacement)
   HIGH effort + LOW result = ABSORPTION → Entry signal
 
-  Also detects repeated absorption: multiple attempts at the same level
-  (e.g., 105 contracts, then 101 contracts, all absorbed at same price).
+  On info bars the effort is the bar's delta (|buy - sell| / volume) and the
+  result is the bar's close vs open. The level-based method (repeated attempts
+  at one price) needs real price-level volume and stays inert on info bars.
 """
 
 from __future__ import annotations
+
+from collections import deque
 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
 from orderflow_system.data.models import (
-    Tick, Candle, Signal, SignalType, Side, FootprintLevel,
+    InfoBar, Signal, SignalType, Side,
 )
-from orderflow_system.analytics.footprint import FootprintBar, FootprintEngine
+from orderflow_system.analytics.footprint import FootprintBar
 from orderflow_system.analytics.delta import DeltaResult
 from orderflow_system.config.settings import AbsorptionConfig
 from orderflow_system.utils.clock import Clock, RealClock
@@ -49,9 +52,10 @@ class AbsorptionDetector:
     Detects absorption patterns in real-time.
 
     Two detection methods:
-    1. Per-candle: High aggressive volume at a level but candle closes in opposite direction
+    1. Per-bar: strong delta but the bar closes in the opposite direction
        (positive delta + negative close = buyers absorbed = bearish absorption)
-    2. Rolling-window: Aggressive volume accumulates at a price level with no displacement
+    2. Level-based: aggressive volume accumulates at a price level with no
+       displacement. Requires a footprint with real price levels; skipped otherwise.
 
     Multiple attempts at the same level increase confidence.
     """
@@ -61,39 +65,40 @@ class AbsorptionDetector:
         self.tick_size = tick_size
         self._clock = clock or RealClock()
         self._active_absorptions: dict[float, AbsorptionEvent] = {}
-        self._signal_history: list[Signal] = []
-        self._cleanup_interval_ms = 60_000  # Clean stale events every minute
+        self._signal_history: deque[Signal] = deque(maxlen=5000)
+        self._cleanup_period_ms = 60_000  # Clean stale events every 60 seconds
 
-    def check_candle(
+    def check_bar(
         self,
-        candle: Candle,
+        bar: InfoBar,
         footprint: FootprintBar,
         delta: DeltaResult,
         current_price: float,
     ) -> Optional[Signal]:
         """
-        Check a completed candle for absorption.
+        Check a completed bar for absorption.
 
-        Absorption candle signatures:
-        - HIGH delta in one direction but candle closes in OPPOSITE direction
-          → Positive delta (buy pressure) + red candle = sellers absorbing the buys
-          → Negative delta (sell pressure) + green candle = buyers absorbing the sells
+        Absorption bar signatures:
+        - HIGH delta in one direction but bar closes in the OPPOSITE direction
+          → Positive delta (buy pressure) + red bar = sellers absorbing the buys
+          → Negative delta (sell pressure) + green bar = buyers absorbing the sells
         - High volume at a specific level with no price movement through it
+          (only when real price-level data exists)
         """
-        if candle.volume == 0:
+        if bar.volume == 0:
             return None
 
         # ── Method 1: Delta vs Close Mismatch ──
-        signal = self._check_delta_close_mismatch(candle, delta, footprint)
+        signal = self._check_delta_close_mismatch(bar, delta, footprint)
         if signal:
             return signal
 
         # ── Method 2: Level-based absorption ──
-        return self._check_level_absorption(candle, footprint, current_price)
+        return self._check_level_absorption(bar, footprint, current_price)
 
     def _check_delta_close_mismatch(
         self,
-        candle: Candle,
+        bar: InfoBar,
         delta: DeltaResult,
         footprint: FootprintBar,
     ) -> Optional[Signal]:
@@ -102,59 +107,59 @@ class AbsorptionDetector:
         "Positive delta but negative closure" = aggressive buyers absorbed by passive sellers.
         The opposite direction wins.
         """
-        abs_delta = abs(delta.vertical_delta)
-        if abs_delta < self.config.min_aggressive_volume:
+        pct = abs(delta.delta_pct)
+        if pct < self.config.min_delta_pct:
             return None
 
-        # Positive delta (buy pressure) but bearish candle close
-        if delta.vertical_delta > 0 and not candle.is_green:
+        # "No reward": the bar must close against the delta by a real margin.
+        adverse_bps = (bar.open - bar.close) / bar.close * 1e4
+        strength = min(100.0, (pct / self.config.min_delta_pct) * 40)
+        details = {
+            "type": "delta_close_mismatch",
+            "delta": delta.vertical_delta,
+            "delta_pct": round(delta.delta_pct, 4),
+            "aggressive_buy_vol": delta.buy_volume,
+            "aggressive_sell_vol": delta.sell_volume,
+        }
+
+        # Positive delta (buy pressure) but bearish bar
+        if delta.vertical_delta > 0 and adverse_bps >= self.config.min_adverse_body_bps:
             # Buyers were absorbed → bearish signal
-            strength = min(100.0, (abs_delta / self.config.min_aggressive_volume) * 40)
+            details["bar_close"] = "bearish"
             return self._create_signal(
-                candle=candle,
+                bar=bar,
                 direction=Side.SELL,
-                price_level=candle.high,  # Absorption happened at the high
+                price_level=bar.high,  # Absorption happened at the high
                 strength=strength,
-                details={
-                    "type": "delta_close_mismatch",
-                    "delta": delta.vertical_delta,
-                    "candle_close": "bearish",
-                    "aggressive_buy_vol": delta.buy_volume,
-                    "aggressive_sell_vol": delta.sell_volume,
-                },
+                details=details,
             )
 
-        # Negative delta (sell pressure) but bullish candle close
-        if delta.vertical_delta < 0 and candle.is_green:
+        # Negative delta (sell pressure) but bullish bar
+        if delta.vertical_delta < 0 and -adverse_bps >= self.config.min_adverse_body_bps:
             # Sellers were absorbed → bullish signal
-            strength = min(100.0, (abs_delta / self.config.min_aggressive_volume) * 40)
+            details["bar_close"] = "bullish"
             return self._create_signal(
-                candle=candle,
+                bar=bar,
                 direction=Side.BUY,
-                price_level=candle.low,  # Absorption happened at the low
+                price_level=bar.low,  # Absorption happened at the low
                 strength=strength,
-                details={
-                    "type": "delta_close_mismatch",
-                    "delta": delta.vertical_delta,
-                    "candle_close": "bullish",
-                    "aggressive_buy_vol": delta.buy_volume,
-                    "aggressive_sell_vol": delta.sell_volume,
-                },
+                details=details,
             )
 
         return None
 
     def _check_level_absorption(
         self,
-        candle: Candle,
+        bar: InfoBar,
         footprint: FootprintBar,
         current_price: float,
     ) -> Optional[Signal]:
         """
         Check for absorption at specific price levels within the footprint.
         High volume at a level + price didn't break through = absorption.
+        Needs real price-level volume; info bars have none, so nothing is inferred.
         """
-        if not footprint.levels:
+        if not footprint.has_price_levels:
             return None
 
         now_ms = self._clock.now_ms()
@@ -204,7 +209,7 @@ class AbsorptionDetector:
                         + event.attempts * 15,
                     )
                     signal = self._create_signal(
-                        candle=candle,
+                        bar=bar,
                         direction=direction,
                         price_level=price,
                         strength=strength,
@@ -236,14 +241,14 @@ class AbsorptionDetector:
 
     def _create_signal(
         self,
-        candle: Candle,
+        bar: InfoBar,
         direction: Side,
         price_level: float,
         strength: float,
         details: dict,
     ) -> Signal:
         signal = Signal(
-            timestamp_ms=candle.timestamp_ms,
+            timestamp_ms=bar.timestamp_ms,
             signal_type=SignalType.ABSORPTION,
             direction=direction,
             price_level=price_level,

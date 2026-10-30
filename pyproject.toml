@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "orderflow-system"
 version = "0.1.0"
-description = "Semi-automated orderflow trading alert system based on Fabio's methodology"
+description = "Semi-automated orderflow trading alert system on information-driven bars, based on Fabio's methodology"
 requires-python = ">=3.10"
 dependencies = [
     "websockets>=12.0",
-    "aiohttp>=3.9",
+    "pyarrow>=15.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
     "pandas>=2.1",
     "numpy>=1.26",
     "scipy>=1.12",
@@ -22,11 +24,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27"]
 tuning = ["RiskLabAI[hpo]>=3.1,<4", "optuna>=4.9,<5"]
 
 [project.scripts]
 orderflow = "orderflow_system.main:main"
 
-[tool.setuptools]
-packages = ["orderflow_system"]
+[tool.setuptools.packages.find]
+include = ["orderflow_system*"]
+
+[tool.setuptools.package-data]
+orderflow_system = ["dashboard/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "orderflow_system"]
+markers = ["real_data: needs the external info-bar dataset mounted at /Volumes/Market-Data"]

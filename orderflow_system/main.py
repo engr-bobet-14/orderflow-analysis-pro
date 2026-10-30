@@ -1,619 +1,288 @@
 """
-Main Orchestrator — Wires all components together and runs the system.
+Main Orchestrator — wires the info-bar pipeline to storage, alerts and the dashboard.
 
 Architecture:
-  Data Source (MT5 or Bybit) → Ticks → CandleBuilder → Analytics Engines → Pattern Detectors
-       ↓                              ↓                        ↓
-  OrderbookTracker              DeltaEngine              Profile Framing
-       ↓                              ↓                        ↓
-                       Signal Aggregator (State Machine)
-                                    ↓
-                       Telegram Alert Bot + Database Logging
+  Parquet info-bar dataset -> InfoBarReplayFeed -> InfoBarPipeline (pure, deterministic)
+                                                      |  delta / footprint / patterns /
+                                                      |  session profile / bias / signal state machine
+                                                      v
+                                   SQLite (optional) + Telegram (optional) + Dashboard WebSocket
 
-Data Sources:
-  - MT5 (default): Real NAS100/XAUUSD data from MetaTrader 5 terminal
-  - Bybit: Free perpetual futures data via WebSocket
-  - Both: Run both feeds simultaneously
+The pipeline (orderflow_system/pipeline.py) does all analysis with no I/O and no
+wall clock. This module only moves data in and results out.
+
+Data source: information-driven bars (six bar types, selected via --bar-type or
+settings.INFO_BARS). Live Binance feeds are not implemented yet.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
+import hashlib
+import json
 import signal
 import sys
-from datetime import datetime, timezone
+from dataclasses import asdict, replace
 from typing import Optional
 
 from orderflow_system.config.settings import (
-    InstrumentConfig,
-    Instrument,
-    DataSource,
-    get_all_configs,
-    TELEGRAM,
-    DB_PATH,
-    LOG_LEVEL,
-    DATA_SOURCE,
-    MT5,
     DASHBOARD,
+    DB_PATH,
+    INFO_BARS,
+    LOG_LEVEL,
+    TELEGRAM,
+    InfoBarConfig,
+    InstrumentConfig,
+    get_all_configs,
 )
-from orderflow_system.data.models import (
-    Tick, Candle, Signal, Side, OrderbookSnapshot,
-)
-from orderflow_system.data.bybit_feed import BybitFeed
-from orderflow_system.data.mt5_feed import MT5Feed
-from orderflow_system.data.candle_builder import CandleBuilder
-from orderflow_system.data.database import Database
-from orderflow_system.analytics.volume_profile import VolumeProfileEngine
-from orderflow_system.analytics.delta import DeltaEngine
-from orderflow_system.analytics.footprint import FootprintEngine
-from orderflow_system.analytics.orderbook import OrderbookTracker
-from orderflow_system.patterns.absorption import AbsorptionDetector
-from orderflow_system.patterns.initiative import InitiativeDetector
-from orderflow_system.patterns.sweep import SweepDetector
-from orderflow_system.patterns.exhaustion import ExhaustionDetector
-from orderflow_system.patterns.divergence import DivergenceDetector
-from orderflow_system.signals.profile_framing import ProfileFramingEngine
-from orderflow_system.signals.aggregator import SignalAggregator
 from orderflow_system.alerts.telegram_bot import TelegramAlertBot
-from orderflow_system.dashboard.websocket_manager import WebSocketManager
 from orderflow_system.dashboard.app import app as dashboard_app, set_system, ws_manager
+from orderflow_system.dashboard.websocket_manager import WebSocketManager
+from orderflow_system.dashboard.trade_serializer import serialize_trade
+from orderflow_system.data.database import Database
+from orderflow_system.data.infobar_feed import InfoBarReader, InfoBarReplayFeed, open_bars
+from orderflow_system.data.models import BarType, InfoBar
+from orderflow_system.pipeline import BarResult, InfoBarPipeline
 
 logger = logging.getLogger("orderflow_system")
 
-
-class InstrumentPipeline:
-    """
-    Full processing pipeline for a single instrument.
-    Ticks → Candles → Analytics → Patterns → Signals → Alerts.
-    """
-
-    def __init__(self, config: InstrumentConfig):
-        self.config = config
-        self.symbol = config.instrument.value
-
-        # Analytics engines
-        self.candle_builder = CandleBuilder(
-            interval_seconds=60,
-            tick_size=config.tick_size,
-            on_candle_close=self._on_candle_close,
-        )
-        self.vp_engine = VolumeProfileEngine(config.volume_profile)
-        self.delta_engine = DeltaEngine(tick_size=config.tick_size)
-        self.footprint_engine = FootprintEngine(tick_size=config.tick_size)
-        self.orderbook_tracker = OrderbookTracker(
-            thin_threshold=config.sweep.thin_book_threshold
-        )
-
-        # Pattern detectors
-        self.absorption = AbsorptionDetector(config.absorption, tick_size=config.tick_size)
-        self.initiative = InitiativeDetector(config.initiative, tick_size=config.tick_size)
-        self.sweep = SweepDetector(config.sweep)
-        self.exhaustion = ExhaustionDetector(config.exhaustion)
-        self.divergence = DivergenceDetector(config.divergence)
-
-        # Profile framing
-        self.profile_framing = ProfileFramingEngine()
-
-        # Current price tracker
-        self._current_price: float = 0.0
-        self._tick_count: int = 0
-        # Callback for routing candle-close signals to the system
-        self._on_signals_callback = None
-        self._candle_count: int = 0
-
-    async def process_tick(self, tick: Tick):
-        """Process a single tick through the pipeline."""
-        self._current_price = tick.price
-        self._tick_count += 1
-        await self.candle_builder.process_tick(tick)
-
-    async def process_orderbook(self, snapshot: OrderbookSnapshot):
-        """Process an orderbook update."""
-        book_state = self.orderbook_tracker.update(snapshot)
-
-        # Check for sweep on every book update
-        current_candle = self.candle_builder.current_candle
-        if current_candle and self.footprint_engine.history:
-            fp = self.footprint_engine.history[-1]
-            signal = self.sweep.check(
-                self.orderbook_tracker, current_candle, fp
-            )
-            if signal:
-                return signal
-        return None
-
-    async def _on_candle_close(self, candle: Candle) -> list[Signal]:
-        """
-        Called when a candle closes. Run all analytics and pattern checks.
-        This is the main processing pipeline for each candle.
-        """
-        self._candle_count += 1
-        signals: list[Signal] = []
-
-        # 1. Compute delta
-        delta = self.delta_engine.compute_from_candle(candle)
-
-        # 2. Build footprint
-        footprint = self.footprint_engine.build_from_candle(candle)
-
-        # 3. Check each pattern detector
-        # Absorption
-        abs_signal = self.absorption.check_candle(
-            candle, footprint, delta, self._current_price
-        )
-        if abs_signal:
-            signals.append(abs_signal)
-            logger.info(f"[{self.symbol}] {abs_signal}")
-
-        # Initiative
-        init_signal = self.initiative.check_candle(candle, delta, footprint)
-        if init_signal:
-            signals.append(init_signal)
-            logger.info(f"[{self.symbol}] {init_signal}")
-
-        # Exhaustion (needs candle history)
-        recent = self.candle_builder.get_recent_candles(10)
-        exh_signal = self.exhaustion.check_candle(
-            candle, delta, self.delta_engine, footprint, recent
-        )
-        if exh_signal:
-            signals.append(exh_signal)
-            logger.info(f"[{self.symbol}] {exh_signal}")
-
-        # Divergence
-        div_signal = self.divergence.check_candle(candle, self.delta_engine)
-        if div_signal:
-            signals.append(div_signal)
-            logger.info(f"[{self.symbol}] {div_signal}")
-
-        # Route signals to the system if callback is set
-        if signals and self._on_signals_callback:
-            await self._on_signals_callback(self.symbol, signals)
-
-        return signals
-
-    @property
-    def current_price(self) -> float:
-        return self._current_price
-
-    @property
-    def stats(self) -> dict:
-        return {
-            "symbol": self.symbol,
-            "price": self._current_price,
-            "ticks": self._tick_count,
-            "candles": self._candle_count,
-            "cum_delta": self.delta_engine.cumulative_delta,
-        }
+_DB_FLUSH_BARS = 2000
+_STATS_EVERY_BARS = 500
 
 
 class OrderflowSystem:
     """
-    Main system orchestrator.
-    Manages multiple instruments, coordinates between pipelines,
-    and routes signals to alerts.
+    Runs one info-bar replay through the pipeline and fans results out.
+
+    send_alerts: Telegram alerts are OFF by default because a replay emits
+    historical signals; enable only when the feed is the live edge.
     """
 
     def __init__(
         self,
         instruments: Optional[list[InstrumentConfig]] = None,
-        data_source: DataSource = DATA_SOURCE,
+        info_bars: InfoBarConfig = INFO_BARS,
+        send_alerts: bool = False,
     ):
-        if instruments is None:
-            instruments = get_all_configs()
+        instruments = instruments or get_all_configs()
+        self.info_bars = info_bars
+        self.send_alerts = send_alerts
 
-        self.data_source = data_source
-        self.pipelines: dict[str, InstrumentPipeline] = {}
-        for cfg in instruments:
-            self.pipelines[cfg.instrument.value] = InstrumentPipeline(cfg)
+        cfg = next((c for c in instruments if c.instrument.value == info_bars.symbol), None)
+        if cfg is None:
+            raise ValueError(
+                f"No instrument config for symbol {info_bars.symbol!r}; "
+                f"configured: {[c.instrument.value for c in instruments]}"
+            )
+        self.symbol = cfg.instrument.value
+        config_payload = asdict(cfg)
+        self.config_digest = hashlib.sha256(json.dumps(
+            config_payload, sort_keys=True, separators=(",", ":"), default=lambda value: value.value,
+        ).encode()).hexdigest()
+        self.run_id: Optional[str] = None
+        self._first_session_date: Optional[str] = None
+        self._first_session_complete = False
+        self._tasks: list[asyncio.Task] = []
+        self.pipelines: dict[str, InfoBarPipeline] = {
+            self.symbol: InfoBarPipeline(
+                cfg, bar_type=info_bars.bar_type, history_bars=info_bars.history_bars
+            )
+        }
 
-        self.aggregator = SignalAggregator(
-            min_composite_score=40.0,
-            signal_cooldown_seconds=30.0,
-        )
-
-        # Wire candle-close signals from each pipeline back to the system
-        for sym, pipeline in self.pipelines.items():
-            pipeline._on_signals_callback = self._on_candle_signals
         self.telegram = TelegramAlertBot(
-            bot_token=TELEGRAM.bot_token,
-            chat_id=TELEGRAM.chat_id,
+            bot_token=TELEGRAM.bot_token, chat_id=TELEGRAM.chat_id,
         )
         self.db = Database(DB_PATH)
-        self.feed: Optional[BybitFeed] = None
-        self.mt5_feed: Optional[MT5Feed] = None
         self.ws_manager: WebSocketManager = ws_manager
+        self.reader: Optional[InfoBarReader] = None
+        self.feed: Optional[InfoBarReplayFeed] = None
+        self.replay_finished = False
         self._running = False
-        self._tick_batch_size = 100
-        self._tick_buffers: dict[str, list[Tick]] = {}
+        self._stopping = False
+        self._stop_event = asyncio.Event()
+        self._bar_buffer: list[InfoBar] = []
+
+    # ── lifecycle ───────────────────────────────────────────
 
     async def start(self):
-        """Start the complete system."""
         logger.info("=" * 60)
-        logger.info("  ORDERFLOW TRADING ALERT SYSTEM")
-        logger.info("  Based on Fabio's Orderflow Methodology")
+        logger.info("  ORDERFLOW ANALYSIS — INFORMATION-DRIVEN BARS")
         logger.info("=" * 60)
 
-        # Initialize database
-        await self.db.connect()
-        logger.info("Database connected")
-
-        # Initialize Telegram
-        await self.telegram.initialize()
-
-        # Load historical profiles (if available) into profile framing engines
-        for symbol, pipeline in self.pipelines.items():
-            profiles = await self.db.get_volume_profiles(symbol, days=5)
-            for vp in profiles:
-                pipeline.profile_framing.add_profile(vp)
-            if profiles:
-                bias = pipeline.profile_framing.analyze(pipeline.current_price)
-                logger.info(
-                    f"[{symbol}] Loaded {len(profiles)} historical profiles. "
-                    f"Bias: {bias.direction.value} ({bias.confidence:.0f}%)"
-                )
-                await self.telegram.send_daily_bias_update(symbol, bias)
-
-        # Start data feed(s) based on configured source
-        symbols = list(self.pipelines.keys())
-        feed_tasks = []
-
-        if self.data_source in (DataSource.MT5, DataSource.BOTH):
-            # ── MetaTrader 5 Feed ──
-            self.mt5_feed = MT5Feed(
-                symbols=dict(MT5.symbols),
-                on_tick=self._on_tick,
-                on_orderbook=self._on_orderbook,
-                poll_interval_ms=MT5.poll_interval_ms,
-                enable_book=MT5.enable_book,
-            )
-            feed_tasks.append(self.mt5_feed.start())
-            logger.info(
-                f"MT5 feed configured: {len(MT5.symbols)} symbols "
-                f"(poll: {MT5.poll_interval_ms}ms, book: {MT5.enable_book})"
-            )
-
-            # Connect to MT5 early so symbol validation happens before feeds start
-            if not self.mt5_feed.connect():
-                logger.error("MT5 connection failed — skipping history download")
-            elif MT5.download_history_days > 0:
-                # Download M1 bars synchronously BEFORE starting feeds/dashboard
-                self._download_mt5_history_sync()
-
-        if self.data_source in (DataSource.BYBIT, DataSource.BOTH):
-            # ── Bybit WebSocket Feed ──
-            self.feed = BybitFeed(
-                symbols=symbols,
-                on_tick=self._on_tick,
-                on_orderbook=self._on_orderbook,
-            )
-            feed_tasks.append(self.feed.start())
-            logger.info(f"Bybit feed configured: {symbols}")
-
-        self._running = True
-        source_name = self.data_source.value.upper()
-        logger.info(f"Starting live feed [{source_name}] for: {', '.join(symbols)}")
-
-        # ── Dashboard (FastAPI + Uvicorn) ──
-        if DASHBOARD.enabled:
-            import uvicorn
-            set_system(self)
-            uvi_config = uvicorn.Config(
-                dashboard_app,
-                host=DASHBOARD.host,
-                port=DASHBOARD.port,
-                log_level=DASHBOARD.log_level,
-                loop="none",
-            )
-            uvi_server = uvicorn.Server(uvi_config)
-            feed_tasks.append(uvi_server.serve())
-            logger.info(f"Dashboard enabled at http://{DASHBOARD.host}:{DASHBOARD.port}")
-
-        # Run feed(s) + periodic tasks + dashboard concurrently
-        await asyncio.gather(
-            *feed_tasks,
-            self._periodic_tasks(),
+        # Discover the dataset before allocating a SQLite worker thread.
+        self.reader = open_bars(
+            self.info_bars.root, self.info_bars.symbol, self.info_bars.bar_type,
+            start=self.info_bars.start, end=self.info_bars.end, strict=self.info_bars.strict,
+            version=self.info_bars.version,
         )
+        info = self.reader.info
+        logger.info(
+            f"Dataset: {info.parquet_path} | {self.info_bars.bar_type.value} "
+            f"| window [{self.info_bars.start or 'begin'} .. {self.info_bars.end or 'end'})"
+        )
+        if self.info_bars.persist:
+            await self.db.connect()
+        try:
+            if self.info_bars.persist:
+                run_payload = [info.dataset_id, self.info_bars.bar_type.value,
+                               self.reader.start_ms, self.reader.end_ms, self.config_digest]
+                self.run_id = hashlib.sha256(json.dumps(
+                    run_payload, separators=(",", ":"),
+                ).encode()).hexdigest()
+                await self.db.create_run(
+                    self.run_id, info.dataset_id, str(info.parquet_path.resolve()), info.version,
+                    self.info_bars.bar_type, self.symbol, self.reader.start_ms, self.reader.end_ms,
+                    self.config_digest,
+                )
+            await self.telegram.initialize()
+            self.feed = InfoBarReplayFeed(
+                self.reader, self._on_bar, bars_per_second=self.info_bars.bars_per_second
+            )
+            self._running = True
+            self._tasks = [asyncio.create_task(self._replay(), name="orderflow-replay")]
+            if DASHBOARD.enabled:
+                import uvicorn
+                set_system(self)
+                server = uvicorn.Server(uvicorn.Config(
+                    dashboard_app, host=DASHBOARD.host, port=DASHBOARD.port,
+                    log_level=DASHBOARD.log_level, loop="none",
+                ))
+                self._uvicorn = server
+                self._tasks.append(asyncio.create_task(server.serve(), name="orderflow-dashboard"))
+                logger.info(f"Dashboard enabled at http://{DASHBOARD.host}:{DASHBOARD.port}")
+            stop_task = asyncio.create_task(self._stop_event.wait(), name="orderflow-stop")
+            self._tasks.append(stop_task)
+            done, _ = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Re-raise any child failure only after the finally block has joined siblings.
+            for task in done:
+                task.result()
+        finally:
+            try:
+                await self.stop()
+            finally:
+                for task in self._tasks:
+                    if not task.done():
+                        task.cancel()
+                if self._tasks:
+                    await asyncio.gather(*self._tasks, return_exceptions=True)
+                try:
+                    if self.db._db is not None:
+                        await self._flush_bars()
+                finally:
+                    await self.db.close()
+                    self._running = False
+                    if DASHBOARD.enabled:
+                        set_system(None)
+                    logger.info("System stopped.")
+
+    async def _replay(self):
+        sent = await self.feed.run()
+        await self._flush_bars()
+        self.replay_finished = True
+        pipeline = self.pipelines[self.symbol]
+        rep = self.reader.report
+        logger.info(
+            f"Replay finished: {sent} bars | rejected={rep.rows_rejected} "
+            f"tied_ts={rep.tied_timestamps} gap_bars={rep.bars_spanning_missing_hours} "
+            f"| {pipeline.stats}"
+        )
+        await self.ws_manager.broadcast_stats(self._stats_payload())
+        if DASHBOARD.enabled:
+            await self._stop_event.wait()    # keep serving the dashboard until stopped
+        else:
+            await self.stop()
 
     async def stop(self):
-        """Gracefully shut down."""
+        if self._stopping:      # uvicorn re-raises the signal to our handler: stop() runs once
+            return
+        self._stopping = True
         logger.info("Shutting down...")
         self._running = False
         if self.feed:
             await self.feed.stop()
-        if self.mt5_feed:
-            await self.mt5_feed.stop()
-        await self.db.close()
-        logger.info("System stopped.")
+        if getattr(self, "_uvicorn", None):
+            self._uvicorn.should_exit = True
+        self._stop_event.set()
 
-    def _download_mt5_history_sync(self):
-        """
-        Download historical 1-minute bars from MT5 and inject into candle builders.
-        Runs synchronously before the event loop starts so candles are always available.
-        """
-        if not self.mt5_feed or not self.mt5_feed._mt5:
-            logger.warning("No MT5 connection — skipping history download")
-            return
+    # ── per-bar I/O ─────────────────────────────────────────
 
-        mt5_mod = self.mt5_feed._mt5   # already-initialized MetaTrader5 module
-        from datetime import timedelta
+    async def _on_bar(self, bar: InfoBar):
+        pipeline = self.pipelines[self.symbol]
+        result: BarResult = pipeline.process_bar(bar)   # sync, no I/O
+        if self._first_session_date is None:
+            from orderflow_system.pipeline import utc_date
+            self._first_session_date = utc_date(bar.timestamp_ms)
+            session_midnight_ms = (bar.timestamp_ms // 86_400_000) * 86_400_000
+            predecessor_ms = self.reader.first_predecessor_ms if self.reader is not None else None
+            self._first_session_complete = predecessor_ms is None or predecessor_ms < session_midnight_ms
+        paced = self.info_bars.bars_per_second > 0
 
-        now = datetime.now(timezone.utc)
-        from_date = now - timedelta(days=MT5.download_history_days)
-
-        logger.info(
-            f"Downloading M1 bars for {len(MT5.symbols)} instruments "
-            f"({MT5.download_history_days}d)..."
-        )
-
-        total_added = 0
-        for internal, mt5_sym in MT5.symbols.items():
-            pipeline = self.pipelines.get(internal)
-            if not pipeline:
-                continue
-
-            try:
-                rates = mt5_mod.copy_rates_range(
-                    mt5_sym, mt5_mod.TIMEFRAME_M1, from_date, now
+        if self.info_bars.persist:
+            self._bar_buffer.append(bar)
+            for sig in result.signals:
+                await self.db.insert_signal(
+                    self.symbol, sig, bar_type=self.info_bars.bar_type, commit=False,
+                    run_id=self.run_id, bar_seq=bar.seq,
                 )
+            if len(self._bar_buffer) >= _DB_FLUSH_BARS:
+                await self._flush_bars()
 
-                if rates is None or len(rates) == 0:
-                    logger.warning(f"[{internal}] No M1 bars for {mt5_sym}")
-                    continue
+        if result.closed_profile is not None:
+            await self._on_session_closed(pipeline, result)
 
-                # Convert to Candle objects
-                candles = []
-                for r in rates:
-                    candles.append(Candle(
-                        timestamp_ms=int(r['time']) * 1000,
-                        open=float(r['open']),
-                        high=float(r['high']),
-                        low=float(r['low']),
-                        close=float(r['close']),
-                        volume=float(
-                            r['real_volume'] if r['real_volume'] > 0
-                            else r['tick_volume']
-                        ),
-                        buy_volume=0.0,
-                        sell_volume=0.0,
-                        tick_count=int(r['tick_volume']),
-                    ))
-
-                added = pipeline.candle_builder.load_historical_candles(candles)
-                total_added += added
-
-                # Build VP from candle history
-                today = now.strftime("%Y-%m-%d")
-                all_candles = pipeline.candle_builder.history
-                if all_candles:
-                    vp = pipeline.vp_engine.compute_from_candles(
-                        all_candles, session_date=today
-                    )
-                    if vp.total_volume > 0:
-                        pipeline.profile_framing.add_profile(vp)
-
-                logger.info(
-                    f"[{internal}] +{added} M1 bars (total {len(all_candles)})"
+        for agg in result.aggregated:
+            trade = agg.execution
+            if self.send_alerts:
+                await self.telegram.send_signal_alert(
+                    self.symbol, agg, pipeline.profile_framing.current_bias, trade
                 )
+            if paced:
+                await self.ws_manager.broadcast_signal(self.symbol, agg)
+                if trade:
+                    await self.ws_manager.broadcast_trade_state(self.symbol, serialize_trade(trade))
 
-            except Exception as e:
-                logger.error(
-                    f"[{internal}] History download failed: {e}",
-                    exc_info=True,
-                )
+        # Dashboard polls bars over REST; in a fast replay only periodic stats are pushed.
+        if pipeline.bars_processed % _STATS_EVERY_BARS == 0 or paced:
+            await self.ws_manager.broadcast_stats(self._stats_payload())
 
-        logger.info(
-            f"History download complete: {total_added} total candles loaded"
-        )
-
-    async def _on_tick(self, symbol: str, tick: Tick):
-        """Handle incoming tick."""
-        pipeline = self.pipelines.get(symbol)
-        if not pipeline:
-            return
-
-        await pipeline.process_tick(tick)
-
-        # Broadcast to dashboard (throttled by ws_manager)
-        await self.ws_manager.broadcast_tick(
-            symbol, tick.price, tick.size, tick.side.value
-        )
-
-        # Buffer ticks for batch DB insert
-        if symbol not in self._tick_buffers:
-            self._tick_buffers[symbol] = []
-        self._tick_buffers[symbol].append(tick)
-
-        if len(self._tick_buffers[symbol]) >= self._tick_batch_size:
-            await self.db.insert_ticks_batch(symbol, self._tick_buffers[symbol])
-            self._tick_buffers[symbol] = []
-
-    async def _on_orderbook(self, symbol: str, snapshot: OrderbookSnapshot):
-        """Handle orderbook update."""
-        pipeline = self.pipelines.get(symbol)
-        if not pipeline:
-            return
-
-        sweep_signal = await pipeline.process_orderbook(snapshot)
-
-        # Broadcast orderbook to dashboard (throttled)
-        await self.ws_manager.broadcast_orderbook(symbol, {
-            "best_bid": snapshot.best_bid,
-            "best_ask": snapshot.best_ask,
-            "spread": snapshot.spread,
-            "imbalance": round(snapshot.imbalance_ratio(), 4),
-        })
-
-        if sweep_signal:
-            await self._handle_signal(symbol, pipeline, sweep_signal)
-
-    async def _on_candle_signals(self, symbol: str, signals: list[Signal]):
-        """Called by InstrumentPipeline callback when candle-close produces signals."""
-        pipeline = self.pipelines.get(symbol)
-        if not pipeline:
-            return
-
-        for signal in signals:
-            await self._handle_signal(symbol, pipeline, signal)
-
-    async def _on_candle_close_handler(self, symbol: str, candle: Candle):
-        """Process closed candle signals."""
-        pipeline = self.pipelines.get(symbol)
-        if not pipeline:
-            return
-
-        signals = await pipeline._on_candle_close(candle)
-
-        # Store candle
-        await self.db.insert_candle(symbol, "1m", candle)
-
-        # Broadcast candle to dashboard
-        await self.ws_manager.broadcast_candle(symbol, {
-            "time": candle.timestamp_ms / 1000,
-            "open": round(candle.open, 6),
-            "high": round(candle.high, 6),
-            "low": round(candle.low, 6),
-            "close": round(candle.close, 6),
-            "volume": round(candle.volume, 2),
-            "delta": round(candle.delta, 2),
-        })
-
-        # Broadcast cumulative delta
-        await self.ws_manager.broadcast_delta(symbol, {
-            "time": candle.timestamp_ms / 1000,
-            "value": round(pipeline.delta_engine.cumulative_delta, 2),
-            "bar_delta": round(candle.delta, 2),
-        })
-
-        # Process each signal through the aggregator
-        for signal in signals:
-            await self._handle_signal(symbol, pipeline, signal)
-
-    async def _handle_signal(
-        self, symbol: str, pipeline: InstrumentPipeline, signal: Signal
-    ):
-        """Route a signal through the aggregator and send alerts."""
-        # Store raw signal
-        await self.db.insert_signal(symbol, signal)
-
-        # Get current bias
-        bias = pipeline.profile_framing.current_bias
-
-        # Aggregate with context
-        agg = self.aggregator.process_signal(
-            instrument=symbol,
-            signal=signal,
-            bias=bias,
-            current_price=pipeline.current_price,
-            recent_candles=pipeline.candle_builder.get_recent_candles(5),
-        )
-
-        if agg:
-            trade = self.aggregator.get_active_trade(symbol)
-            await self.telegram.send_signal_alert(symbol, agg, bias, trade)
-
-            # Broadcast signal + trade state to dashboard
-            await self.ws_manager.broadcast_signal(symbol, agg)
-            if trade:
-                await self.ws_manager.broadcast_trade_state(symbol, trade)
-
-    async def _periodic_tasks(self):
-        """Run periodic tasks: VP rebuild, bias update, stats logging."""
-        profile_interval = 3600       # Rebuild VP every hour
-        stats_interval = 15           # Broadcast stats every 15 sec
-        last_profile = 0
-        last_stats = 0
-
-        while self._running:
-            await asyncio.sleep(10)
-            now = asyncio.get_event_loop().time()
-
-            # Flush remaining tick buffers
-            for symbol in list(self._tick_buffers.keys()):
-                if self._tick_buffers[symbol]:
-                    await self.db.insert_ticks_batch(
-                        symbol, self._tick_buffers[symbol]
-                    )
-                    self._tick_buffers[symbol] = []
-
-            # Periodic VP rebuild
-            if now - last_profile > profile_interval:
-                last_profile = now
-                for symbol, pipeline in self.pipelines.items():
-                    await self._rebuild_volume_profile(symbol, pipeline)
-
-            # Stats logging
-            if now - last_stats > stats_interval:
-                last_stats = now
-                all_stats = []
-                for symbol, pipeline in self.pipelines.items():
-                    stats = pipeline.stats
-                    logger.info(
-                        f"[{symbol}] price={stats['price']:.2f} "
-                        f"ticks={stats['ticks']} candles={stats['candles']} "
-                        f"cum_delta={stats['cum_delta']:.1f}"
-                    )
-                    all_stats.append(stats)
-
-                # Broadcast system-wide stats
-                await self.ws_manager.broadcast_stats({
-                    "data_source": self.data_source.value,
-                    "ws_clients": self.ws_manager.client_count,
-                    "instruments": all_stats,
-                })
-
-                # Broadcast per-symbol stats so dashboard updates per tab
-                for symbol, pipeline in self.pipelines.items():
-                    await self.ws_manager.broadcast(
-                        "stats", pipeline.stats, symbol=symbol
-                    )
-
-    async def _rebuild_volume_profile(
-        self, symbol: str, pipeline: InstrumentPipeline
-    ):
-        """Rebuild volume profile from recent candle data."""
-        # Get today's candles from DB
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        start_ms = now_ms - 24 * 3600 * 1000  # Last 24h
-
-        candles = await self.db.get_candles(symbol, "1m", start_ms, now_ms)
-        if len(candles) < 10:
-            return
-
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        vp = pipeline.vp_engine.compute_from_candles(candles, session_date=today)
-
-        if vp.total_volume > 0:
-            pipeline.profile_framing.add_profile(vp)
-            await self.db.insert_volume_profile(symbol, vp)
-            bias = pipeline.profile_framing.analyze(pipeline.current_price)
-            logger.info(
-                f"[{symbol}] VP rebuilt: POC={vp.poc:.2f} "
-                f"VAH={vp.vah:.2f} VAL={vp.val:.2f} "
-                f"Shape={vp.shape} | Bias={bias.direction.value}"
+    async def _on_session_closed(self, pipeline: InfoBarPipeline, result: BarResult):
+        vp, bias = result.closed_profile, result.bias
+        if self.info_bars.persist:
+            complete = vp.session_date != self._first_session_date or self._first_session_complete
+            await self.db.insert_volume_profile(
+                self.symbol, vp, bar_type=self.info_bars.bar_type,
+                run_id=self.run_id, complete=complete,
             )
-
-            # Broadcast VP + bias to dashboard
-            await self.ws_manager.broadcast_volume_profile(symbol, {
-                "poc": vp.poc,
-                "vah": vp.vah,
-                "val": vp.val,
-                "shape": vp.shape,
-                "total_volume": vp.total_volume,
-                "lvn_levels": vp.lvn_levels,
-                "volume_at_price": {
-                    str(p): v for p, v in sorted(vp.volume_at_price.items())
-                },
+        if self.send_alerts and bias is not None:
+            await self.telegram.send_daily_bias_update(self.symbol, bias)
+        if self.info_bars.bars_per_second > 0:
+            await self.ws_manager.broadcast_volume_profile(self.symbol, {
+                "poc": vp.poc, "vah": vp.vah, "val": vp.val, "shape": vp.shape,
+                "total_volume": vp.total_volume, "lvn_levels": vp.lvn_levels,
+                "source": vp.source,
             })
-            await self.ws_manager.broadcast_bias(symbol, bias)
+            if bias is not None:
+                await self.ws_manager.broadcast_bias(self.symbol, bias)
 
-            # Auto-watch qualified levels
-            for level in bias.qualified_levels:
-                if level.strength >= 50:
-                    self.aggregator.set_watching(
-                        symbol, level, level.direction
-                    )
+    async def _flush_bars(self):
+        if self._bar_buffer:
+            await self.db.insert_bars_batch(
+                self.symbol, self.info_bars.bar_type, self._bar_buffer,
+                dataset_id=self.reader.info.dataset_id,
+            )
+            self._bar_buffer = []
+        if self.db._db is not None:
+            await self.db.commit()
+
+    def _stats_payload(self) -> dict:
+        return {
+            "data_source": f"info-bars:{self.info_bars.bar_type.value}",
+            "replay_finished": self.replay_finished,
+            "ws_clients": self.ws_manager.client_count,
+            "instruments": [p.stats for p in self.pipelines.values()],
+        }
 
 
 def setup_logging():
@@ -629,21 +298,39 @@ def setup_logging():
     )
 
 
-def main():
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Orderflow analysis on information-driven bars")
+    p.add_argument("--bar-type", choices=[b.value for b in BarType], default=INFO_BARS.bar_type.value)
+    p.add_argument("--start", default=INFO_BARS.start, help="Inclusive UTC date/datetime")
+    p.add_argument("--end", default=INFO_BARS.end, help="Exclusive UTC date/datetime")
+    p.add_argument("--root", default=INFO_BARS.root)
+    p.add_argument("--version", default=INFO_BARS.version, help="Dataset stamp, e.g. 20261026T135000Z")
+    p.add_argument("--speed", type=float, default=INFO_BARS.bars_per_second,
+                   help="Replay bars/second (0 = as fast as possible)")
+    p.add_argument("--persist", action="store_true", default=INFO_BARS.persist,
+                   help="Write bars, signals and profiles to SQLite")
+    p.add_argument("--no-dashboard", action="store_true")
+    p.add_argument("--alerts", action="store_true", help="Send Telegram alerts for replayed signals")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None):
     """Entry point."""
+    args = parse_args(argv)
     setup_logging()
+    if args.no_dashboard:
+        DASHBOARD.enabled = False
 
-    logger.info(f"Data source: {DATA_SOURCE.value.upper()}")
-    if DATA_SOURCE in (DataSource.MT5, DataSource.BOTH):
-        logger.info(f"MT5 symbols: {MT5.symbols}")
-        logger.info(
-            "Make sure MetaTrader 5 is running and logged into your broker account."
-        )
+    cfg = replace(
+        INFO_BARS, root=args.root, bar_type=BarType(args.bar_type), version=args.version,
+        start=args.start, end=args.end, bars_per_second=args.speed, persist=args.persist,
+    )
+    logger.info(f"Info bars: {cfg.bar_type.value} {cfg.symbol} from {cfg.root}")
 
-    system = OrderflowSystem(data_source=DATA_SOURCE)
+    system = OrderflowSystem(info_bars=cfg, send_alerts=args.alerts)
 
-    # Handle Ctrl+C gracefully
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     def shutdown_handler():
         logger.info("Received shutdown signal...")

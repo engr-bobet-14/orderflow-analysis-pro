@@ -1,7 +1,7 @@
 /**
  * Footprint Chart Component — TradingView-Style
  * Drag to pan, scroll to zoom, crosshair cursor, smooth canvas rendering
- * Bid/Ask volume heatmap at each price level per candle bar
+ * Bid/Ask volume heatmap at each price level per info bar
  */
 
 class FootprintChart {

@@ -4,7 +4,7 @@ Injectable event clock.
 `RealClock` preserves existing live-trading behavior (wall-clock time) and
 is every constructor's default, so live semantics are unchanged. Historical
 replay / backtest callers inject an `EventClock` instead and advance it to
-each candle's own timestamp as they step through history, so cooldowns and
+each bar's own timestamp as they step through history, so cooldowns and
 staleness windows are computed against market time rather than however
 fast the replay happens to execute.
 """
@@ -28,7 +28,7 @@ class RealClock:
 
 class EventClock:
     """Reports whichever timestamp was last set via `.set()`. Historical/
-    backtest callers set this to the current candle's `timestamp_ms` as
+    backtest callers set this to the current bar's `timestamp_ms` as
     they replay."""
 
     def __init__(self, now_ms: int = 0):

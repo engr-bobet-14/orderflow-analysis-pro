@@ -13,10 +13,9 @@ Brief description of changes:
 
 ## Testing
 
-- [ ] Tests pass (`pytest orderflow_system/test_integration.py`)
-- [ ] Tested with MT5 feed
-- [ ] Tested with Bybit feed
-- [ ] Tested in demo mode
+- [ ] Tests pass (`pytest`)
+- [ ] `python -m orderflow_system.validate_infobars` passes on the info-bar dataset (if analytics changed)
+- [ ] No look-ahead / no fabricated price-level data introduced
 
 ## Related Issues
 
