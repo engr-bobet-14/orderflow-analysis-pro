@@ -105,6 +105,8 @@ class RiskConfig:
     max_rr_ratio: float = 5.0                 # Maximum target R:R
     signal_cooldown_seconds: float = 30.0     # Min MARKET time between signals
     min_composite_score: float = 40.0         # Aggregator entry threshold
+    default_stop_pct: float = 0.003           # Fallback stop distance (no usable value-area levels)
+    default_target_pct: float = 0.006         # Fallback target distance (no usable value-area levels)
 
 
 @dataclass

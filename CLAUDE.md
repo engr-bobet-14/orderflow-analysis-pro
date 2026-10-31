@@ -17,6 +17,10 @@ Forked from mahmoud20138/OrderFlow-Analysis-Pro.
 * Primary information-driven bar dataset used for order-flow strategy calibration, backtesting, and validation.
 * Path: `/Volumes/Market-Data/info-bars/BTCUSDT/<bar_type>/<UTC timestamp>.parquet` (+ `.json` sidecar)
 * Bar types: `fixed_{dollar,tick,volume}_{imbalance,run}`
+* Dataset policy (default split by year):
+  * 2019–2023: development, hyperparameter optimization, and cross-validation (thresholds and parameters are fitted here).
+  * 2024–2025: out-of-sample validation only (select the best info bar type and config; no re-tuning).
+  * 2026: final untouched test set.
 * External volume: confirm `/Volumes/Market-Data` is mounted before reading. Read-only: never write there.
 * Columns: close-time `Date Time` (UTC), `Tick Number`, OHLC, per-bar volume/buy/sell, ticks, dollar value, `Threshold`. No price-level or trade-level data → never fabricate footprint, horizontal delta, tape or book (see README "What the data does not contain").
 * Ordering is (close time, `Tick Number`); close times can tie. Bars spanning `missing_tick_hours` get `data_gap`: analytical histories advance, emitted detector signals are discarded, and protective stop/target actions remain active.

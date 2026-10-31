@@ -113,6 +113,8 @@ class InfoBarPipeline:
             min_composite_score=config.risk.min_composite_score,
             signal_cooldown_seconds=config.risk.signal_cooldown_seconds,
             clock=self.clock,
+            default_stop_pct=config.risk.default_stop_pct,
+            default_target_pct=config.risk.default_target_pct,
         )
 
         self.bars: deque[InfoBar] = deque(maxlen=history_bars)
