@@ -55,30 +55,11 @@ Forked from mahmoud20138/OrderFlow-Analysis-Pro.
 ## Architecture
 
 * Authoritative architecture: `orderflow_system/pipeline.py` (pure, deterministic analysis) + `orderflow_system/main.py` (I/O)
-* Core package: `orderflow_system/`
-* Analytics: `orderflow_system/analytics/`
-* Patterns: `orderflow_system/patterns/`
-* Signals: `orderflow_system/signals/`
-* Dashboard: `orderflow_system/dashboard/`
 * Info-bar models, Parquet reader/replay, SQLite: `orderflow_system/data/` (`models.py`, `infobar_feed.py`, `database.py`)
 * Execution snapshots and shared ledger: `data/models.py`, `ledger.py`; action consumers use immutable snapshots; current dashboard views serialize live trade state with the same schema. Persisted runs retain dataset/window/config provenance.
-* Telegram alerts: `orderflow_system/alerts/`
-* Configuration: `orderflow_system/config/`
 * All settings (incl. INFO_BARS, DASHBOARD host/port): `orderflow_system/config/settings.py`
 * Invariants: analytics are synchronous with no wall clock (use `EventClock`); no look-ahead; thresholds are scale-free (delta/volume, bps), not absolute contracts/ticks.
 * Dormant (need L2 data, not wired): `analytics/orderbook.py`, `patterns/sweep.py`.
-
-## Optuna Warm-Starting
-
-Applies to `scripts/optimize_orderflow.py` (`open_study`). Not yet implemented — build to these rules.
-
-* Default on for new studies: enqueue the best params of prior studies as first trials via `study.enqueue_trial(params, skip_if_exists=True)`. Opt-out flag `--no-warm-start`.
-* Sources: same symbol and bar type, read from `--study-db`. Use only COMPLETE, feasible, non-degenerate trials, one best per source study (capped, e.g. `--warm-start-max`) — pick another trial, don't enqueue an infeasible one.
-* Dataset policy: sources must be fitted on 2019–2023 only. Never seed from a study that saw 2024+ data or the holdout.
-* Compatibility: enqueue only params whose keys and kinds match the new `SEARCH_SPACE_BOUNDS` and lie inside its bounds. Fill dimensions missing in old trials from `baseline_extra_params()`. Skip out-of-bounds values — don't clamp, clamping invents params. Log every skip.
-* Reevaluate: enqueued trials run the full `objective()` under the new study's identity (data, costs, folds). Never copy old values or `user_attrs`.
-* Preserve originals: open source studies read-only (`load_study`). Never `add_trial`, delete, or mutate them. Warm-start always writes a new study, never edits an old one.
-* Reproducibility: enqueue once, before the first trial, only when the study has no trials, so resume never re-enqueues. Order deterministically (value desc, then study name, then trial number). Enqueued trials count toward `--n-trials`. Record source study names, trial numbers, params and the warm-start flag in the new study's `user_attrs` and `results.json`; include them in study identity because they change the trajectory.
 
 ## Caveats
 
