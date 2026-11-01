@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -38,7 +38,7 @@ from orderflow_system.data.infobar_feed import open_bars
 from orderflow_system.data.models import BarType, InfoBar
 from orderflow_system.ledger import TradeLedger
 from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest
-from scripts.dataset_policy import DEV_END
+from scripts.dataset_policy import DEV_END, DEV_START
 
 
 def json_safe(value):
@@ -629,7 +629,7 @@ def library_versions(bar_type=None):
     return {name: metadata.version(name) for name in names}
 
 
-def study_identity(args, metadata):
+def study_identity(args, metadata, warm_start=False):
     identity = {"search_space": args.space, "strategy_fp": STRATEGY_FP,
                 "instrument_defaults": asdict(instrument_config(args.symbol)),
                 "initial_capital_usd": INITIAL_CAPITAL_USD, "risk_per_trade_pct": RISK_PER_TRADE_PCT,
@@ -639,6 +639,8 @@ def study_identity(args, metadata):
                 "n_splits": args.n_splits, "embargo": args.embargo,
                 "holdout_fraction": args.holdout_fraction, "min_trades_per_fold": args.min_trades_per_fold,
                 "seed": args.seed}
+    if warm_start:   # the seeds are not hashed: they are persisted in the stored identity (resolve_study)
+        identity["warm_start"] = {"max": args.warm_start_max}
     space_fp = fingerprint(identity)
     name = (f"{args.symbol}__{args.bar_type}__{args.start_date}_{args.end_date}"
             f"__d{metadata['fingerprint'][:8]}__s{space_fp[:8]}")
@@ -669,6 +671,16 @@ def open_study(args, name, identity, worker_index=0):
         if "identity" not in stored:
             study.set_user_attr("identity", identity)
             study.set_user_attr("versions", versions)
+        # Warm-start reconcile: the identity (intent, with the seeds) is persisted above and the marker is set
+        # last, so a crash at any point is repaired here. A seed trial in any state counts as present.
+        seeds = identity.get("warm_start", {}).get("seeds")
+        if seeds and "warm_start_done" not in stored:
+            have = {t.user_attrs.get("warm_start_source") for t in study.trials}
+            for seed in seeds:
+                key = f'{seed["study"]}#{seed["trial"]}'
+                if key not in have:
+                    study.enqueue_trial(seed["params"], user_attrs={"warm_start_source": key}, skip_if_exists=True)
+            study.set_user_attr("warm_start_done", True)
         study.sampler = optuna.samplers.TPESampler(seed=(args.seed + worker_index * 1_000_003 + len(study.trials)) % 2**32,
                                                   constant_liar=args.n_jobs > 1)
     return study
@@ -744,6 +756,214 @@ def campaign_trials(study_db, symbol):
            if v is not None and math.isfinite(v)]
     return {"n_symbol_all_studies": len(rows), "n_dispersion_trials": len(raw),
             "trial_sharpe_std": float(np.std(raw, ddof=1)) if len(raw) >= 2 else None}
+
+
+@contextmanager
+def _readonly_db(study_db):
+    """Read-only connection inside one read transaction, so a reader's SELECTs all see one snapshot even
+    while an optimizer commits trials."""
+    con = sqlite3.connect(f"file:{Path(study_db)}?mode=ro", uri=True, isolation_level=None)
+    try:
+        con.execute("BEGIN")
+        yield con
+    finally:
+        con.close()                 # closing ends (rolls back) the read transaction
+
+
+@contextmanager
+def _shared_lock_readonly(path):
+    """Shared flock through an O_RDONLY descriptor: needs no write access and never creates the file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)                # closing releases the lock
+
+
+def _study_id(con, study_name):
+    row = con.execute("select study_id from studies where study_name = ?", (study_name,)).fetchone()
+    if row is None:
+        raise ValueError(f"study not found: {study_name}")
+    return row[0]
+
+
+def list_study_names(study_db):
+    """All study names in the DB, read-only."""
+    with _readonly_db(study_db) as con:
+        return [r[0] for r in con.execute("select study_name from studies order by study_id")]
+
+
+def read_study_attrs(study_db, study_name):
+    """Study-level user_attrs (decoded JSON), read-only."""
+    with _readonly_db(study_db) as con:
+        sid = _study_id(con, study_name)
+        return {k: json.loads(v) for k, v in
+                con.execute("select key, value_json from study_user_attributes where study_id = ?", (sid,))}
+
+
+def read_study_trials(study_db, study_name):
+    """Every trial (any state) of a study, ordered by number, with external-repr params; read-only."""
+    from optuna.distributions import json_to_distribution
+    with _readonly_db(study_db) as con:
+        sid = _study_id(con, study_name)
+        trials = {}
+        for tid, number, state in con.execute(
+                "select trial_id, number, state from trials where study_id = ? order by number", (sid,)):
+            trials[tid] = {"number": number, "state": state, "value": None, "params": {}, "attrs": {}}
+        for tid, value, vtype in con.execute(
+                """select v.trial_id, v.value, v.value_type from trial_values v join trials t on t.trial_id = v.trial_id
+                   where t.study_id = ? and v.objective = 0""", (sid,)):
+            if tid in trials:
+                trials[tid]["value"] = {"INF_POS": math.inf, "INF_NEG": -math.inf, "NAN": math.nan}.get(vtype, value)
+        for tid, name, raw, dist in con.execute(
+                """select p.trial_id, p.param_name, p.param_value, p.distribution_json from trial_params p
+                   join trials t on t.trial_id = p.trial_id where t.study_id = ?""", (sid,)):
+            trials[tid]["params"][name] = json_to_distribution(dist).to_external_repr(raw)
+        for tid, key, vjson in con.execute(
+                """select a.trial_id, a.key, a.value_json from trial_user_attributes a
+                   join trials t on t.trial_id = a.trial_id where t.study_id = ?""", (sid,)):
+            trials[tid]["attrs"][key] = json.loads(vjson)
+    out = sorted(trials.values(), key=lambda t: t["number"])
+    for t in out:
+        t["feasible"] = t["attrs"].get("feasible") is True
+    return out
+
+
+STUDY_TABLES = {"studies", "study_user_attributes", "trials", "trial_values", "trial_params", "trial_user_attributes"}
+
+
+def _study_names(study_db):
+    """list_study_names, or [] for a missing, zero-byte or half-initialised DB (Optuna creates the schema later,
+    in open_study). Waits out a schema creation in progress, but only through an existing init lock: never
+    creates a file next to the DB."""
+    path, lock = Path(study_db), Path(str(study_db) + ".init.lock")
+    if not path.is_file():
+        return []
+    with _shared_lock_readonly(lock) if lock.is_file() else nullcontext():
+        with _readonly_db(path) as con:
+            tables = {r[0] for r in con.execute("select name from sqlite_master where type = 'table'")}
+            if not STUDY_TABLES <= tables:
+                return []
+            return [r[0] for r in con.execute("select study_name from studies order by study_id")]
+
+
+def _seed_params(trial, args, fill):
+    """(complete params, None) for an eligible COMPLETE trial, else (None, skip reason); infeasible -> (None, None)."""
+    attrs, value = trial["attrs"], trial["value"]
+    if attrs.get("feasible") is not True:
+        return None, None
+    if not (math.isfinite(value) and value > FEASIBLE_FLOOR):
+        return None, "degenerate_value"
+    if (attrs.get("total_trades", 0) < args.min_total_trades
+            or any(f["n_trades"] < args.min_trades_per_fold for f in attrs.get("fold_results", []))):
+        return None, "infeasible_under_floors"
+    params = {name: trial["params"].get(name, fill.get(name)) for name in args.space}
+    if set(trial["params"]) - set(args.space) or None in params.values():
+        return None, "unknown_dimension"
+    if any(not lo <= params[name] <= hi for name, (lo, hi, _) in args.space.items()):
+        return None, "out_of_bounds"            # never clamp: clamping invents params
+    if any(kind == "int" and params[name] != int(params[name]) for name, (_, _, kind) in args.space.items()):
+        return None, "non_integral_int"
+    return {name: int(v) if args.space[name][2] == "int" else float(v) for name, v in params.items()}, None
+
+
+def select_warm_start(args, metadata):
+    """(seeds, skipped): the best eligible trial of each prior same-symbol/bar-type dev-window study, read-only.
+    A source must have the destination's window and bars (same dates and data fingerprint) and a stored
+    holdout_fraction >= the destination's, so its search never saw the destination's holdout (fail closed)."""
+    if args.no_warm_start:
+        return [], []
+    pattern = re.compile(rf"{re.escape(args.symbol)}__{re.escape(args.bar_type)}__"
+                         r"(\d{4}-\d\d-\d\d)_(\d{4}-\d\d-\d\d)__d([0-9a-f]+)__")
+    fill = baseline_extra_params(args.symbol)
+    seeds, skipped, chosen, scans = [], [], set(), {}
+    for study in _study_names(args.study_db):
+        match = pattern.match(study)
+        if not match:
+            continue
+        start, end = map(date.fromisoformat, match.groups()[:2])
+        data_fp = match.group(3)
+        attrs = read_study_attrs(args.study_db, study)
+        identity = attrs.get("identity") if isinstance(attrs.get("identity"), dict) else {}
+        hf = identity.get("holdout_fraction")
+        reason = ("not_dev_window" if start < DEV_START or end > DEV_END else
+                  "window_mismatch" if ((start, end) != (args.start_date, args.end_date)
+                                        or data_fp != metadata["fingerprint"][:len(data_fp)]) else
+                  "derived_study" if ({"warm_start_done", "warm_start_skipped"} & attrs.keys()
+                                      or "warm_start" in identity) else
+                  "holdout_seen" if any(key.startswith("holdout::") for key in attrs) else
+                  "holdout_overlap" if (isinstance(hf, bool) or not isinstance(hf, (int, float))
+                                        or hf < args.holdout_fraction) else None)
+        if reason:
+            skipped.append({"study": study, "trial": None, "reason": reason})
+            continue
+        trials = sorted((t for t in read_study_trials(args.study_db, study) if t["state"] == "COMPLETE"),
+                        key=lambda t: (-t["value"], t["number"]))
+        scans[study] = [(trial, *_seed_params(trial, args, fill)) for trial in trials]
+
+    # Greedy over every eligible candidate in rank order, so each parameter set goes to its highest-ranked
+    # trial across all studies; one seed per study; the cap applies last.
+    candidates = sorted(((trial["value"], study, trial["number"], params)
+                         for study, scan in scans.items() for trial, params, _ in scan if params is not None),
+                        key=lambda c: (-c[0], c[1], c[2]))
+    seeded, duplicates = {}, set()
+    for value, study, number, params in candidates:
+        key = tuple(sorted(params.items()))
+        if study in seeded:
+            continue
+        if key in chosen:
+            duplicates.add((study, number))
+            continue
+        chosen.add(key)
+        seeded[study] = number
+        seeds.append({"study": study, "trial": number, "value": value, "params": params})
+    # Informational trial-level skips, per study in DB order: what ranked above the study's seed (or all of
+    # its trials when it has none).
+    for study, scan in scans.items():
+        for trial, params, reason in scan:
+            if seeded.get(study) == trial["number"]:
+                break
+            if (study, trial["number"]) in duplicates:
+                reason = "duplicate_params"
+            if reason:
+                skipped.append({"study": study, "trial": trial["number"], "reason": reason})
+        if study not in seeded:
+            skipped.append({"study": study, "trial": None, "reason": "no_eligible_trial"})
+    seeds.sort(key=lambda s: (-s["value"], s["study"], s["trial"]))
+    return seeds[:args.warm_start_max], skipped
+
+
+def _stored_identity(study_db, name):
+    """The persisted identity attr, or None when the study is absent or was never given one."""
+    return read_study_attrs(study_db, name).get("identity") if name in _study_names(study_db) else None
+
+
+def resolve_study(args, metadata):
+    """Which study to open, read-only: an existing cold study, else an existing warm study with its persisted
+    seeds, else a new study (warm only when selection finds seeds). Selection never affects a resume."""
+    cold_name, cold_id = study_identity(args, metadata)
+    result = {"name": cold_name, "identity": cold_id, "mode": "new_cold", "seeds": [], "skipped": []}
+    if _stored_identity(args.study_db, cold_name) is not None:
+        if not args.no_warm_start:
+            print(f"Warm start applies only to new studies; resuming {cold_name}", file=sys.stderr)
+        return {**result, "mode": "resume_cold"}
+    if args.no_warm_start:
+        return result
+    warm_name, warm_id = study_identity(args, metadata, warm_start=True)
+    stored = _stored_identity(args.study_db, warm_name)
+    if stored is not None:
+        warm_start = stored.get("warm_start", {})
+        if {**stored, "warm_start": {k: v for k, v in warm_start.items() if k != "seeds"}} != warm_id:
+            raise ValueError(f"Study identity mismatch: {warm_name}")
+        return {**result, "name": warm_name, "identity": stored, "mode": "resume_warm",
+                "seeds": warm_start.get("seeds", [])}
+    seeds, skipped = select_warm_start(args, metadata)
+    if not seeds:
+        return {**result, "skipped": skipped}
+    seeds = json_safe(seeds)
+    return {"name": warm_name, "identity": {**warm_id, "warm_start": {**warm_id["warm_start"], "seeds": seeds}},
+            "mode": "new_warm", "seeds": seeds, "skipped": skipped}
 
 
 def return_diagnostics(values):
@@ -859,6 +1079,8 @@ def study_result(study, args, metadata, identity):
         "trial_counts": {state: sum(t.state.name == state for t in study.trials)
                          for state in ("COMPLETE", "FAIL", "RUNNING", "PRUNED", "WAITING")},
         "identity": identity, "dataset": metadata, "seed": args.seed, "versions": study.user_attrs["versions"],
+        "warm_start": (study.user_attrs.get("identity") or {}).get("warm_start"),
+        "warm_start_skipped": study.user_attrs.get("warm_start_skipped"),
         "git": git_state(), "holdout_history": {key: value for key, value in study.user_attrs.items()
                                                  if key.startswith("holdout::")},
         "limitations": ["folds are chronological sub-periods of one continuous replay; no model is fitted, so nothing is purged",
@@ -878,15 +1100,52 @@ def save_results(path, entry):
             raise ValueError(f"Results must contain a JSON object: {path}")
         studies = data.setdefault("symbols", {}).setdefault(entry["symbol"], {}).setdefault(entry["bar_type"], {})
         previous = studies.get(entry["study_name"], {})
-        entry = {**entry, "holdout_history": {**previous.get("holdout_history", {}), **entry["holdout_history"]}}
+        # Seeds are not in the study name, so two warm experiments can share a name across databases.
+        if previous and previous.get("warm_start") != entry.get("warm_start"):
+            raise ValueError(f"{path} already holds {entry['study_name']} with a different warm start "
+                             "(other seeds, or cold vs warm); use a different --output")
+        entry ={**entry, "holdout_history": {**previous.get("holdout_history", {}), **entry["holdout_history"]}}
         studies[entry["study_name"]] = entry
         atomic_json(path, data)
     return data
 
 
+def dry_run_plan(args, cache_path, resolved):
+    """Print and return what a launch would do. Creates no study, DB or results file."""
+    bars = CachedBars(cache_path, args.bar_type)
+    n_search, _ = split_timeline(bars, args)
+    widened = [n for n, (lo, hi, _) in args.space.items()
+               if lo < SEARCH_SPACE_BOUNDS[n][0] or hi > SEARCH_SPACE_BOUNDS[n][1]]
+    prior = (sum(key.startswith("holdout::") for key in read_study_attrs(args.study_db, resolved["name"]))
+             if resolved["mode"].startswith("resume") else 0)
+    plan = json_safe({
+        "dry_run": True, "study_name": resolved["name"], "mode": resolved["mode"], "bar_type": args.bar_type,
+        "n_trials": args.n_trials, "n_jobs": args.n_jobs, "search_space": args.space,
+        "widened_vs_default": widened,
+        "floors": {"min_total_trades": args.min_total_trades, "min_trades_per_fold": args.min_trades_per_fold,
+                   "n_splits": args.n_splits},
+        "costs": {"fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps},
+        "window": {"start": str(args.start_date), "end": str(args.end_date), "n_bars": len(bars),
+                   "n_search_bars": n_search},
+        "warm_start": {"seeds": resolved["seeds"], "skipped": resolved["skipped"]},
+        "holdout": {"evaluate_holdout": args.evaluate_holdout, "holdout_fraction": args.holdout_fraction,
+                    "embargo": args.embargo, "prior_evaluations": prior},
+        "study_exists": resolved["mode"].startswith("resume")})
+    print(json.dumps(plan, sort_keys=True))
+    return plan
+
+
 def optimize_study(args, cache_path, metadata):
-    name, identity = study_identity(args, metadata)
+    resolved = resolve_study(args, metadata)
+    name, identity = resolved["name"], resolved["identity"]
+    for skip in resolved["skipped"]:
+        print(f"Warm start: skipped {skip['study']} trial {skip['trial']}: {skip['reason']}", file=sys.stderr)
+    print(f"Warm start: {resolved['mode']}, {len(resolved['seeds'])} seed(s) [{name}]", file=sys.stderr)
+    if args.dry_run:
+        return dry_run_plan(args, cache_path, resolved)
     study = open_study(args, name, identity)
+    if resolved["mode"] == "new_warm":
+        study.set_user_attr("warm_start_skipped", resolved["skipped"])
     lock = study_lock_path(args.study_db, name)
     bars = CachedBars(cache_path, args.bar_type)
     n_search, folds = split_timeline(bars, args)
@@ -974,7 +1233,8 @@ def load_space(path):
             raise ValueError(f"{name}: bounds must be finite numbers")
         if lo > hi or lo <= 0 or (kind == "int" and any(int(v) != v for v in (lo, hi))):
             raise ValueError(f"{name}: invalid ordered positive bounds")
-        if name in ("volume_decline_pct", "delta_failure_pct") and hi > 1:
+        if name in ("volume_decline_pct", "delta_failure_pct", "absorption_min_delta_pct",
+                    "initiative_min_delta_pct") and hi > 1:
             raise ValueError(f"{name}: fractions must not exceed 1")
         space[name] = (int(lo), int(hi), kind) if kind == "int" else (lo, hi, kind)
     return space
@@ -987,7 +1247,7 @@ def build_parser():
                         help="comma-separated bar types; all expands to six info types; add time_1m explicitly (all,time_1m)")
     parser.add_argument("--start-date", type=date.fromisoformat, default=os.getenv("START_DATE", "2019-09-10"))
     parser.add_argument("--end-date", type=date.fromisoformat, default=os.getenv("END_DATE", "2023-12-31"), help="inclusive UTC day")
-    for flag, default in (("n-trials", 50), ("n-jobs", 1), ("n-splits", 5), ("min-trades-per-fold", 2)):
+    for flag, default in (("n-trials", 300), ("n-jobs", 1), ("n-splits", 5), ("min-trades-per-fold", 2)):
         parser.add_argument("--" + flag, type=positive_int, default=default)
     parser.add_argument("--min-total-trades", type=nonnegative_int, default=0,
                         help="pooled trade floor across all folds; a trial below it is infeasible")
@@ -998,6 +1258,12 @@ def build_parser():
     parser.add_argument("--fee-bps", type=nonnegative, default=5.0)
     parser.add_argument("--slippage-bps", type=nonnegative, default=1.0)
     parser.add_argument("--search-space", type=Path)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the resolved study plan as one JSON line; create no study, DB or results file")
+    parser.add_argument("--no-warm-start", action="store_true",
+                        help="do not seed a new study with the best trials of prior studies in --study-db")
+    parser.add_argument("--warm-start-max", type=positive_int, default=3,
+                        help="maximum number of prior best configurations enqueued into a new study")
     parser.add_argument("--data-root", type=Path, default=INFO_BARS.root)
     parser.add_argument("--trades-root", type=Path, default=os.getenv("ORDERFLOW_TRADES_ROOT", "/Volumes/Market-Data/orderbook-data_binance/futures_trades"))
     output = ROOT / "output/optimize"

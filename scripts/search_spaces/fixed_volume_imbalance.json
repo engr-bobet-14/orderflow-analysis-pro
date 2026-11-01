@@ -1,0 +1,6 @@
+{
+  "default_stop_pct": {"low": 0.001, "high": 0.025},
+  "price_proximity_pct": {"low": 0.0002, "high": 0.005},
+  "absorption_min_delta_pct": {"low": 0.2, "high": 0.9},
+  "initiative_min_delta_pct": {"low": 0.2, "high": 0.9}
+}

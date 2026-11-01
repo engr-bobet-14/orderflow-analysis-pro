@@ -11,8 +11,8 @@ Whole pipeline:
 
 ```bash
 source .venv_orderflow/bin/activate
-python scripts/optimize_orderflow.py --bar-type fixed_dollar_imbalance --n-trials 50       # steps 2-3
-python scripts/optimize_orderflow.py --bar-type fixed_dollar_imbalance --n-trials 50 --evaluate-holdout   # step 4
+python scripts/optimize_orderflow.py --bar-type fixed_dollar_imbalance --n-trials 300       # steps 2-3
+python scripts/optimize_orderflow.py --bar-type fixed_dollar_imbalance --n-trials 300 --evaluate-holdout   # step 4
 ```
 
 ## Step 0 - Setup
@@ -45,7 +45,7 @@ Raw inputs are read-only; nothing is ever written to them. Confirm `/Volumes/Mar
 
 ```bash
 python scripts/optimize_orderflow.py --symbol BTCUSDT --bar-type fixed_dollar_imbalance \
-  --start-date 2023-01-01 --end-date 2023-12-31 --n-trials 50
+  --start-date 2023-01-01 --end-date 2023-12-31 --n-trials 300
 ```
 
 - One study per (symbol, bar type). Twelve parameters are searched (price proximity, composite score, cooldown, volume decline, divergence lookback, delta failure, absorption and initiative thresholds, fallback stop width and target R:R); bounds can be overridden with `--search-space file.json`, e.g. `{"lookback_bars": {"low": 8, "high": 20}}`.
@@ -61,12 +61,13 @@ python scripts/optimize_orderflow.py --symbol BTCUSDT --bar-type fixed_dollar_im
 ## Step 3 - Resume and parallel
 
 ```bash
-python scripts/optimize_orderflow.py ...same arguments... --n-trials 100            # tops up to 100 total
+python scripts/optimize_orderflow.py ...same arguments... --n-trials 600            # tops up to 600 total
 python scripts/optimize_orderflow.py ...same arguments... --n-jobs 4                # 4 spawn workers, one SQLite study
 ```
 
 - Rerun with the same identity inputs to resume. `--n-trials` is the **total** to reach, not an increment; an already-complete study adds none. No trial is ever deleted.
 - Identity = data, strategy source, search bounds, costs, CV geometry, holdout fraction, min trades, seed. Changing any of them starts a new study (new name in `results.json`). `--n-trials`, `--n-jobs` and output paths do not.
+- Warm start (default on) applies only when a command creates a **new** study: an existing study with the original identity always resumes as before. `--no-warm-start` and `--warm-start-max` change which study a command resolves to (a warm study has a different name from a cold one), and a warm study's seeds are fixed when it is created. See Step 6 for the resolution order.
 - Resume is refused if Optuna, RiskLabAI or quantstats major.minor changed; use a new `--study-db`.
 - A second invocation of the same study exits with an error; different studies may run concurrently. Parallel runs can overshoot by up to `--n-jobs - 1` trials and propose in completion order; `--n-jobs 1` with the same `--seed` is reproducible.
 
@@ -104,6 +105,91 @@ s = optuna.load_study(study_name="<study_name>", storage="sqlite:///output/optim
 print(s.best_value, s.best_params, len(s.trials))
 EOF
 ```
+
+## Step 6 - Search-space v2 campaign (not launched)
+
+Two studies with wider, per-bar-type bounds (`scripts/search_spaces/<bar_type>.json`), warm-started from the best trials already in `output/optimize/main/studies.db`. **Launching requires the user's explicit approval**; run the dry-run first. `--dry-run` still needs `/Volumes/Market-Data` mounted and may write the bar cache under `output/optimize/cache`, but it creates no study, DB or results file. The replays of the best trials (see `scripts/search_spaces/FINDINGS.md`) found no statistically significant gross edge in the best trials of the 200-trial studies, so this campaign tests search-space hygiene, not a known edge.
+
+Shared flags: `--symbol BTCUSDT --start-date 2019-09-10 --end-date 2023-12-31 --n-jobs 1 --n-splits 5 --embargo 0.02 --holdout-fraction 0.2 --min-total-trades 105 --min-trades-per-fold 11 --fee-bps 5 --slippage-bps 1 --seed 43`. Never add `--no-warm-start` to a campaign command: a cold study has a different name, and once it exists the default command resumes it instead of the warm one. Seed 43 (prior runs used 42) decorrelates TPE's startup from the 200-trial runs. `--study-db output/optimize/main/studies.db` is the DB holding the warm-start sources; a separate `--output output/optimize/campaign2/results.json` leaves the old `results.json` untouched. The campaign is staged: **stage 1 is 300 trials per bar type**, then a check decides whether to top up (see "Stage check and top-up" below). Wall-clock at the observed per-trial time with `--n-jobs 1`: about 5.8 h for 300 tick trials (69 s/trial) and about 4.8 h for 300 volume trials (58 s/trial); a top-up to 600 totals about 11.5 h (tick) and 9.7 h (volume), and the ceiling of 800 about 15.3 h (tick) and 12.9 h (volume).
+
+Tick launch (stage 1, 300 trials):
+
+```bash
+python scripts/optimize_orderflow.py --bar-type fixed_tick_imbalance --n-trials 300 \
+  --search-space scripts/search_spaces/fixed_tick_imbalance.json \
+  --symbol BTCUSDT --start-date 2019-09-10 --end-date 2023-12-31 --n-jobs 1 --n-splits 5 \
+  --embargo 0.02 --holdout-fraction 0.2 \
+  --min-total-trades 105 --min-trades-per-fold 11 --fee-bps 5 --slippage-bps 1 --seed 43 \
+  --study-db output/optimize/main/studies.db --output output/optimize/campaign2/results.json
+```
+
+Tick dry-run (prints the plan as one JSON line; creates no study, DB or results file):
+
+```bash
+python scripts/optimize_orderflow.py --bar-type fixed_tick_imbalance --n-trials 300 \
+  --search-space scripts/search_spaces/fixed_tick_imbalance.json \
+  --symbol BTCUSDT --start-date 2019-09-10 --end-date 2023-12-31 --n-jobs 1 --n-splits 5 \
+  --embargo 0.02 --holdout-fraction 0.2 \
+  --min-total-trades 105 --min-trades-per-fold 11 --fee-bps 5 --slippage-bps 1 --seed 43 \
+  --study-db output/optimize/main/studies.db --output output/optimize/campaign2/results.json \
+  --dry-run
+```
+
+Volume launch (stage 1, 300 trials):
+
+```bash
+python scripts/optimize_orderflow.py --bar-type fixed_volume_imbalance --n-trials 300 \
+  --search-space scripts/search_spaces/fixed_volume_imbalance.json \
+  --symbol BTCUSDT --start-date 2019-09-10 --end-date 2023-12-31 --n-jobs 1 --n-splits 5 \
+  --embargo 0.02 --holdout-fraction 0.2 \
+  --min-total-trades 105 --min-trades-per-fold 11 --fee-bps 5 --slippage-bps 1 --seed 43 \
+  --study-db output/optimize/main/studies.db --output output/optimize/campaign2/results.json
+```
+
+Volume dry-run:
+
+```bash
+python scripts/optimize_orderflow.py --bar-type fixed_volume_imbalance --n-trials 300 \
+  --search-space scripts/search_spaces/fixed_volume_imbalance.json \
+  --symbol BTCUSDT --start-date 2019-09-10 --end-date 2023-12-31 --n-jobs 1 --n-splits 5 \
+  --embargo 0.02 --holdout-fraction 0.2 \
+  --min-total-trades 105 --min-trades-per-fold 11 --fee-bps 5 --slippage-bps 1 --seed 43 \
+  --study-db output/optimize/main/studies.db --output output/optimize/campaign2/results.json \
+  --dry-run
+```
+
+Dry-run fields: `mode` (`new_cold`, `new_warm`, `resume_cold`, `resume_warm`), `study_exists`, `widened_vs_default` (dimensions whose bounds exceed the built-in ones), `floors`, `costs`, `window` (bars and search bars), `warm_start` (`seeds`, `skipped` with reasons) and `holdout` (`evaluate_holdout`, `holdout_fraction`, `embargo`, `prior_evaluations` already recorded on an existing study). `main()` writes no `results.json` in dry-run.
+
+### Stage check and top-up
+
+When a stage finishes, read the best trial from `output/optimize/campaign2/results.json` (`best_objective`, `best_trial_number`; the earlier 200-trial bests were tick -0.223 and volume -0.940) and run the read-only boundary audit on each new study (it opens the DB read-only and reads the search space from the study's stored identity):
+
+```bash
+python scripts/search_space_audit.py --study-db output/optimize/main/studies.db \
+  --study-name BTCUSDT__fixed_tick_imbalance__2019-09-10_2023-12-31__d72a3440a__s02650ab3
+python scripts/search_space_audit.py --study-db output/optimize/main/studies.db \
+  --study-name BTCUSDT__fixed_volume_imbalance__2019-09-10_2023-12-31__db53f26f0__s4462e3ca
+```
+
+The audit prints, per dimension, how many of the 10 best feasible trials sit in the outer 10% of the range (`top_lo`, `top_hi`), the share of the last 50 trials in the outer 5% (`tail_lo`, `tail_hi`), and a `widen` flag (at least 5 of the top 10, or at least 30% of the tail). See `scripts/search_spaces/FINDINGS.md` for the rule and the 200-trial baseline.
+
+Decision rule:
+
+- **Stop at 300** if `best_trial_number` is not in the last 100 trials (the best has plateaued) and no widened dimension is still flagged.
+- **Top up to 600** if the best trial is among the last 100 trials, or a widened dimension is still flagged `widen`. Rerun the same launch command with `--n-trials 600` (the total to reach, not an increment); it resumes the same warm study with its persisted seeds, because `--n-trials` is not part of the identity.
+- **Go to 800 (tick only)** if the 600-trial result is still improving and some trial has a positive fold-level result.
+- If nothing beats the 200-trial bests, stop: the strategy, not the search, is the limit.
+
+Warm start (new studies only; opt out with `--no-warm-start`, cap with `--warm-start-max`, default 3):
+
+- Sources are prior studies of the same symbol and bar type in `--study-db`, fitted on the 2019-2023 window; each contributes at most its best eligible trial.
+- Eligible: COMPLETE, feasible, finite, with every parameter inside the new bounds and of the right kind. An out-of-bounds trial is skipped (never clamped) and the next-best trial of that study is tried; every skip is logged with its reason.
+- Dimensions missing in old trials are filled from the baseline values (`baseline_extra_params`).
+- Studies that saw holdout data, and studies outside the development window, are never sources. A source must also have the same start/end dates and bars (data fingerprint) as the new study and a recorded `holdout_fraction` at least as large, so its search never covered the new study's holdout; a study whose holdout fraction is unknown is skipped.
+- A results file refuses a second, different warm start (other seeds, or cold vs warm) under the same study name; use another `--output`.
+- Seeds are ordered (value descending, study name, trial number), enqueued once before the first trial, count toward `--n-trials`, and are fully re-evaluated under the new study's costs, folds and bounds; old values are never copied. Source studies are opened read-only.
+
+Resolution order: an existing cold study with the original identity resumes first (selection never affects a resume); then an existing warm study resumes with its **persisted** seeds; otherwise a new study seeds itself from the sources. Derived (warm-started) studies are never sources, so extending a source study never changes a warm study that was already created.
 
 ## Smoke test (BTCUSDT, 2019-2023 development data, 5 trials)
 
@@ -149,7 +235,7 @@ python scripts/diagnose_trades.py --study-db output/optimize/smoke/studies.db \
 | `--symbol` | `BTCUSDT` | |
 | `--bar-type` | **all six** info-bar types | The smoke test pins `fixed_tick_imbalance`; omitting it runs every bar type. |
 | `--start-date` / `--end-date` | `2019-09-10` / `2023-12-31` | Inclusive UTC days; env `START_DATE` / `END_DATE` override. The optimizer warns if the end is after 2023-12-31. |
-| `--n-trials` | `50` | Per study. |
+| `--n-trials` | `300` | Total COMPLETE trials per study (not an increment). |
 | `--n-jobs` | `1` | |
 | `--n-splits` | `5` | Chronological folds. |
 | `--min-trades-per-fold` | `2` | **Not** the approved floor: pass `11` explicitly. |
@@ -157,6 +243,8 @@ python scripts/diagnose_trades.py --study-db output/optimize/smoke/studies.db \
 | `--embargo` | `0.02` | Scoring blackout at each fold start. |
 | `--holdout-fraction` | `0.2` | Last 20% of bars never replayed during the search. |
 | `--evaluate-holdout` | off | |
+| `--no-warm-start` / `--warm-start-max` | warm start **on** / `3` | Applies to new studies only; see Step 6. |
+| `--dry-run` | off | Prints the resolved plan; creates no study, DB or results file. |
 | `--fee-bps` / `--slippage-bps` | `5.0` / `1.0` | Part of the study identity. |
 | `--seed` | `42` | |
 | `--study-db` | `output/optimize/studies.db` | Shared with older studies unless overridden (the smoke test overrides it). |

@@ -1,0 +1,7 @@
+{
+  "default_stop_pct": {"low": 0.001, "high": 0.025},
+  "price_proximity_pct": {"low": 0.0002, "high": 0.005},
+  "signal_cooldown_seconds": {"low": 1.0, "high": 120.0},
+  "delta_failure_pct": {"low": 0.2, "high": 0.95},
+  "target_rr": {"low": 0.6, "high": 4.0}
+}
