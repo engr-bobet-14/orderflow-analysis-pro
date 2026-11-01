@@ -1,0 +1,13 @@
+## Optuna Warm-Starting
+
+Implemented in `scripts/optimize_orderflow.py` (`select_warm_start`, `resolve_study`, `open_study`); user docs in `USAGE.md` Step 6. Tests: `tests/test_warm_start.py`.
+
+* Default on for new studies: the best params of prior studies are enqueued as first trials via `study.enqueue_trial`. Opt out with `--no-warm-start`; cap with `--warm-start-max` (default 3).
+* Resolution order (`resolve_study`, read-only, runs before `open_study`): an existing cold study with the original identity resumes first; then an existing warm study resumes with its **persisted** seeds; only a brand-new study selects seeds. Selection never affects a resume.
+* Sources: same symbol and bar type in `--study-db`, one best eligible trial per source study. Eligible: COMPLETE, feasible, finite value above `FEASIBLE_FLOOR`, total/fold trades meet the new floors, every param inside the new `args.space` bounds and of the right kind. Skip, never clamp; log every skip with its reason and try the study's next-best trial. Missing dimensions are filled from `baseline_extra_params()`.
+* Dataset policy: a source must be fitted on 2019–2023 only, have the same start/end dates and bars (data fingerprint) as the new study, and a stored `holdout_fraction` at least the new study's (unknown means skip). Studies with a `holdout::` attr are never sources. Derived (warm-started) studies are never sources.
+* Duplicates: identical param sets across sources are resolved by candidate rank (value desc, study name, trial number) before the cap.
+* Reevaluate: enqueued trials run the full `objective()` under the new study's identity (data, costs, folds). Old values and `user_attrs` are never copied.
+* Preserve originals: sources are read with `sqlite3` `mode=ro` in one read snapshot; never `add_trial`, delete or mutate them. Warm start always writes a new study.
+* Reproducibility: seeds are persisted in the stored study identity **before** anything is enqueued; `open_study` then reconciles under the init lock by `warm_start_source` trial attr and sets `warm_start_done` last, so a crash between enqueues is repaired on the next open. Seeds count toward `--n-trials`. The study **name** hash contains only `{"warm_start": {"max": N}}`, not the seeds, so resume cannot depend on mutable source contents (deliberate refinement of "seeds in identity"; the persisted identity and `results.json` carry the exact seeds). `save_results` refuses to overwrite a same-named entry with different seeds.
+* `--dry-run` prints the resolved plan (mode, seeds, skips, floors, costs, holdout settings) and creates no study, DB or results file.

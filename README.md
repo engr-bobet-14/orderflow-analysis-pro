@@ -153,7 +153,7 @@ stop width and target R:R, without changing the pipeline defaults or the noteboo
 python scripts/optimize_orderflow.py \
   --symbol BTCUSDT --bar-type fixed_dollar_imbalance,fixed_tick_run \
   --start-date 2023-06-01 --end-date 2023-07-31 \
-  --n-trials 50 --n-jobs 2 \
+  --n-trials 300 --n-jobs 2 \
   --study-db /tmp/orderflow/studies.db \
   --cache-dir /tmp/orderflow/cache --output /tmp/orderflow/results.json
 ```
@@ -192,6 +192,13 @@ Changing an identity input starts a new study. Changing `--n-trials`, `--n-jobs`
 output paths or the holdout evaluation flag keeps the study. Resume is refused
 if Optuna, RiskLabAI or quantstats major.minor versions changed; use a new
 study database in that case. Versions and git SHA/dirty state are recorded.
+
+New studies are warm-started by default: the best eligible trial of each prior
+study of the same symbol and bar type (same window and bars, holdout at least as
+large) is enqueued as a first trial and fully re-evaluated. An existing study
+always resumes first and keeps its persisted seeds; `--no-warm-start` and
+`--warm-start-max` change which study a command resolves to. `--dry-run` prints
+the resolved plan without creating anything. See `USAGE.md` Step 6.
 
 Search-space overrides are a JSON file supplied with `--search-space`, for
 example `{"lookback_bars": {"low": 8, "high": 20}}`. Unknown dimensions are
