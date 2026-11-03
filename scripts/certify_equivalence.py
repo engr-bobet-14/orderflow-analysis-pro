@@ -1,35 +1,41 @@
-"""Research-equivalence certificate: does a paired dataset (v1) reproduce the v0 bars AND strategy behaviour?
+"""Certify a paired dataset (v1) against v0: dataset/pipeline certificate, or Optuna research certificate.
 
-Read-only. Refuses to run unless a passed, full-history trade-alignment report for the same dataset id and
-root hash is given (scripts/verify_paired_dataset.py). Then, per bar type:
+Read-only. Both refuse to run unless a passed, full-history trade-alignment report for the same dataset id
+and root hash is given (scripts/verify_paired_dataset.py). Then, per bar type:
 
   L1 bars       all parquet columns, all rows, bit-exact
   L2 metadata   sidecar fields the reader/pipeline consume (symbol, config.bar_type, missing_tick_hours);
                 other sidecar differences are listed as informational
-  L3 reader     InfoBarReader output (incl. duration_ms, data_gap) over the full range and every stored
-                Optuna study window
-  L4 replay     legacy ReplayDigest (+ prefix digests) for the default config and every stored study's
-                best params over its window
+  L3 reader     InfoBarReader output (incl. duration_ms, data_gap) over the full range [+ study windows]
+  L4 replay     legacy ReplayDigest (+ prefix digests) for the default config [+ every stored study's
+                best params over its window]
 
-Verdict: "strategy-equivalent" (all levels pass for all types), "bar-equivalent only" (L1 passes
-everywhere, a later level fails), else "different".
+--mode dataset (default): "Are the bars reproducible and processed identically by the pipeline?"
+  Never opens the Optuna results catalog or study DB. L3 over the full range, L4 default config only.
+  Verdict "dataset-reproducible; pipeline-equivalent (default config)" (all levels pass for all types),
+  "bar-equivalent only" (L1 passes everywhere, a later level fails), else "different". It certifies
+  neither Optuna research results nor strategy profitability (`not_certified` says so).
 
-Coverage. Full-study mode (default) refuses when the results catalog or the Optuna study DB is missing or
-unreadable, or when the DB holds a study of a certified symbol/bar type that the catalog lacks: coverage
-never shrinks silently. --limited-coverage certifies the default configuration only and appends
-"(limited coverage)" to the verdict. Either way the certificate lists every covered study, its params and
-window, and every DB study left uncovered. The Optuna results file and study DB are hashed
-before and after and must be unchanged; no study is resumed, relabelled or mutated. v1 always has a new
-DatasetInfo.dataset_id (path-based), so Optuna treats it as new data regardless of the verdict.
+--mode research: "Do the stored Optuna studies replay identically?" Adds every catalogued study's window
+  (L3) and best params (L4). Refuses when the results catalog or the study DB is missing or unreadable,
+  or when the DB holds a study of a certified symbol/bar type that the catalog lacks (finished or not):
+  coverage never shrinks silently. Verdict "strategy-equivalent" / "bar-equivalent only" / "different".
+  The Optuna files are hashed before and after and must be unchanged; no study is resumed, relabelled or
+  mutated. v1 always has a new DatasetInfo.dataset_id (path-based), so Optuna treats it as new data.
+
+The dataset root hash is pinned by the registry (config/paired_datasets.json) or, before registration, by
+--expected-root (a trusted 64-hex SHA-256 that must also agree with any registry entry). Certification
+never writes the registry. Output: output/certificates/<mode>-<id>.json.
 
     python scripts/certify_equivalence.py --paired-root <root> --dataset-id <id> \
-        --alignment-report output/certificates/alignment-<id>.json [--v0-version 20261026T135000Z]
+        --alignment-report <alignment-<id>.json> [--expected-root <sha256>] [--mode dataset|research]
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -44,7 +50,8 @@ if str(ROOT) not in sys.path:
 
 from orderflow_system.config.settings import INFO_BARS  # noqa: E402
 from orderflow_system.data.infobar_feed import DataIntegrityError, find_dataset, open_bars  # noqa: E402
-from orderflow_system.data.paired_dataset import open_registered  # noqa: E402
+from orderflow_system.data.paired_dataset import (  # noqa: E402
+    REGISTRY_PATH, PairedDataset, open_registered, pinned_root)
 from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest  # noqa: E402
 from scripts.optimize_orderflow import (  # noqa: E402
     baseline_extra_params, build_instrument_config, instrument_config, run_backtest)
@@ -52,6 +59,10 @@ from scripts.optimize_orderflow import (  # noqa: E402
 CONSUMED_SIDECAR = ("symbol", "config.bar_type", "missing_tick_hours")
 PREFIX_ENDS = tuple(range(99_999, 50_000_000, 100_000))
 CERT_DIR = ROOT / "output" / "certificates"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+DATASET_PASS = "dataset-reproducible; pipeline-equivalent (default config)"
+NOT_PROFITABILITY = "not validated by any certificate"
+LIMITATION = "Proves v1 reproduces v0 bars and behaviour; not v0's build-time is_buyer_maker (plan §3.1)."
 
 
 class CertificationRefused(RuntimeError):
@@ -249,14 +260,14 @@ def _db_studies(studies_db: Path) -> list[str] | None:
         raise CertificationRefused(f"study DB {studies_db} is unreadable: {exc}") from exc
 
 
-def _coverage(results_path: Path, studies_db: Path, symbol: str, bar_types: list[str], limited: bool):
-    """Which stored studies are certified. Full-study mode refuses anything that would shrink coverage."""
-    catalog = json.loads(results_path.read_text()) if results_path.is_file() and not limited else None
-    if catalog is None and not limited:
-        raise CertificationRefused(f"results catalog {results_path} is missing; full-study certification needs it "
-                                   "(use limited coverage to certify the default configuration only)")
+def _coverage(results_path: Path, studies_db: Path, symbol: str, bar_types: list[str]):
+    """Which stored studies are certified (research mode). Refuses anything that would shrink coverage."""
+    catalog = json.loads(results_path.read_text()) if results_path.is_file() else None
+    if catalog is None:
+        raise CertificationRefused(f"results catalog {results_path} is missing; research certification needs it "
+                                   "(--mode dataset certifies the bars and default-config pipeline without Optuna)")
     db = _db_studies(studies_db)
-    if db is None and not limited:
+    if db is None:
         raise CertificationRefused(f"study DB {studies_db} is missing; full-study coverage cannot be established")
     persisted = {bt: [] for bt in bar_types}
     if catalog:
@@ -272,13 +283,7 @@ def _coverage(results_path: Path, studies_db: Path, symbol: str, bar_types: list
             persisted = {bt: _persisted_study_configs(catalog, con, symbol, bt) for bt in bar_types}
     configs = {bt: [(n, p, w) for n, p, w, _ in rows] for bt, rows in persisted.items()}
     # Required vs covered PER (symbol, bar_type) bucket: a study counts only where its persisted identity says.
-    identities = {}
-    for n in db or []:
-        try:
-            identities[n] = _study_identity(n)
-        except CertificationRefused:
-            if not limited:
-                raise
+    identities = {n: _study_identity(n) for n in db}
     buckets = {}
     for bt in bar_types:
         required = sorted(n for n, ident in identities.items() if ident == (symbol, bt))
@@ -286,10 +291,10 @@ def _coverage(results_path: Path, studies_db: Path, symbol: str, bar_types: list
         buckets[bt] = {"required": required, "covered": covered,
                        "uncataloged": sorted(set(required) - set(covered))}
     uncataloged = sorted(n for b in buckets.values() for n in b["uncataloged"])
-    if uncataloged and not limited:
+    if uncataloged:
         raise CertificationRefused(f"studies in the DB are not in the results catalog: {uncataloged}")
     record = {
-        "mode": "limited" if limited else "full-study",
+        "mode": "full-study",
         "results_catalog": str(results_path), "studies_db": str(studies_db),
         "studies": {bt: [{"study": n, "params": p, "params_source": f"optuna_db_trial_{k}", "window": list(w)}
                          for n, p, w, k in rows] for bt, rows in persisted.items()},
@@ -311,18 +316,15 @@ def _check_alignment(report: dict | None, identity: dict) -> None:
         raise CertificationRefused("alignment report root hash differs from the dataset's")
 
 
-def certify(*, v0_root: Path, v0_version: str | None, v1_root: Path, v1_identity: dict, alignment_report: dict | None,
-            symbol: str, bar_types: list[str], results_path: Path, studies_db: Path,
-            limited_coverage: bool = False) -> dict:
-    _check_alignment(alignment_report, v1_identity)
-    results_path, studies_db = Path(results_path), Path(studies_db)
-    optuna_before = {str(p): _sha(p) for p in (results_path, studies_db)}
-    study_configs, coverage = _coverage(results_path, studies_db, symbol, bar_types, limited_coverage)
+def _run_levels(v0_root, v0_version, v1_root, symbol: str, bar_types: list[str], study_configs: dict) -> dict:
+    """L1-L4 per bar type; `study_configs` adds Optuna study windows (L3) and params (L4) to the defaults."""
+    if not bar_types:   # every verdict is an all(): an empty list would pass with nothing compared
+        raise CertificationRefused("no bar types to certify")
     roots, versions = (Path(v0_root), Path(v1_root)), (v0_version, None)
     types = {}
     for bt in bar_types:
         i0, i1 = (find_dataset(r, symbol, bt, v) for r, v in zip(roots, versions))
-        studies = study_configs[bt]
+        studies = study_configs.get(bt, [])
         windows = [(None, None)] + [w for _, _, w in studies]
         types[bt] = {
             "v0": {"parquet": str(i0.parquet_path), "dataset_id": i0.dataset_id},
@@ -333,22 +335,75 @@ def certify(*, v0_root: Path, v0_version: str | None, v1_root: Path, v1_identity
             "L3": level3(roots, versions, symbol, bt, windows),
             "L4": level4(roots, versions, symbol, bt, [("default", None, (None, None)), *studies]),
         }
-    optuna_after = {str(p): _sha(p) for p in (results_path, studies_db)}
-    if optuna_before != optuna_after:
-        raise CertificationRefused("Optuna results or study DB changed during certification")
+    return types
+
+
+def _summary(types: dict, full_label: str) -> dict:
+    """Verdict + flags from the per-type levels; a failing level can never yield a passing label."""
+    reproducible = all(t["L1"]["passed"] and t["L2"]["passed"] for t in types.values())
+    pipeline = reproducible and all(t["L3"]["passed"] and t["L4"]["configs"][0]["equal"] for t in types.values())
     l1 = all(t["L1"]["passed"] for t in types.values())
     full = all(t[lvl]["passed"] for t in types.values() for lvl in ("L1", "L2", "L3", "L4"))
-    verdict = "strategy-equivalent" if full else "bar-equivalent only" if l1 else "different"
+    return {"verdict": full_label if full else "bar-equivalent only" if l1 else "different",
+            "dataset_reproducible": reproducible, "pipeline_equivalent_default": pipeline}
+
+
+def _header(v0_root, v0_version, v1_identity: dict, alignment_report: dict) -> dict:
     return {
-        "verdict": f"{verdict} (limited coverage)" if limited_coverage else verdict,
-        "coverage": coverage,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "v1": v1_identity, "v0_root": str(v0_root), "v0_version": v0_version,
         "alignment_report": {k: alignment_report[k] for k in ("dataset_id", "root_hash", "n_trades")
                              if k in alignment_report},
-        "optuna_files": optuna_before, "optuna_unchanged": True, "types": types,
-        "limitation": "Proves v1 reproduces v0 bars and behaviour; not v0's build-time is_buyer_maker (plan §3.1).",
     }
+
+
+def certify_dataset(*, v0_root: Path, v0_version: str | None, v1_root: Path, v1_identity: dict,
+                    alignment_report: dict | None, symbol: str, bar_types: list[str]) -> dict:
+    """Dataset/pipeline certificate: alignment gate, L1, L2, L3 (full range), L4 (default config). No Optuna."""
+    _check_alignment(alignment_report, v1_identity)
+    types = _run_levels(v0_root, v0_version, v1_root, symbol, bar_types, {})
+    return {
+        "certification": "dataset-pipeline", **_summary(types, DATASET_PASS),
+        "not_certified": {"optuna_research": "not certified: run --mode research",
+                          "strategy_profitability": NOT_PROFITABILITY},
+        **_header(v0_root, v0_version, v1_identity, alignment_report), "types": types, "limitation": LIMITATION,
+    }
+
+
+def certify_research(*, v0_root: Path, v0_version: str | None, v1_root: Path, v1_identity: dict,
+                     alignment_report: dict | None, symbol: str, bar_types: list[str], results_path: Path,
+                     studies_db: Path) -> dict:
+    """Optuna research certificate: the dataset levels plus every catalogued study, with strict coverage."""
+    _check_alignment(alignment_report, v1_identity)
+    results_path, studies_db = Path(results_path), Path(studies_db)
+    optuna_before = {str(p): _sha(p) for p in (results_path, studies_db)}
+    study_configs, coverage = _coverage(results_path, studies_db, symbol, bar_types)
+    types = _run_levels(v0_root, v0_version, v1_root, symbol, bar_types, study_configs)
+    optuna_after = {str(p): _sha(p) for p in (results_path, studies_db)}
+    if optuna_before != optuna_after:
+        raise CertificationRefused("Optuna results or study DB changed during certification")
+    return {
+        "certification": "optuna-research", **_summary(types, "strategy-equivalent"),
+        "not_certified": {"strategy_profitability": NOT_PROFITABILITY},
+        "coverage": coverage, **_header(v0_root, v0_version, v1_identity, alignment_report),
+        "optuna_files": optuna_before, "optuna_unchanged": True, "types": types, "limitation": LIMITATION,
+    }
+
+
+def _open_pinned(paired_root: Path, dataset_id: str, expected_root: str | None) -> tuple[PairedDataset, str]:
+    """Open the dataset against a trusted root hash: the registry pin, or --expected-root (which must also
+    agree with any registry entry). PairedDataset.open recomputes the root hash and checks every artifact."""
+    if expected_root is None:
+        return open_registered(paired_root, dataset_id, REGISTRY_PATH), "registry"
+    if not SHA256_HEX.fullmatch(expected_root):
+        raise CertificationRefused(f"--expected-root {expected_root!r} is not a lowercase 64-hex SHA-256")
+    try:
+        registered = pinned_root(dataset_id, REGISTRY_PATH)
+    except DataIntegrityError:                     # not registered yet: the trusted value alone pins it
+        registered = None
+    if registered is not None and registered != expected_root:
+        raise CertificationRefused(f"--expected-root differs from the registry pin for {dataset_id}")
+    return PairedDataset.open(Path(paired_root) / dataset_id, expected_root), "--expected-root"
 
 
 def main(argv=None) -> None:
@@ -356,23 +411,31 @@ def main(argv=None) -> None:
     ap.add_argument("--paired-root", type=Path, required=True)
     ap.add_argument("--dataset-id", required=True)
     ap.add_argument("--alignment-report", type=Path, required=True)
+    ap.add_argument("--expected-root", help="trusted root hash (64 hex) for a dataset not registered yet; "
+                                            "must match the registry pin if there is one")
+    ap.add_argument("--mode", choices=("dataset", "research"), default="dataset",
+                    help="dataset (default): bars + default-config pipeline, never reads Optuna; "
+                         "research: also replays every catalogued Optuna study, strict coverage")
     ap.add_argument("--v0-root", type=Path, default=Path(INFO_BARS.root))
     ap.add_argument("--v0-version", default=INFO_BARS.version)
-    ap.add_argument("--results", type=Path, default=ROOT / "output" / "optimize" / "results.json")
-    ap.add_argument("--studies-db", type=Path, default=ROOT / "output" / "optimize" / "studies.db")
-    ap.add_argument("--limited-coverage", action="store_true",
-                    help="certify the default configuration only: stored studies are NOT replayed; the verdict is "
-                         "labelled '(limited coverage)' and lists the DB studies left uncovered")
+    ap.add_argument("--results", type=Path, default=ROOT / "output" / "optimize" / "results.json",
+                    help="research mode only")
+    ap.add_argument("--studies-db", type=Path, default=ROOT / "output" / "optimize" / "studies.db",
+                    help="research mode only")
     args = ap.parse_args(argv)
-    ds = open_registered(args.paired_root, args.dataset_id)
+    ds, pin_source = _open_pinned(args.paired_root, args.dataset_id, args.expected_root)
     report = json.loads(args.alignment_report.read_text()) if args.alignment_report.is_file() else None
-    cert = certify(v0_root=args.v0_root, v0_version=args.v0_version, v1_root=ds.bars_root,
-                   v1_identity={"dataset_id": ds.dataset_id, "root_hash": ds.root_hash}, alignment_report=report,
-                   symbol=ds.manifest["symbol"], bar_types=ds.bar_types, results_path=args.results,
-                   studies_db=args.studies_db, limited_coverage=args.limited_coverage)
+    common = dict(v0_root=args.v0_root, v0_version=args.v0_version, v1_root=ds.bars_root,
+                  v1_identity={"dataset_id": ds.dataset_id, "root_hash": ds.root_hash}, alignment_report=report,
+                  symbol=ds.manifest["symbol"], bar_types=ds.bar_types)
+    if args.mode == "research":
+        cert = certify_research(**common, results_path=args.results, studies_db=args.studies_db)
+    else:
+        cert = certify_dataset(**common)
+    cert["pin_source"] = pin_source
     ds.recheck()
     CERT_DIR.mkdir(parents=True, exist_ok=True)
-    out = CERT_DIR / f"equivalence-{ds.dataset_id}.json"
+    out = CERT_DIR / f"{args.mode}-{ds.dataset_id}.json"
     out.write_text(json.dumps(cert, indent=2, default=str))
     print(f"{cert['verdict']}: {out}")
 

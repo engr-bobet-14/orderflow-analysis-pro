@@ -1,4 +1,5 @@
-"""Research-equivalence certificate (plan §3.4, R9): four levels, gated on a passed full-history alignment."""
+"""Dataset/pipeline and Optuna research certificates (plan §3.4, R9, §21): four levels, gated on a passed
+full-history alignment; only the research certificate reads Optuna storage."""
 import hashlib
 import json
 import shutil
@@ -64,7 +65,7 @@ def roots(tmp_path):
 
 
 def _certify(v0, v1, results, db, report=ALIGNED, **kw):
-    return ce.certify(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY, alignment_report=report,
+    return ce.certify_research(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY, alignment_report=report,
                       symbol="BTCUSDT", bar_types=[BT.value], results_path=results, studies_db=db, **kw)
 
 
@@ -265,7 +266,7 @@ def _catalog(path, buckets):
 
 
 def _certify2(v0, v1, results, db, **kw):
-    return ce.certify(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY, alignment_report=ALIGNED,
+    return ce.certify_research(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY, alignment_report=ALIGNED,
                       symbol="BTCUSDT", bar_types=[BT.value, BT2.value], results_path=results, studies_db=db, **kw)
 
 
@@ -327,17 +328,6 @@ def test_unparseable_persisted_study_name_is_refused_in_full_mode(two_types):
         _certify2(v0, v1, results, db)
 
 
-def test_limited_coverage_is_explicit_and_labelled(roots):
-    v0, v1, results, db = roots
-    results.unlink()
-    cert = _certify(v0, v1, results, db, limited_coverage=True)
-    assert cert["coverage"]["mode"] == "limited"
-    assert cert["coverage"]["studies"] == {BT.value: []}
-    assert cert["coverage"]["uncataloged_db_studies"] == [STUDY]
-    assert cert["verdict"] == "strategy-equivalent (limited coverage)"
-    assert [r["config"] for r in cert["types"][BT.value]["L4"]["configs"]] == ["default"]
-
-
 def test_l1_is_bit_exact(roots):
     v0, v1, _, _ = roots
     path = next((v1 / "BTCUSDT" / BT.value).glob("*.parquet"))
@@ -347,3 +337,223 @@ def test_l1_is_bit_exact(roots):
     table = table.set_column(table.schema.get_field_index("Cumulative Volume"), "Cumulative Volume", pa.array(vol))
     pq.write_table(table, path)
     assert not ce.level1(next((v0 / "BTCUSDT" / BT.value).glob("*.parquet")), path)["passed"]
+
+
+# ── dataset/pipeline certification: never reads Optuna storage (plan §21) ──────────────────────────────────
+
+DATASET_PASS = "dataset-reproducible; pipeline-equivalent (default config)"
+
+
+def _certify_dataset(v0, v1, report=ALIGNED, bar_types=(BT.value,)):
+    return ce.certify_dataset(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY,
+                              alignment_report=report, symbol="BTCUSDT", bar_types=list(bar_types))
+
+
+def test_dataset_certification_needs_no_optuna_files(roots):
+    v0, v1, results, db = roots
+    results.unlink()
+    db.unlink()
+    cert = _certify_dataset(v0, v1)
+    assert cert["certification"] == "dataset-pipeline" and cert["verdict"] == DATASET_PASS
+    assert cert["dataset_reproducible"] is True and cert["pipeline_equivalent_default"] is True
+    t = cert["types"][BT.value]
+    assert all(t[lvl]["passed"] for lvl in ("L1", "L2", "L3", "L4"))
+    assert t["L3"]["windows"] == 1                                         # the full range only
+    assert [r["config"] for r in t["L4"]["configs"]] == ["default"]
+    assert cert["not_certified"] == {"optuna_research": "not certified: run --mode research",
+                                     "strategy_profitability": "not validated by any certificate"}
+    assert not {"coverage", "optuna_files", "optuna_unchanged"} & set(cert)
+
+
+def test_dataset_certification_never_opens_optuna_storage(roots, monkeypatch):
+    v0, v1, _, _ = roots
+
+    def forbidden(*a, **k):
+        raise AssertionError("dataset certification opened an Optuna study DB")
+    monkeypatch.setattr(ce.sqlite3, "connect", forbidden)
+    assert _certify_dataset(v0, v1)["verdict"] == DATASET_PASS
+
+
+@pytest.mark.parametrize("report, match", [
+    (None, "alignment report"),
+    ({**ALIGNED, "status": "failed"}, "passed"),
+    ({**ALIGNED, "full_history": False}, "full-history"),
+    ({**ALIGNED, "root_hash": "cd" * 32}, "root hash"),
+    ({**ALIGNED, "dataset_id": "other"}, "dataset"),
+])
+def test_dataset_certification_requires_matching_passed_full_history_alignment(roots, report, match):
+    v0, v1, _, _ = roots
+    with pytest.raises(ce.CertificationRefused, match=match):
+        _certify_dataset(v0, v1, report=report)
+
+
+def _empty_gap_hours(v0, v1, tmp_path, monkeypatch):
+    side = next((v1 / "BTCUSDT" / BT.value).glob("*.json"))
+    side.write_text(json.dumps({**json.loads(side.read_text()), "missing_tick_hours": []}))
+
+
+def _swap_tie(v0, v1, tmp_path, monkeypatch):
+    rows = make_rows(n=400, step_s=30)
+    rows[10]["ts"] = rows[11]["ts"] = rows[11]["ts"]
+    rows[10]["seq"], rows[11]["seq"] = rows[11]["seq"], rows[10]["seq"]
+    rows[10]["nt"], rows[11]["nt"] = rows[11]["nt"], rows[10]["nt"]
+    shutil.rmtree(v1)
+    write_dataset(v1, rows, bar_type=BT, missing_hours=[GAP])
+
+
+def _skew_v1_replays(v0, v1, tmp_path, monkeypatch):
+    real = ce.replay_digests
+
+    def skewed(root, *args, **kwargs):
+        out = real(root, *args, **kwargs)
+        return {**out, "digest": "0" * 64} if root == v1 else out
+    monkeypatch.setattr(ce, "replay_digests", skewed)
+
+
+@pytest.mark.parametrize("perturb, failing, reproducible", [
+    (_empty_gap_hours, {"L2", "L3"}, False),
+    (_swap_tie, {"L1", "L3", "L4"}, False),                     # the reordered bars also replay differently
+    (_skew_v1_replays, {"L4"}, True),
+])
+def test_dataset_failures_are_never_hidden_by_mode_or_label(roots, tmp_path, monkeypatch, perturb, failing,
+                                                            reproducible):
+    v0, v1, results, db = roots
+    perturb(v0, v1, tmp_path, monkeypatch)
+    data, research = _certify_dataset(v0, v1), _certify(v0, v1, results, db)
+    for cert in (data, research):
+        t = cert["types"][BT.value]
+        assert {lvl for lvl in ("L1", "L2", "L3", "L4") if not t[lvl]["passed"]} == failing
+        assert cert["dataset_reproducible"] is reproducible and cert["pipeline_equivalent_default"] is False
+        assert "pipeline-equivalent" not in cert["verdict"] and "strategy-equivalent" not in cert["verdict"]
+        assert cert["verdict"] in ("bar-equivalent only", "different")
+    for lvl in ("L1", "L2", "L3"):
+        assert data["types"][BT.value][lvl]["passed"] == research["types"][BT.value][lvl]["passed"]
+    assert data["types"][BT.value]["L4"]["configs"][0] == research["types"][BT.value]["L4"]["configs"][0]
+
+
+def test_research_certificate_is_labelled_as_optuna_research_not_profitability(roots):
+    v0, v1, results, db = roots
+    cert = _certify(v0, v1, results, db)
+    assert cert["certification"] == "optuna-research" and cert["verdict"] == "strategy-equivalent"
+    assert cert["dataset_reproducible"] is True and cert["pipeline_equivalent_default"] is True
+    assert cert["not_certified"] == {"strategy_profitability": "not validated by any certificate"}
+
+
+def test_research_refuses_an_unfinished_uncatalogued_study(roots):
+    """A stopped study (running/failed trials, never catalogued) still blocks RESEARCH certification."""
+    v0, v1, results, db = roots
+    stopped = f"BTCUSDT__{BT.value}__2023-01-01_2023-01-01__d9__s9"
+    with sqlite3.connect(db) as con:
+        sid = con.execute("INSERT INTO studies (study_name) VALUES (?)", (stopped,)).lastrowid
+        con.execute("INSERT INTO trials (number, study_id, state) VALUES (0, ?, 'RUNNING')", (sid,))
+        con.execute("INSERT INTO trials (number, study_id, state) VALUES (1, ?, 'FAIL')", (sid,))
+    with pytest.raises(ce.CertificationRefused, match=stopped):
+        _certify(v0, v1, results, db)
+    assert _certify_dataset(v0, v1)["verdict"] == DATASET_PASS             # ...but never the dataset certificate
+
+
+# ── CLI: --mode, --expected-root, output names (plan §21) ─────────────────────────────────────────────────
+
+from tests import paired_fixture as fx   # noqa: E402
+
+PBT = "fixed_tick_imbalance"
+
+
+@pytest.fixture
+def cli(tmp_path, monkeypatch):
+    """A published paired dataset, a v0 copy of its bars, a passed alignment report, and a stopped,
+    uncatalogued study in an Optuna DB with no results catalog."""
+    trades = fx.make_trades(days=3, per_day=600)
+    ds_dir, root_hash = fx.write_paired(tmp_path, trades, {PBT: list(range(37, len(trades) - 5, 37))})
+    v0 = tmp_path / "v0"
+    shutil.copytree(ds_dir / fx.SYMBOL, v0 / fx.SYMBOL)
+    report = tmp_path / "alignment.json"
+    report.write_text(json.dumps({"status": "passed", "full_history": True, "dataset_id": ds_dir.name,
+                                  "root_hash": root_hash}))
+    db = tmp_path / "studies.db"
+    _db(db, [])
+    with sqlite3.connect(db) as con:
+        sid = con.execute("INSERT INTO studies (study_name) VALUES (?)",
+                          (f"BTCUSDT__{PBT}__2023-01-01_2023-01-03__d9__s9",)).lastrowid
+        con.execute("INSERT INTO trials (number, study_id, state) VALUES (0, ?, 'RUNNING')", (sid,))
+    registry = tmp_path / "registry.json"
+    registry.write_text("{}")
+    monkeypatch.setattr(ce, "REGISTRY_PATH", registry)
+    monkeypatch.setattr(ce, "CERT_DIR", tmp_path / "certs")
+    base = ["--paired-root", str(ds_dir.parent), "--dataset-id", ds_dir.name, "--alignment-report", str(report),
+            "--v0-root", str(v0), "--v0-version", fx.STAMP,
+            "--results", str(tmp_path / "results.json"), "--studies-db", str(db)]
+    return {"base": base, "root": root_hash, "id": ds_dir.name, "db": db, "registry": registry,
+            "certs": tmp_path / "certs", "results": tmp_path / "results.json"}
+
+
+def _sha_or_none(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+def test_cli_dataset_mode_is_the_default_and_ignores_unfinished_optuna_studies(cli):
+    before = {p: _sha_or_none(p) for p in (cli["db"], cli["results"], cli["registry"])}
+    ce.main([*cli["base"], "--expected-root", cli["root"]])
+    cert = json.loads((cli["certs"] / f"dataset-{cli['id']}.json").read_text())
+    assert cert["certification"] == "dataset-pipeline" and cert["verdict"] == DATASET_PASS
+    assert cert["pin_source"] == "--expected-root" and cert["v1"]["root_hash"] == cli["root"]
+    assert not (cli["certs"] / f"research-{cli['id']}.json").exists()
+    assert {p: _sha_or_none(p) for p in before} == before                  # Optuna files and registry untouched
+
+
+def test_cli_research_mode_stays_strict(cli):
+    with pytest.raises(ce.CertificationRefused, match="results catalog"):
+        ce.main([*cli["base"], "--expected-root", cli["root"], "--mode", "research"])
+    cli["results"].write_text(json.dumps({"symbols": {"BTCUSDT": {PBT: {}}}}))
+    with pytest.raises(ce.CertificationRefused, match="not in the results catalog"):
+        ce.main([*cli["base"], "--expected-root", cli["root"], "--mode", "research"])
+    assert not cli["certs"].exists() or not list(cli["certs"].iterdir())
+
+
+@pytest.mark.parametrize("pin, error", [
+    ("cd" * 32, "root hash"),                 # well-formed, wrong
+    ("", "expected-root"),                    # empty must not fall back to the registry
+    ("abc", "expected-root"),                 # not a SHA-256
+])
+def test_cli_expected_root_must_match_the_dataset(cli, pin, error):
+    from orderflow_system.data.infobar_feed import DataIntegrityError
+    with pytest.raises((DataIntegrityError, ce.CertificationRefused, SystemExit), match=error):
+        ce.main([*cli["base"], "--expected-root", pin])
+    assert not cli["certs"].exists()
+
+
+def test_cli_without_a_trusted_root_refuses(cli):
+    from orderflow_system.data.infobar_feed import DataIntegrityError
+    with pytest.raises(DataIntegrityError, match="not registered"):
+        ce.main(cli["base"])
+
+
+def test_cli_expected_root_conflicting_with_the_registry_refuses(cli):
+    cli["registry"].write_text(json.dumps({cli["id"]: "cd" * 32}))
+    with pytest.raises(ce.CertificationRefused, match="registry"):
+        ce.main([*cli["base"], "--expected-root", cli["root"]])
+
+
+def test_cli_registered_pin_is_verified_and_recorded(cli):
+    cli["registry"].write_text(json.dumps({cli["id"]: cli["root"]}))
+    ce.main(cli["base"])
+    cert = json.loads((cli["certs"] / f"dataset-{cli['id']}.json").read_text())
+    assert cert["pin_source"] == "registry" and cert["verdict"] == DATASET_PASS
+
+
+def test_cli_limited_coverage_flag_is_gone(cli):
+    with pytest.raises(SystemExit):
+        ce.main([*cli["base"], "--expected-root", cli["root"], "--limited-coverage"])
+
+
+@pytest.mark.parametrize("mode", ["dataset", "research"])
+def test_certifying_no_bar_types_is_refused(roots, mode):
+    """all([]) is True: an empty bar-type list must not yield a passing label with nothing compared."""
+    v0, v1, results, db = roots
+    with pytest.raises(ce.CertificationRefused, match="no bar types"):
+        if mode == "dataset":
+            _certify_dataset(v0, v1, bar_types=())
+        else:
+            ce.certify_research(v0_root=v0, v0_version=STAMP, v1_root=v1, v1_identity=IDENTITY,
+                                alignment_report=ALIGNED, symbol="BTCUSDT", bar_types=[], results_path=results,
+                                studies_db=db)
