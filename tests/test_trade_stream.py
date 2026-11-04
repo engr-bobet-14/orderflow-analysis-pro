@@ -246,6 +246,50 @@ def test_stream_records_quiescent_memory_on_own_connection(tmp_path, monkeypatch
     assert len(connections) == 1 and cursors == connections*3
 
 
+@pytest.mark.parametrize('finish', ['window', 'close', 'error'])
+def test_abandoned_day_releases_result_before_memory_sample(tmp_path, monkeypatch, finish):
+    from contextlib import contextmanager
+    import duckdb
+
+    # 10k trades empirically retain ~600 KiB in ORDER_BY/ALLOCATOR when abandoned.
+    trades = make_trades(days=1, per_day=10000)
+    directory, root = write_paired(tmp_path, trades, {BT: [4, 41, 200]}, days=1)
+    ds = PairedDataset.open(directory, root)
+    connect = duckdb.connect
+    connections = []
+    @contextmanager
+    def inspected_connect(*args, **kwargs):
+        with connect(*args, **kwargs) as con:
+            connections.append(con)
+            yield con
+    monkeypatch.setattr(duckdb, 'connect', inspected_connect)
+    stream = TradeStream(ds, end_ordinal=200 if finish == 'window' else None,
+                         temp_dir=tmp_path/'spill', batch_rows=997)
+    iterator = iter(stream)
+    first = next(iterator)
+    assert np.array_equal(first.rows, canonical(trades.iloc[:len(first.rows)]))
+    with connections[0].cursor() as memory:
+        active_bytes = memory.execute(
+            'SELECT sum(memory_usage_bytes) FROM duckdb_memory()'
+        ).fetchone()[0]
+    assert active_bytes > 0, 'fixture must exercise an allocated ORDER BY result'
+    if finish == 'window':
+        assert list(iterator) == []
+    elif finish == 'close':
+        iterator.close()
+    else:
+        def fail_canonical(*args):
+            raise DataIntegrityError('injected batch failure')
+        monkeypatch.setattr(stream, '_canonical', fail_canonical)
+        with pytest.raises(DataIntegrityError, match='injected batch failure'):
+            list(iterator)
+    assert len(stream.report['per_day_rss']) == 1
+    sample = stream.report['per_day_rss'][-1]
+    assert sample['duckdb_memory_bytes'] == 0
+    assert sample['duckdb_memory_tags'] == {}
+    assert not list((tmp_path/'spill').iterdir())
+
+
 def test_malloc_in_use_is_unavailable_off_darwin(monkeypatch):
     import ctypes
     from types import SimpleNamespace

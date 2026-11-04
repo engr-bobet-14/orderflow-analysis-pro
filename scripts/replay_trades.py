@@ -76,7 +76,8 @@ def _stability_after_day(samples, rss_kind, anchor_day):
 
 def evaluate_memory(samples, peak_bytes, rss_kind, *, day_loads=None, extra_samples=()):
     """§31: main replay trend; whole-process peak and quiescent memory including window checks."""
-    all_samples = list(samples)+list(extra_samples)
+    extra_samples = list(extra_samples)
+    all_samples = list(samples)+extra_samples
     peak = {'status': 'not_evaluable' if peak_bytes is None else ('pass' if peak_bytes <= 2**31 else 'fail'),
             'peak_rss_bytes': peak_bytes, 'limit_bytes': 2**31,
             'source': 'resource.RUSAGE_SELF; host wait4 remains authoritative'}
@@ -113,9 +114,11 @@ def evaluate_memory(samples, peak_bytes, rss_kind, *, day_loads=None, extra_samp
     rss_max_anchor['peak_day'] = peak_day
     rss_max_anchor['n_post_peak'] = rss_max_anchor.pop('n_post_anchor')
 
-    first = all_samples[0].get('malloc_in_use_bytes') if all_samples else None
-    last = all_samples[-1].get('malloc_in_use_bytes') if all_samples else None
-    heap = {'first_bytes': first, 'last_bytes': last, 'flagged': None}
+    first = samples[0].get('malloc_in_use_bytes') if samples else None
+    last = samples[-1].get('malloc_in_use_bytes') if samples else None
+    window_malloc = [s['malloc_in_use_bytes'] for s in extra_samples if s.get('malloc_in_use_bytes') is not None]
+    heap = {'first_bytes': first, 'last_bytes': last, 'flagged': None,
+            'windows_max_malloc_in_use_bytes': max(window_malloc, default=None)}
     if first is not None and last is not None:
         heap['flagged'] = last*10 > first*11+50*MIB*10
     else:

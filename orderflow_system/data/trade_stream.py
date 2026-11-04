@@ -136,72 +136,84 @@ class TradeStream:
                 todays = [f for f in files if f['min_time'] < hi and f['max_time'] >= lo]
                 for f in todays:
                     _check_file(f, hashed)
-                batches = iter(con.execute('''
+                reader = None
+                batches = iter(())
+                current = np.empty(0, dtype=ROW_DTYPE)
+                try:
+                    reader = con.execute('''
                     SELECT trade_time_ms, trade_id, price, quantity, is_buyer_maker
                     FROM read_parquet(?, hive_partitioning = true)
                     WHERE price > 0 AND isfinite(price) AND quantity > 0 AND isfinite(quantity)
                       AND trade_time_ms IS NOT NULL AND trade_time_ms >= ? AND trade_time_ms < ?
                     ORDER BY trade_time_ms, trade_id''', [[str(f['abs']) for f in todays], lo, hi]
-                ).fetch_record_batch(self.batch_rows)) if todays else iter(())
-                current, pos, exhausted = np.empty(0, dtype=ROW_DTYPE), 0, False
-                while idx <= stop_idx and int(grid[idx]) < hi:
-                    hour_ms = int(grid[idx])
-                    parts = []
-                    while True:
-                        if pos == len(current) and not exhausted:
-                            batch = next(batches, None)
-                            if batch is None:
-                                exhausted = True
-                            else:
-                                current = self._canonical(batch, datetime.fromtimestamp(lo/1000, timezone.utc).date())
-                                pos = 0
-                                t, ids = current['time_ms'], current['trade_id']
-                                if len(t):
-                                    if last_key is not None and (int(t[0]), int(ids[0])) <= last_key:
-                                        raise DataIntegrityError('trade keys not strictly increasing')
-                                    if ((t[1:] < t[:-1]) | ((t[1:] == t[:-1]) & (ids[1:] <= ids[:-1]))).any():
-                                        raise DataIntegrityError('trade keys not strictly increasing')
-                                    last_key = int(t[-1]), int(ids[-1])
-                        if pos == len(current):
-                            if exhausted:
+                    ).fetch_record_batch(self.batch_rows) if todays else None
+                    batches = iter(reader) if reader is not None else iter(())
+                    pos, exhausted = 0, False
+                    while idx <= stop_idx and int(grid[idx]) < hi:
+                        hour_ms = int(grid[idx])
+                        parts = []
+                        while True:
+                            if pos == len(current) and not exhausted:
+                                batch = next(batches, None)
+                                if batch is None:
+                                    exhausted = True
+                                else:
+                                    current = self._canonical(batch, datetime.fromtimestamp(lo/1000, timezone.utc).date())
+                                    pos = 0
+                                    t, ids = current['time_ms'], current['trade_id']
+                                    if len(t):
+                                        if last_key is not None and (int(t[0]), int(ids[0])) <= last_key:
+                                            raise DataIntegrityError('trade keys not strictly increasing')
+                                        if ((t[1:] < t[:-1]) | ((t[1:] == t[:-1]) & (ids[1:] <= ids[:-1]))).any():
+                                            raise DataIntegrityError('trade keys not strictly increasing')
+                                        last_key = int(t[-1]), int(ids[-1])
+                            if pos == len(current):
+                                if exhausted:
+                                    break
+                                continue
+                            if int(current['time_ms'][pos]) >= hour_ms+HOUR_MS:
                                 break
-                            continue
-                        if int(current['time_ms'][pos]) >= hour_ms+HOUR_MS:
-                            break
-                        stop = int(np.searchsorted(current['time_ms'], hour_ms+HOUR_MS))
-                        # Copy just this hour's rows; don't retain an entire batch through a view.
-                        parts.append(current[pos:stop].copy())
-                        pos = stop
-                    rows = np.concatenate(parts) if parts else np.empty(0, dtype=ROW_DTYPE)
-                    ref = hours.iloc[idx]
-                    got = (hour_ms, ordinal, len(rows), sum_lots(rows['qty_lots']), hashlib.sha256(rows.tobytes()).hexdigest())
-                    want = (int(ref.hour_ms), int(ref.first_ordinal), int(ref.n_trades), int(ref.sum_qty_lots), ref.digest)
-                    if got != want:
-                        raise DataIntegrityError(f'hour {hour_ms}: trades {got} != hours.parquet {want}')
-                    self.report['hours_verified'] += 1
-                    self.report['n_verified'] += len(rows)
-                    if self.end_ordinal is not None:
-                        self.report['overscan_n'] += max(0, ordinal+len(rows)-1-self.end_ordinal)
-                    rows.flags.writeable = False
-                    yield VerifiedHour(hour_ms, ordinal, rows)
-                    ordinal += len(rows)
-                    idx += 1
-                    del rows, parts
-                del batches, current
-                gc.collect()
-                with con.cursor() as memory:
-                    duckdb_bytes = int(memory.execute(
-                        'SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()'
-                    ).fetchone()[0])
-                    tags = dict(memory.execute(
-                        'SELECT tag, memory_usage_bytes FROM duckdb_memory() WHERE memory_usage_bytes != 0'
-                    ).fetchall())
-                malloc_bytes = malloc_in_use_bytes()
-                self.report['per_day_rss'].append({'day': lo//DAY_MS,
-                    'bytes': process.memory_info().rss if process else peak_rss_bytes(),
-                    'rss_kind': self.report['rss_kind'], 'duckdb_memory_bytes': duckdb_bytes,
-                    'duckdb_memory_tags': tags, 'malloc_in_use_bytes': malloc_bytes,
-                    'unavailable': ['malloc_in_use_bytes'] if malloc_bytes is None else []})
+                            stop = int(np.searchsorted(current['time_ms'], hour_ms+HOUR_MS))
+                            # Copy just this hour's rows; don't retain an entire batch through a view.
+                            parts.append(current[pos:stop].copy())
+                            pos = stop
+                        rows = np.concatenate(parts) if parts else np.empty(0, dtype=ROW_DTYPE)
+                        ref = hours.iloc[idx]
+                        got = (hour_ms, ordinal, len(rows), sum_lots(rows['qty_lots']), hashlib.sha256(rows.tobytes()).hexdigest())
+                        want = (int(ref.hour_ms), int(ref.first_ordinal), int(ref.n_trades), int(ref.sum_qty_lots), ref.digest)
+                        if got != want:
+                            raise DataIntegrityError(f'hour {hour_ms}: trades {got} != hours.parquet {want}')
+                        self.report['hours_verified'] += 1
+                        self.report['n_verified'] += len(rows)
+                        if self.end_ordinal is not None:
+                            self.report['overscan_n'] += max(0, ordinal+len(rows)-1-self.end_ordinal)
+                        rows.flags.writeable = False
+                        yield VerifiedHour(hour_ms, ordinal, rows)
+                        ordinal += len(rows)
+                        idx += 1
+                        del rows, parts
+                finally:
+                    if reader is not None:
+                        reader.close()
+                    # Closing Arrow alone can retain an abandoned ORDER BY result.
+                    # Replace it on the owning connection before the quiescent sample.
+                    con.execute('SELECT 1').fetchall()
+                    del reader
+                    del batches, current
+                    gc.collect()
+                    with con.cursor() as memory:
+                        duckdb_bytes = int(memory.execute(
+                            'SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()'
+                        ).fetchone()[0])
+                        tags = dict(memory.execute(
+                            'SELECT tag, memory_usage_bytes FROM duckdb_memory() WHERE memory_usage_bytes != 0'
+                        ).fetchall())
+                    malloc_bytes = malloc_in_use_bytes()
+                    self.report['per_day_rss'].append({'day': lo//DAY_MS,
+                        'bytes': process.memory_info().rss if process else peak_rss_bytes(),
+                        'rss_kind': self.report['rss_kind'], 'duckdb_memory_bytes': duckdb_bytes,
+                        'duckdb_memory_tags': tags, 'malloc_in_use_bytes': malloc_bytes,
+                        'unavailable': ['malloc_in_use_bytes'] if malloc_bytes is None else []})
             full = self.start_ordinal == 1 and self.end_ordinal is None
             if full:
                 for f in files:

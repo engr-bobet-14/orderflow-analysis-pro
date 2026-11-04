@@ -82,6 +82,32 @@ def test_window_equals_full_trade_outputs(tmp_path, start, end):
             assert prefix.report['lanes'][bt]['developing_profiles'] == lane['developing_profiles']
 
 
+def test_midday_result_release_preserves_frozen_trade_outputs_and_digests(tmp_path):
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    trades = make_trades(days=2, per_day=10000)
+    bt = TYPES[0]
+    ends = [4, 1000, 4000, 7500, 9990, 11000, 14000, 17500, 19990]
+    directory, root = write_paired(tmp_path, trades, {bt: ends}, days=2)
+    ds = PairedDataset.open(directory, root)
+    run = replay(ds, tmp_path, '2023-01-01', '2023-01-02T12:00:00+00:00',
+                 batch=997, types=[bt])
+    payload = [{'seq': result.bar.seq, 'stats': asdict(result.trade_stats),
+                'footprint': asdict(result.trade_footprint),
+                'profiles': [asdict(p) for p in result.trade_profiles]}
+               for _, result in run]
+    # Frozen from 948f1d0, before the result-release change; includes a finalised day.
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), default=str).encode()
+    assert hashlib.sha256(encoded).hexdigest() == '1dc021017df64e155b31a7e220583da9aafdc9d0ff41bf9a65edead9961111b4'
+    lane = run.report['lanes'][bt]
+    assert lane['replay_digest'] == '39f9807a8071060f4fe98bd9f4a08713d896629fa5ed2a71cf47d235b5f31652'
+    assert lane['trade_digest'] == 'de3e4d660a2e3fbdef60cf61f94d806bb3f0445ca089acdf9d7117cc1db7b481'
+    assert lane['finalised_days'] == 1
+    assert all(s['duckdb_memory_bytes'] == 0 for s in run.report['stream']['per_day_rss'])
+
+
 def test_midnight_close_and_predecessor_tie_warmup(tmp_path):
     trades = make_trades(days=3, per_day=100)
     t = trades.trade_time_ms.to_numpy().copy()
@@ -787,7 +813,40 @@ def test_memory_criteria_window_memory_is_included():
     assert result['gate_duckdb']['status'] == 'fail'
     assert result['gate_stability']['status'] == 'pass'
     assert result['gate_stability']['n_post_anchor'] == 40
-    assert result['diagnostic_live_heap']['flagged'] is True
+    assert result['gate_duckdb']['sample_scope'] == 'main_replay_and_windows'
+    assert result['diagnostic_live_heap']['flagged'] is False
+    assert result['diagnostic_live_heap']['first_bytes'] == 100*(1 << 20)
+    assert result['diagnostic_live_heap']['last_bytes'] == 100*(1 << 20)
+    assert result['diagnostic_live_heap']['windows_max_malloc_in_use_bytes'] == 200*(1 << 20)
+
+
+def test_live_heap_main_endpoints_and_window_max_are_separate():
+    samples = _memory_gate_samples()
+    samples[-1]['malloc_in_use_bytes'] = 200*(1 << 20)
+    extra = [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': value}
+             for value in [300*(1 << 20), None, 50*(1 << 20)]]
+    result = _evaluate_memory_with_loads(samples, 1 << 31, 'current', extra_samples=extra)
+    heap = result['diagnostic_live_heap']
+    assert heap['first_bytes'] == 100*(1 << 20)
+    assert heap['last_bytes'] == 200*(1 << 20)
+    assert heap['flagged'] is True
+    assert heap['windows_max_malloc_in_use_bytes'] == 300*(1 << 20)
+    assert result['verdict'] == 'pass'
+
+
+def test_live_heap_without_main_samples_keeps_endpoints_unavailable():
+    extra = [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': 123}]
+    result = _evaluate_memory_with_loads([], 1 << 31, 'current', extra_samples=extra)
+    heap = result['diagnostic_live_heap']
+    assert heap['first_bytes'] is None and heap['last_bytes'] is None
+    assert heap['flagged'] is None
+    assert heap['windows_max_malloc_in_use_bytes'] == 123
+
+
+@pytest.mark.parametrize('extra', [[], [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': None}]])
+def test_live_heap_window_max_unavailable_without_window_malloc(extra):
+    result = _evaluate_memory_with_loads(_memory_gate_samples(), 1 << 31, 'current', extra_samples=extra)
+    assert result['diagnostic_live_heap']['windows_max_malloc_in_use_bytes'] is None
 
 
 def test_memory_criteria_missing_day_samples_cannot_pass():
