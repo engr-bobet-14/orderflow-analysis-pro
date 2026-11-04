@@ -180,3 +180,34 @@ DB_PATH = "orderflow_data.db"
 
 # Logging
 LOG_LEVEL = "INFO"
+
+
+@dataclass
+class TradeFlowConfig:
+    """Authenticated replay settings; legacy profile settings remain independent."""
+    paired_root: str = "/Volumes/Market-Data/info-bars-paired"
+    footprint_bucket: float = 1.0
+    profile_bucket: float = 10.0
+    duckdb_threads: int = 4
+    duckdb_memory_limit: str = "1GB"
+    duckdb_temp_dir: str = "output/duckdb_tmp"
+    report_dir: str = "output/trade_replay"
+
+    def __post_init__(self):
+        import math
+        from pathlib import Path
+        for name, label in (('duckdb_temp_dir', 'DuckDB temp directory'), ('report_dir', 'trade report directory')):
+            directory = Path(getattr(self, name))
+            if not directory.is_absolute():
+                directory = Path(__file__).resolve().parents[2]/directory
+            directory = directory.resolve()
+            if directory.is_relative_to('/Volumes'):
+                raise ValueError(f'{label} must be local, outside /Volumes')
+            setattr(self, name, str(directory))
+        for width in (self.footprint_bucket, self.profile_bucket):
+            scaled = width * 100
+            if (not math.isfinite(scaled) or width <= 0 or round(scaled) < 1 or
+                    abs(scaled-round(scaled)) >= 1e-9):
+                raise ValueError('trade bucket must be positive and a multiple of $0.01')
+            if round(scaled) > 2**63-1:
+                raise ValueError('trade bucket exceeds int64 ticks')

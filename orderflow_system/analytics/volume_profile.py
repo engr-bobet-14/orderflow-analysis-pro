@@ -99,6 +99,12 @@ class VolumeProfileEngine:
         )
         return result
 
+    def compute_from_volume_at_price(
+        self, vap: dict[float, float], session_date: str = "", source: str = "trades"
+    ) -> VolumeProfileResult:
+        """Compute a profile from an independently bucketed trade histogram."""
+        return self._compute_profile(dict(vap), session_date, source=source)
+
     def _compute_profile(
         self, volume_at_price: dict[float, float], session_date: str, source: str = "ticks"
     ) -> VolumeProfileResult:
