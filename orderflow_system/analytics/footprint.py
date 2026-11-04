@@ -121,6 +121,17 @@ class FootprintEngine:
         if len(self._bar_history) > self._max_history:
             self._bar_history = self._bar_history[-self._max_history:]
 
+    def build_from_levels(self, bar: InfoBar, levels) -> FootprintBar:
+        """Already bucketed integer ticks / taker buy lots / taker sell lots."""
+        fp = FootprintBar(
+            timestamp_ms=bar.timestamp_ms, open=bar.open, high=bar.high, low=bar.low, close=bar.close,
+            levels={round(int(p)/100, 10): FootprintLevel(
+                price=round(int(p)/100, 10), ask_volume=int(b)/1000, bid_volume=int(s)/1000,
+            ) for p, b, s in zip(*levels)},
+        )
+        self._remember(fp)
+        return fp
+
     def build_from_ticks(self, ticks: list[Tick], timestamp_ms: int = 0) -> FootprintBar:
         """Build footprint bar from raw ticks."""
         if not ticks:

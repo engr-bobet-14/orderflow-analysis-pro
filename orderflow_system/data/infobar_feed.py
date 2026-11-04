@@ -181,10 +181,38 @@ class InfoBarReader:
         self.report = ReadReport()
         # Populated before the first yield, including when earlier groups are pruned.
         self.first_predecessor_ms: Optional[int] = None
+        self.first_predecessor_seq: Optional[int] = None
         missing = info.missing_hours_ms
         self._missing = [(h, h + _HOUR_MS) for h in missing]
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _timestamps_ms(column) -> np.ndarray:
+        """Match reader precision without Arrow's lossy timestamp casts."""
+        raw = column.fill_null(0).cast("int64").to_numpy()
+        unit = column.type.unit
+        return raw * 1000 if unit == "s" else raw // {"ms": 1, "us": 1000, "ns": 1_000_000}[unit]
+
+    def last_tick_number(self) -> int:
+        """Last close in this window, using the same UTC and unit rules as iteration."""
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(self.info.parquet_path)
+        ts_col = pf.schema_arrow.names.index(TS_COL)
+        for idx in reversed(range(pf.num_row_groups)):
+            if not self._group_in_range(pf, idx, ts_col):
+                continue
+            table = pf.read_row_group(idx, columns=[TS_COL, "Tick Number"])
+            times = self._timestamps_ms(table[TS_COL])
+            mask = np.ones(len(times), dtype=bool)
+            if self.start_ms is not None:
+                mask &= times >= self.start_ms
+            if self.end_ms is not None:
+                mask &= times < self.end_ms
+            if mask.any():
+                return int(table["Tick Number"].to_numpy()[mask][-1])
+        raise DataIntegrityError("no ending bar in replay window")
 
     def _group_in_range(self, pf, idx: int, ts_col: int) -> bool:
         if self.start_ms is None and self.end_ms is None:
@@ -233,9 +261,7 @@ class InfoBarReader:
         def read_group(idx):
             tbl = pf.read_row_group(idx, columns=COLUMNS)
             # Fill timestamp nulls only for conversion: they are rejected below.
-            raw_ts = tbl[TS_COL].fill_null(0).cast("int64").to_numpy()
-            unit = ts_type.unit
-            ts = raw_ts * 1000 if unit == "s" else raw_ts // {"ms": 1, "us": 1000, "ns": 1_000_000}[unit]
+            ts = self._timestamps_ms(tbl[TS_COL])
             arrays = [tbl[k].to_numpy() for k in COLUMNS[1:]]
             seq, o, h, l, c, vol, bv, sv, nt, dv, th = arrays
             finite = np.isfinite(np.column_stack(arrays)).all(axis=1)
@@ -305,6 +331,7 @@ class InfoBarReader:
                     self._fail("out_of_order", row_base + i)
                     continue
                 predecessor_ms = prev_ts
+                predecessor_seq = prev_seq
                 duration = None if prev_ts is None else t - prev_ts
                 spans_gap = (duration is not None and
                              any(prev_ts < hi and t > lo for lo, hi in self._missing))
@@ -319,6 +346,7 @@ class InfoBarReader:
                     rep.bars_spanning_missing_hours += 1
                 if rep.first_ts_ms is None:
                     self.first_predecessor_ms = predecessor_ms
+                    self.first_predecessor_seq = predecessor_seq if predecessor_ms is not None else None
                     rep.first_ts_ms = t
                 rep.last_ts_ms = t
                 rep.rows_yielded += 1

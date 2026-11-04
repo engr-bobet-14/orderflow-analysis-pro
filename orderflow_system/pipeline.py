@@ -21,15 +21,17 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Optional
 
 from orderflow_system.analytics.delta import DeltaEngine, DeltaResult
 from orderflow_system.analytics.footprint import FootprintBar, FootprintEngine
 from orderflow_system.analytics.volume_profile import VolumeProfileEngine
-from orderflow_system.config.settings import InstrumentConfig
+from orderflow_system.analytics.trade_accumulator import TradeBarStats, TradeBarUpdate, exact_value_area
+from orderflow_system.config.settings import InstrumentConfig, TradeFlowConfig, VolumeProfileConfig
 from orderflow_system.data.models import BarType, InfoBar, Signal, VolumeProfileResult
+from orderflow_system.data.infobar_feed import DataIntegrityError
 from orderflow_system.patterns.absorption import AbsorptionDetector
 from orderflow_system.patterns.divergence import DivergenceDetector
 from orderflow_system.patterns.exhaustion import ExhaustionDetector
@@ -59,6 +61,9 @@ class BarResult:
     closed_profile: Optional[VolumeProfileResult] = None           # set on the bar that opens a new session
     bias: Optional[DailyBias] = None                               # bias computed at that rollover
     gap_skipped: bool = False                                      # detector output discarded (outage)
+    trade_footprint: Optional[FootprintBar] = None
+    trade_stats: Optional[TradeBarStats] = None
+    trade_profiles: list[VolumeProfileResult] = field(default_factory=list)
 
 
 class ReplayDigest:
@@ -92,8 +97,11 @@ class InfoBarPipeline:
         config: InstrumentConfig,
         bar_type: Optional[BarType] = None,
         history_bars: int = 5000,
+        trade_config: Optional[TradeFlowConfig] = None,
     ):
         self.config = config
+        self.trade_config = trade_config or TradeFlowConfig()
+        self.trade_view: Optional[TradeView] = None
         self.symbol = config.instrument.value
         self.bar_type = bar_type
         self.clock = EventClock()
@@ -136,7 +144,7 @@ class InfoBarPipeline:
 
     # ── main entry ──────────────────────────────────────────
 
-    def process_bar(self, bar: InfoBar) -> BarResult:
+    def process_bar(self, bar: InfoBar, trade: Optional[TradeBarUpdate] = None) -> BarResult:
         if self._last_ts is not None and bar.timestamp_ms < self._last_ts:
             raise ValueError(
                 f"Out-of-order bar: {bar.timestamp_ms} < {self._last_ts}. "
@@ -198,6 +206,10 @@ class InfoBarPipeline:
         for agg in aggregated:
             agg.bar_seq = bar.seq
             self.action_counts[agg.action] += 1
+        if trade is not None:
+            if self.trade_view is None:
+                self.trade_view = TradeView(self.trade_config, self.config.volume_profile)
+            result.trade_footprint, result.trade_stats, result.trade_profiles = self.trade_view.update(bar, trade)
         return result
 
     # ── internals ───────────────────────────────────────────
@@ -289,3 +301,79 @@ class InfoBarPipeline:
             "actions": dict(self.action_counts),
             "gap_bars_skipped": self.gap_bars_skipped,
         }
+
+
+class TradeProfileTracker:
+    """Bounded history of finalised trade profiles, isolated from strategy framing."""
+    def __init__(self):
+        self.history = deque(maxlen=200)
+
+    def add(self, profile):
+        self.history.append(profile)
+
+
+class TradeView:
+    def __init__(self, config: TradeFlowConfig, profile_config: Optional[VolumeProfileConfig] = None):
+        self.footprint_engine = FootprintEngine(tick_size=config.footprint_bucket)
+        self.profile_engine = VolumeProfileEngine(replace(
+            profile_config or VolumeProfileConfig(), tick_size=config.profile_bucket,
+        ))
+        self.tracker = TradeProfileTracker()
+
+    def compute_profile(self, day, ticks, lots) -> VolumeProfileResult:
+        """Keep legacy profile statistics, deciding POC and value-area boundaries on lots."""
+        profile = self.profile_engine.compute_from_volume_at_price(
+            {round(int(p)/100, 10): int(q)/1000 for p, q in zip(ticks, lots)}, utc_date(day*_DAY_MS),
+        )
+        poc, lo, hi = exact_value_area(lots, self.profile_engine.config.value_area_pct)
+        if profile.poc != round(int(ticks[poc])/100, 10):
+            raise DataIntegrityError('trade profile integer POC differs from float POC')
+        return replace(profile, vah=round(int(ticks[hi])/100, 10), val=round(int(ticks[lo])/100, 10))
+
+    def update(self, bar: InfoBar, trade: TradeBarUpdate):
+        footprint = self.footprint_engine.build_from_levels(bar, trade.footprint_levels)
+        profiles = []
+        for day, ticks, lots in trade.finalised_days:
+            profile = self.compute_profile(day, ticks, lots)
+            profiles.append(profile)
+            self.tracker.add(profile)
+        return footprint, trade.stats, profiles
+
+
+class TradeDigest:
+    """Hash per-bar leaves, with predeclared inclusive seq ranges (bounded memory)."""
+    def __init__(self, ranges=()):
+        self._h = hashlib.sha256()
+        self._ranges = {tuple(r): hashlib.sha256() for r in ranges}
+        self.bars = 0
+
+    def update(self, result: BarResult, trade: TradeBarUpdate):
+        import struct
+        from dataclasses import astuple
+        stats = result.trade_stats
+        if stats is None or len(trade.finalised_days) != len(result.trade_profiles):
+            raise ValueError('TradeDigest requires matching trade stats and profiles')
+        h = hashlib.sha256()
+        h.update(struct.pack('<q', result.bar.seq))
+        h.update(struct.pack('<13q', *astuple(stats)))
+        for array in trade.footprint_levels:
+            h.update(struct.pack('<q', len(array)))
+            h.update(array.tobytes())
+        h.update(struct.pack('<q', len(trade.finalised_days)))
+        for (day, ticks, lots), profile in zip(trade.finalised_days, result.trade_profiles):
+            h.update(struct.pack('<qq', day, len(ticks)))
+            h.update(ticks.tobytes())
+            h.update(lots.tobytes())
+            h.update(struct.pack('<3d', profile.poc, profile.vah, profile.val))
+        leaf = h.digest()
+        self._h.update(leaf)
+        for (lo, hi), digest in self._ranges.items():
+            if lo <= result.bar.seq <= hi:
+                digest.update(leaf)
+        self.bars += 1
+
+    def hexdigest(self):
+        return self._h.hexdigest()
+
+    def range_hexdigest(self, lo, hi):
+        return self._ranges[(lo, hi)].hexdigest()

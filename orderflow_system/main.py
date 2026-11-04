@@ -25,6 +25,9 @@ import json
 import signal
 import sys
 from dataclasses import asdict, replace
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from orderflow_system.config.settings import (
@@ -35,6 +38,7 @@ from orderflow_system.config.settings import (
     TELEGRAM,
     InfoBarConfig,
     InstrumentConfig,
+    TradeFlowConfig,
     get_all_configs,
 )
 from orderflow_system.alerts.telegram_bot import TelegramAlertBot
@@ -65,7 +69,15 @@ class OrderflowSystem:
         instruments: Optional[list[InstrumentConfig]] = None,
         info_bars: InfoBarConfig = INFO_BARS,
         send_alerts: bool = False,
+        paired_dataset: Optional[str] = None,
+        trade_config: Optional[TradeFlowConfig] = None,
     ):
+        if paired_dataset and (info_bars.persist or send_alerts):
+            raise ValueError('trade replay cannot persist or send alerts')
+        self.paired_dataset = paired_dataset
+        self.trade_config = trade_config or TradeFlowConfig()
+        self.dataset = None
+        self.trade_report: Optional[dict] = None
         instruments = instruments or get_all_configs()
         self.info_bars = info_bars
         self.send_alerts = send_alerts
@@ -87,7 +99,8 @@ class OrderflowSystem:
         self._tasks: list[asyncio.Task] = []
         self.pipelines: dict[str, InfoBarPipeline] = {
             self.symbol: InfoBarPipeline(
-                cfg, bar_type=info_bars.bar_type, history_bars=info_bars.history_bars
+                cfg, bar_type=info_bars.bar_type, history_bars=info_bars.history_bars,
+                trade_config=self.trade_config,
             )
         }
 
@@ -112,6 +125,24 @@ class OrderflowSystem:
         logger.info("=" * 60)
 
         # Discover the dataset before allocating a SQLite worker thread.
+        if self.paired_dataset:
+            from orderflow_system.data.paired_dataset import open_registered
+
+            self.dataset = open_registered(Path(self.trade_config.paired_root), self.paired_dataset)
+            if (self.info_bars.bar_type.value not in self.dataset.bar_types or
+                    self.info_bars.symbol != self.dataset.manifest['symbol']):
+                raise ValueError('instrument or bar type is absent from the paired dataset')
+            stamp = self.dataset.manifest['stamp']
+            bars_root = self.dataset.bars_root.resolve()
+            if self.info_bars.version is not None and self.info_bars.version != stamp:
+                raise ValueError(f'requested version {self.info_bars.version!r} differs from paired version {stamp!r}')
+            requested_root = Path(self.info_bars.root).resolve()
+            if requested_root not in (Path(INFO_BARS.root).resolve(), bars_root):
+                raise ValueError(f'requested root {self.info_bars.root!r} (resolved {str(requested_root)!r}) '
+                                 f'differs from paired bars root {str(bars_root)!r}')
+            self.info_bars = replace(self.info_bars, root=str(bars_root), version=stamp, strict=True)
+            logger.info('Trade dataset: dataset_id=%s root=%s version=%s root_hash=%s',
+                        self.dataset.dataset_id, bars_root, stamp, self.dataset.root_hash)
         self.reader = open_bars(
             self.info_bars.root, self.info_bars.symbol, self.info_bars.bar_type,
             start=self.info_bars.start, end=self.info_bars.end, strict=self.info_bars.strict,
@@ -178,21 +209,76 @@ class OrderflowSystem:
                     logger.info("System stopped.")
 
     async def _replay(self):
-        sent = await self.feed.run()
-        await self._flush_bars()
-        self.replay_finished = True
-        pipeline = self.pipelines[self.symbol]
-        rep = self.reader.report
-        logger.info(
-            f"Replay finished: {sent} bars | rejected={rep.rows_rejected} "
-            f"tied_ts={rep.tied_timestamps} gap_bars={rep.bars_spanning_missing_hours} "
-            f"| {pipeline.stats}"
-        )
-        await self.ws_manager.broadcast_stats(self._stats_payload())
-        if DASHBOARD.enabled:
-            await self._stop_event.wait()    # keep serving the dashboard until stopped
-        else:
-            await self.stop()
+        replay, status, error = None, 'failed', None
+        try:
+            if self.dataset is None:
+                sent = await self.feed.run()
+            else:
+                from orderflow_system.data.trade_stream import TradeReplay
+
+                replay = TradeReplay(self.dataset, [(self.reader, self.pipelines[self.symbol])],
+                    temp_dir=Path(self.trade_config.duckdb_temp_dir), threads=self.trade_config.duckdb_threads,
+                    memory_limit=self.trade_config.duckdb_memory_limit)
+                sent = 0
+                with closing(iter(replay)) as iterator:
+                    while self._running:
+                        item = next(iterator, None)
+                        if item is None:
+                            break
+                        _, result = item
+                        await self._on_bar(result.bar, result)
+                        sent += 1
+                        if self._running:
+                            await asyncio.sleep(1/self.info_bars.bars_per_second if self.info_bars.bars_per_second > 0 else 0)
+                    if not self._running:
+                        status = 'stopped'
+                        return
+            await self._flush_bars()
+            self.replay_finished = True
+            pipeline = self.pipelines[self.symbol]
+            rep = self.reader.report
+            logger.info(
+                f"Replay finished: {sent} bars | rejected={rep.rows_rejected} "
+                f"tied_ts={rep.tied_timestamps} gap_bars={rep.bars_spanning_missing_hours} "
+                f"| {pipeline.stats}"
+            )
+            await self.ws_manager.broadcast_stats(self._stats_payload())
+            if DASHBOARD.enabled:
+                await self._stop_event.wait()    # keep serving the dashboard until stopped
+            else:
+                await self.stop()
+            status = 'passed'
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            if self.dataset is not None:
+                self._write_trade_report(replay, status, error)
+
+    def _write_trade_report(self, replay, status: str, error: Optional[BaseException]) -> None:
+        report = dict(replay.report) if status == 'passed' else {}
+        report.update({
+            'status': status, 'dataset_id': self.dataset.dataset_id, 'root_hash': self.dataset.root_hash,
+            'bar_type': self.info_bars.bar_type.value,
+            'effective_root': str(self.dataset.bars_root.resolve()),
+            'effective_version': self.dataset.manifest['stamp'],
+            'bars_processed': self.pipelines[self.symbol].bars_processed,
+            'stream': replay.stream.report if replay is not None else {},
+        })
+        if status == 'stopped':
+            report['identities'] = 'not evaluated (stopped before end)'
+        if error is not None:
+            report['error'] = {'type': type(error).__name__, 'message': str(error)}
+        output = Path(self.trade_config.report_dir).resolve()
+        if output.is_relative_to('/Volumes'):
+            raise ValueError('trade replay reports must be local, outside /Volumes')
+        output.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        path = output/f'main-{self.dataset.dataset_id}-{self.info_bars.bar_type.value}-{stamp}.json'
+        path.write_text(json.dumps(report, indent=2)+'\n')
+        self.trade_report = report
+        logger.info('Trade replay status=%s bars=%s dataset_id=%s bar_type=%s report=%s',
+                    status, report['bars_processed'], report['dataset_id'], report['bar_type'], path)
 
     async def stop(self):
         if self._stopping:      # uvicorn re-raises the signal to our handler: stop() runs once
@@ -208,9 +294,10 @@ class OrderflowSystem:
 
     # ── per-bar I/O ─────────────────────────────────────────
 
-    async def _on_bar(self, bar: InfoBar):
+    async def _on_bar(self, bar: InfoBar, result: Optional[BarResult] = None):
         pipeline = self.pipelines[self.symbol]
-        result: BarResult = pipeline.process_bar(bar)   # sync, no I/O
+        if result is None:
+            result = pipeline.process_bar(bar)   # sync, no I/O
         if self._first_session_date is None:
             from orderflow_system.pipeline import utc_date
             self._first_session_date = utc_date(bar.timestamp_ms)
@@ -311,7 +398,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Write bars, signals and profiles to SQLite")
     p.add_argument("--no-dashboard", action="store_true")
     p.add_argument("--alerts", action="store_true", help="Send Telegram alerts for replayed signals")
-    return p.parse_args(argv)
+    p.add_argument("--trades", action="store_true", help="Replay authenticated trade analytics")
+    p.add_argument("--paired-dataset")
+    p.add_argument("--paired-root", default=TradeFlowConfig().paired_root)
+    args = p.parse_args(argv)
+    if args.trades and (not args.paired_dataset or args.persist or args.alerts):
+        p.error('--trades requires --paired-dataset and refuses --persist / --alerts')
+    if args.trades and not args.no_dashboard:
+        p.error('--trades is a blocking batch replay and requires --no-dashboard')
+    if not args.trades and args.paired_dataset:
+        p.error('--paired-dataset requires --trades')
+    return args
 
 
 def main(argv: Optional[list[str]] = None):
@@ -327,7 +424,9 @@ def main(argv: Optional[list[str]] = None):
     )
     logger.info(f"Info bars: {cfg.bar_type.value} {cfg.symbol} from {cfg.root}")
 
-    system = OrderflowSystem(info_bars=cfg, send_alerts=args.alerts)
+    system = OrderflowSystem(info_bars=cfg, send_alerts=args.alerts,
+        paired_dataset=args.paired_dataset if args.trades else None,
+        trade_config=TradeFlowConfig(paired_root=args.paired_root))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

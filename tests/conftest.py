@@ -61,3 +61,14 @@ def write_dataset(root: Path, rows, bar_type=BarType.DOLLAR_IMBALANCE, symbol="B
 def dataset_root(tmp_path):
     write_dataset(tmp_path, make_rows(100))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def no_repo_trade_report_pollution():
+    import os
+    reports = Path(os.environ.get('ORDERFLOW_TEST_REPORT_DIR',
+                   str(Path(__file__).resolve().parents[1]/'output'/'trade_replay'))).resolve()
+    before = {p.relative_to(reports) for p in reports.rglob('*') if p.is_file()}
+    yield
+    added = {p.relative_to(reports) for p in reports.rglob('*') if p.is_file()}-before
+    assert not added, f'test polluted repo output/trade_replay: {sorted(map(str, added))}'
