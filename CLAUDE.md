@@ -10,6 +10,7 @@ Forked from mahmoud20138/OrderFlow-Analysis-Pro.
 
 * Migrated to information-driven bars: `Parquet → InfoBarReader → InfoBarPipeline → OrderflowSystem`. MT5/Bybit feeds and the fixed-time bar builder are removed.
 * Default source: info-bar replay (`settings.INFO_BARS`, default `fixed_dollar_imbalance`); no MT5 terminal needed.
+* Trade pipeline (PR #12): `--trades` replays the registered paired dataset `20261103T011635Z-d3a7b9603b37` (2019-09-10 → 2023-12-31 UTC, `TradeFlowConfig.paired_root`) into per-bar taker footprint ($1) and UTC-day volume profile ($10); full-history validated at f68cc72 (`scripts/replay_trades.py`, peak RSS gate 4 GiB). Detectors do not use these yet.
 * Not done: live Binance feed; calibration of order-flow thresholds against the dataset (defaults are provisional); live Telegram entry/exit alerts (off during replay).
 
 ## Data
@@ -22,7 +23,7 @@ Forked from mahmoud20138/OrderFlow-Analysis-Pro.
   * 2024–2025: out-of-sample validation only (select the best info bar type and config; no re-tuning).
   * 2026: final untouched test set.
 * External volume: confirm `/Volumes/Market-Data` is mounted before reading. Read-only: never write there.
-* Columns: close-time `Date Time` (UTC), `Tick Number`, OHLC, per-bar volume/buy/sell, ticks, dollar value, `Threshold`. No price-level or trade-level data → never fabricate footprint, horizontal delta, tape or book (see README "What the data does not contain").
+* Columns: close-time `Date Time` (UTC), `Tick Number`, OHLC, per-bar volume/buy/sell, ticks, dollar value, `Threshold`. No price-level or trade-level data → never fabricate footprint, horizontal delta, tape or book (see README "What the data does not contain"). Real footprint/profile come only from the paired trade dataset via the trade pipeline; there is still no order book.
 * Ordering is (close time, `Tick Number`); close times can tie. Bars spanning `missing_tick_hours` get `data_gap`: analytical histories advance, emitted detector signals are discarded, and protective stop/target actions remain active.
 
 ## Working Rules
