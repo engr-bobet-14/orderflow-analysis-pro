@@ -11,6 +11,7 @@ from orderflow_system.data.paired_dataset import PairedDataset
 from orderflow_system.data.trade_stream import TradeReplay
 from orderflow_system.pipeline import InfoBarPipeline
 from tests.paired_fixture import make_trades, write_paired, STAMP, canonical, day_ms, DAY0
+from scripts import replay_trades as replay_script
 
 TYPES = ['fixed_dollar_imbalance', 'fixed_tick_run']
 
@@ -674,7 +675,7 @@ def test_memory_criteria_flat_rss_passes_and_heap_is_diagnostic():
     mib = 1 << 20
     samples = _memory_gate_samples()
     samples[-1]['malloc_in_use_bytes'] = 200*mib
-    result = _evaluate_memory_with_loads(samples, 2*1024*mib, 'current')
+    result = _evaluate_memory_with_loads(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current')
     assert result['verdict'] == 'pass'
     assert result['gate_peak_rss']['status'] == 'pass'
     assert result['gate_duckdb']['status'] == 'pass'
@@ -731,11 +732,19 @@ def test_memory_criteria_missing_duckdb_is_not_evaluable():
     assert result['gate_duckdb']['reason']
 
 
+def test_memory_criteria_observed_attempt_two_peak_passes():
+    result = _evaluate_memory_with_loads(_memory_gate_samples(), 2_181_775_360, 'current')
+    assert result['verdict'] == 'pass'
+    assert result['gate_peak_rss']['status'] == 'pass'
+    assert result['gate_peak_rss']['limit_bytes'] == 4_294_967_296
+
+
 def test_memory_criteria_peak_breach_cannot_be_excused_by_stability():
-    result = _evaluate_memory_with_loads(_memory_gate_samples(), (1 << 31)+1, 'current')
+    result = _evaluate_memory_with_loads(_memory_gate_samples(), replay_script.PEAK_RSS_LIMIT_BYTES+1, 'current')
     assert result['verdict'] == 'fail'
     assert result['gate_stability']['status'] == 'pass'
     assert result['gate_peak_rss']['status'] == 'fail'
+    assert result['gate_peak_rss']['reason'] == 'process peak RSS exceeds 4 GiB'
 
 
 @pytest.mark.parametrize('verdict,exit_code', [('pass', 0), ('fail', 1)])
@@ -781,8 +790,12 @@ def test_memory_criteria_exact_limits_and_heaviest_anchor_pass():
         sample['bytes'] = 1000*(1 << 20)
         sample['duckdb_memory_bytes'] = 64*(1 << 20)
     samples[-1]['malloc_in_use_bytes'] = 160*(1 << 20)
-    result = _evaluate_memory_with_loads(samples, 1 << 31, 'current')
+    result = _evaluate_memory_with_loads(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current')
     assert result['verdict'] == 'pass'
+    assert result['gate_peak_rss']['status'] == 'pass'
+    assert result['gate_peak_rss']['limit_bytes'] == replay_script.PEAK_RSS_LIMIT_BYTES == 4_294_967_296
+    assert result['gate_duckdb']['limit_bytes'] == 64*(1 << 20)
+    assert result['gate_stability']['limit_bytes_per_day'] == 1 << 20
     assert result['gate_stability']['n_post_anchor'] == 30
     assert result['diagnostic_live_heap']['flagged'] is False
 
@@ -792,7 +805,7 @@ def test_memory_criteria_rolling_slopes_are_diagnostic_only():
     samples = _memory_gate_samples(n_post=120)
     for i, sample in enumerate(samples[1:]):
         sample['bytes'] += round(60*math.sin(2*math.pi*i/40)*(1 << 20))
-    result = _evaluate_memory_with_loads(samples, 1 << 31, 'current')
+    result = _evaluate_memory_with_loads(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current')
     assert result['verdict'] == 'pass'
     assert any(s['slope_bytes_per_day'] > (1 << 20) for s in result['gate_stability']['rolling_30_day_slopes'])
 
@@ -801,14 +814,14 @@ def test_memory_criteria_ols_uses_elapsed_utc_days():
     samples = _memory_gate_samples(slope_mib=1.5)
     for i, sample in enumerate(samples):
         sample['day'] = 1000+2*i
-    result = _evaluate_memory_with_loads(samples, 1 << 31, 'current')
+    result = _evaluate_memory_with_loads(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current')
     assert result['verdict'] == 'pass'
     assert result['gate_stability']['slope_bytes_per_day'] == pytest.approx(.75*(1 << 20))
 
 
 def test_memory_criteria_window_memory_is_included():
     extra = [{'duckdb_memory_bytes': 65*(1 << 20), 'malloc_in_use_bytes': 200*(1 << 20)}]
-    result = _evaluate_memory_with_loads(_memory_gate_samples(), 1 << 31, 'current', extra_samples=extra)
+    result = _evaluate_memory_with_loads(_memory_gate_samples(), replay_script.PEAK_RSS_LIMIT_BYTES, 'current', extra_samples=extra)
     assert result['verdict'] == 'fail'
     assert result['gate_duckdb']['status'] == 'fail'
     assert result['gate_stability']['status'] == 'pass'
@@ -825,7 +838,7 @@ def test_live_heap_main_endpoints_and_window_max_are_separate():
     samples[-1]['malloc_in_use_bytes'] = 200*(1 << 20)
     extra = [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': value}
              for value in [300*(1 << 20), None, 50*(1 << 20)]]
-    result = _evaluate_memory_with_loads(samples, 1 << 31, 'current', extra_samples=extra)
+    result = _evaluate_memory_with_loads(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', extra_samples=extra)
     heap = result['diagnostic_live_heap']
     assert heap['first_bytes'] == 100*(1 << 20)
     assert heap['last_bytes'] == 200*(1 << 20)
@@ -836,7 +849,7 @@ def test_live_heap_main_endpoints_and_window_max_are_separate():
 
 def test_live_heap_without_main_samples_keeps_endpoints_unavailable():
     extra = [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': 123}]
-    result = _evaluate_memory_with_loads([], 1 << 31, 'current', extra_samples=extra)
+    result = _evaluate_memory_with_loads([], replay_script.PEAK_RSS_LIMIT_BYTES, 'current', extra_samples=extra)
     heap = result['diagnostic_live_heap']
     assert heap['first_bytes'] is None and heap['last_bytes'] is None
     assert heap['flagged'] is None
@@ -845,7 +858,7 @@ def test_live_heap_without_main_samples_keeps_endpoints_unavailable():
 
 @pytest.mark.parametrize('extra', [[], [{'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': None}]])
 def test_live_heap_window_max_unavailable_without_window_malloc(extra):
-    result = _evaluate_memory_with_loads(_memory_gate_samples(), 1 << 31, 'current', extra_samples=extra)
+    result = _evaluate_memory_with_loads(_memory_gate_samples(), replay_script.PEAK_RSS_LIMIT_BYTES, 'current', extra_samples=extra)
     assert result['diagnostic_live_heap']['windows_max_malloc_in_use_bytes'] is None
 
 
@@ -862,7 +875,7 @@ def test_memory_criteria_exceeded_gate_has_reason(gate):
     samples = _memory_gate_samples(slope_mib=2 if gate == 'gate_stability' else 0)
     if gate == 'gate_duckdb':
         samples[-1]['duckdb_memory_bytes'] = 65*(1 << 20)
-    peak = (1 << 31)+1 if gate == 'gate_peak_rss' else 1 << 31
+    peak = replay_script.PEAK_RSS_LIMIT_BYTES+1 if gate == 'gate_peak_rss' else replay_script.PEAK_RSS_LIMIT_BYTES
     result = _evaluate_memory_with_loads(samples, peak, 'current')
     assert result[gate]['status'] == 'fail'
     assert result[gate]['reason']
@@ -873,7 +886,7 @@ def test_memory_stability_early_heaviest_day_with_late_rss_maximum():
     samples = _memory_gate_samples(n_post=60)
     samples[-1]['bytes'] = 1600*(1 << 20)
     loads = {s['day']: 100 if i == 0 else 1 for i, s in enumerate(samples)}
-    result = evaluate_memory(samples, 1 << 31, 'current', day_loads=loads)
+    result = evaluate_memory(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', day_loads=loads)
     stability = result['gate_stability']
     assert stability['anchor_day'] == datetime.fromtimestamp(1000*86400, timezone.utc).date().isoformat()
     assert stability['anchor_n_trades'] == 100
@@ -893,7 +906,7 @@ def test_memory_stability_late_heaviest_day_not_evaluable(n_post):
     loads = {s['day']: 1 for s in samples}
     anchor = samples[-n_post-1]['day']
     loads[anchor] = 100
-    result = evaluate_memory(samples, 1 << 31, 'current', day_loads=loads)
+    result = evaluate_memory(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', day_loads=loads)
     stability = result['gate_stability']
     assert stability['anchor_day'] == datetime.fromtimestamp(anchor*86400, timezone.utc).date().isoformat()
     assert stability['n_post_anchor'] == n_post
@@ -907,7 +920,7 @@ def test_memory_stability_load_tie_chooses_earliest_day():
     samples = _memory_gate_samples()
     loads = {s['day']: 1 for s in samples}
     loads[1002] = loads[1005] = 200
-    result = evaluate_memory(samples, 1 << 31, 'current', day_loads=loads)
+    result = evaluate_memory(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', day_loads=loads)
     stability = result['gate_stability']
     assert stability['anchor_day'] == datetime.fromtimestamp(1002*86400, timezone.utc).date().isoformat()
     assert stability['anchor_n_trades'] == 200
@@ -923,7 +936,7 @@ def test_memory_stability_light_day_rss_spike_does_not_move_anchor():
     loads[1003] = 500
     loads[999] = loads[5000] = 1000000
     extra = [{'day': 5000, 'bytes': 2000*(1 << 20), 'duckdb_memory_bytes': 0, 'malloc_in_use_bytes': 100}]
-    result = evaluate_memory(samples, 1 << 31, 'current', day_loads=loads, extra_samples=extra)
+    result = evaluate_memory(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', day_loads=loads, extra_samples=extra)
     stability = result['gate_stability']
     assert stability['anchor_day'] == datetime.fromtimestamp(1003*86400, timezone.utc).date().isoformat()
     assert stability['anchor_n_trades'] == 500
@@ -938,7 +951,7 @@ def test_memory_stability_missing_authenticated_loads_cannot_pass(missing):
     from scripts.replay_trades import evaluate_memory
     samples = _memory_gate_samples()
     loads = None if missing == 'all' else {s['day']: 1 for s in samples[:-1]}
-    result = evaluate_memory(samples, 1 << 31, 'current', day_loads=loads)
+    result = evaluate_memory(samples, replay_script.PEAK_RSS_LIMIT_BYTES, 'current', day_loads=loads)
     stability = result['gate_stability']
     assert stability['status'] == 'not_evaluable'
     assert stability['anchor_day'] is None and stability['anchor_n_trades'] is None

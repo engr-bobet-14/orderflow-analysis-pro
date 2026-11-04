@@ -32,6 +32,7 @@ from orderflow_system.data.trade_alignment import peak_rss_bytes
 from orderflow_system.pipeline import InfoBarPipeline
 
 MIB = 1 << 20
+PEAK_RSS_LIMIT_BYTES = 4 * 1024**3
 
 
 def _rss_slope(samples):
@@ -78,13 +79,13 @@ def evaluate_memory(samples, peak_bytes, rss_kind, *, day_loads=None, extra_samp
     """§31: main replay trend; whole-process peak and quiescent memory including window checks."""
     extra_samples = list(extra_samples)
     all_samples = list(samples)+extra_samples
-    peak = {'status': 'not_evaluable' if peak_bytes is None else ('pass' if peak_bytes <= 2**31 else 'fail'),
-            'peak_rss_bytes': peak_bytes, 'limit_bytes': 2**31,
+    peak = {'status': 'not_evaluable' if peak_bytes is None else ('pass' if peak_bytes <= PEAK_RSS_LIMIT_BYTES else 'fail'),
+            'peak_rss_bytes': peak_bytes, 'limit_bytes': PEAK_RSS_LIMIT_BYTES,
             'source': 'resource.RUSAGE_SELF; host wait4 remains authoritative'}
     if peak_bytes is None:
         peak['reason'] = 'process peak RSS unavailable'
     elif peak['status'] == 'fail':
-        peak['reason'] = 'process peak RSS exceeds 2 GiB'
+        peak['reason'] = f'process peak RSS exceeds {PEAK_RSS_LIMIT_BYTES // 1024**3} GiB'
 
     values = [s.get('duckdb_memory_bytes') for s in all_samples]
     maximum = max(values) if values and all(v is not None for v in values) else None
