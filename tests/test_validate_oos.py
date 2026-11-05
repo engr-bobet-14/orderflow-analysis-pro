@@ -640,3 +640,44 @@ def test_an_identical_campaign_cannot_be_executed_twice_concurrently(tmp_path):
     release.set()
     first.join()
     assert evaluated == ["a"]
+
+
+# Phase 3: legacy absent/disabled identity remains bar-only; enabled identity fails closed.
+@pytest.mark.parametrize("stored", ["absent", "disabled"])
+def test_frozen_strategy_accepts_legacy_or_disabled_trade_identity(stored):
+    identity = dict(IDENTITY)
+    if stored != "absent":
+        identity["trade_signals"] = stored
+    assert vo.frozen_strategy_problems(identity, opt.library_versions(), "BTCUSDT") == []
+
+
+@pytest.mark.parametrize("stored", [{"signals": {"absorption_levels": True}, "footprint_bucket": 1., "profile_bucket": 10.},
+                                    {}, None, True, False, "off", 0, []])
+def test_frozen_strategy_rejects_other_trade_identity(stored):
+    problems = vo.frozen_strategy_problems({**IDENTITY, "trade_signals": stored}, opt.library_versions(), "BTCUSDT")
+    assert "study used trade signals; OOS validation is bar-only" in problems
+
+
+def test_frozen_strategy_rejects_enabled_current_pipeline(monkeypatch):
+    from orderflow_system import pipeline
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    cfg = TradeFlowConfig(signals=TradeSignalConfig(framing_profile_source="trades"))
+    monkeypatch.setattr(pipeline, "TradeFlowConfig", lambda: cfg)
+    problems = vo.frozen_strategy_problems(IDENTITY, opt.library_versions(), "BTCUSDT")
+    assert any("current evaluation pipeline" in p and "bar-only" in p for p in problems)
+
+
+def test_evaluation_refuses_enabled_pipeline_before_validation_data(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from orderflow_system import pipeline
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    cfg = TradeFlowConfig(signals=TradeSignalConfig(exhaustion_contrarian="bonus"))
+    monkeypatch.setattr(pipeline, "TradeFlowConfig", lambda: cfg)
+    evaluate = Mock(side_effect=AssertionError("validation data accessed"))
+    monkeypatch.setattr(fe, "evaluate_frozen", evaluate)
+    prep = {"meta": {"symbol": "BTCUSDT", "bar_type": "fixed_tick_imbalance"}, "params": {}, "settings": {},
+            "start": date(2024, 1, 1), "end": date(2024, 1, 31)}
+    with pytest.raises(ValueError, match="bar-only"):
+        vo.evaluate_candidate(prep, study_db=tmp_path/"must-not-open.db", data_root=tmp_path)
+    evaluate.assert_not_called()
+    assert not list(tmp_path.iterdir())

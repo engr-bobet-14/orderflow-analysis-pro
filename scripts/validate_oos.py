@@ -44,6 +44,10 @@ def subset_diffs(stored, current, path=""):
 def frozen_strategy_problems(identity, stored_versions, symbol):
     """Reasons the stored study no longer describes the code that would run (empty when compatible)."""
     problems = []
+    if identity.get("trade_signals", "disabled") != "disabled":
+        problems.append("study used trade signals; OOS validation is bar-only")
+    if opt.InfoBarPipeline(opt.instrument_config(symbol)).trade_config.signals.any_enabled:
+        problems.append("current evaluation pipeline has trade signals enabled; OOS validation is bar-only")
     stored = identity.get("instrument_defaults")
     if stored is None:
         problems.append("stored identity lacks instrument_defaults")
@@ -87,6 +91,8 @@ def preflight_candidate(study_db, study_name, trial, *, cache_dir, start=None, e
 def evaluate_candidate(prep, *, study_db, data_root, trades_root=None):
     """The only step that reads validation data. Call it after the campaign manifest is frozen."""
     meta = prep["meta"]
+    if opt.InfoBarPipeline(opt.instrument_config(meta["symbol"])).trade_config.signals.any_enabled:
+        raise ValueError("current evaluation pipeline has trade signals enabled; OOS validation is bar-only")
     result = fe.evaluate_frozen(prep["params"], symbol=meta["symbol"], bar_type=meta["bar_type"],
                                 start=prep["start"], end=prep["end"], settings=prep["settings"],
                                 data_root=data_root, cache_dir=prep.get("cache_dir"), trades_root=trades_root,
