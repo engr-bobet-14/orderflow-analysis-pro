@@ -369,7 +369,9 @@ class TradeView:
         return replace(profile, vah=round(int(ticks[hi])/100, 10), val=round(int(ticks[lo])/100, 10))
 
     def update(self, bar: InfoBar, trade: TradeBarUpdate):
-        footprint = self.footprint_engine.build_from_levels(bar, trade.footprint_levels)
+        factory=getattr(trade.footprint_levels,'to_footprint',None)
+        footprint = (factory(bar,self.footprint_engine) if factory is not None else
+                     self.footprint_engine.build_from_levels(bar, trade.footprint_levels))
         profiles = []
         for day, ticks, lots in trade.finalised_days:
             profile = self.compute_profile(day, ticks, lots)

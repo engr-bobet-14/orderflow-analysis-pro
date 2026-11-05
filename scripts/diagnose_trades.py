@@ -119,12 +119,14 @@ def add_gross(trades):
     return out
 
 
-def replay_trades(bars, params, args):
+def replay_trades(bars, params, args, trade_updates=None, trade_config=None):
     """Closed trades from replaying the search segment only (never the pseudo-holdout)."""
     n_search, _ = opt.split_timeline(bars, args)
     search = bars[:n_search]
     result = opt.run_backtest(search, opt.build_instrument_config(params, args.symbol),
-                              params["price_proximity_pct"], search[0].bar_type)
+                              params["price_proximity_pct"], search[0].bar_type,
+                              **({"trade_updates": trade_updates, "trade_config": trade_config}
+                                 if trade_updates is not None else {}))
     trades = add_gross(opt.simulate_trades_risk_based(
         result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps))
     trades.attrs["replay_digest"] = result["replay_digest"]
@@ -244,14 +246,16 @@ def find_cached_bars(cache_dir, data_fp):
                      "run the optimizer once to build the cache")
 
 
-def replay_and_verify(path, meta, params, settings, expected):
+def replay_and_verify(path, meta, params, settings, expected, trade_updates=None, trade_config=None):
     """Replay the cached development window with the study's own settings and require its stored digest."""
     if expected is None:
         verify_replay(None, None)
     bars = opt.CachedBars(path, meta["bar_type"])
     replay_args = argparse.Namespace(symbol=meta["symbol"], **settings)
     n_search, folds = opt.split_timeline(bars, replay_args)
-    trades = replay_trades(bars, params, replay_args)
+    trades = replay_trades(bars, params, replay_args,
+                           **({'trade_updates':trade_updates,'trade_config':trade_config}
+                              if trade_updates is not None else {}))
     verify_replay(trades.attrs["replay_digest"], expected)
     return bars, trades, n_search, folds
 
@@ -262,6 +266,7 @@ def build_parser():
     parser.add_argument("--study-db", type=Path, default=out / "optimize/studies.db")
     parser.add_argument("--study-name", required=True)
     parser.add_argument("--trial", type=int)
+    parser.add_argument('--trade-cache', type=Path)
     parser.add_argument("--cache-dir", type=Path, default=out / "optimize/cache")
     parser.add_argument("--output-dir", type=Path, default=out / "diagnose")
     parser.add_argument("--floors", action="store_true")
@@ -272,6 +277,11 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     identity = load_identity(args.study_db, args.study_name)
+    phase4 = identity.get('phase') == 'phase4' or args.trade_cache is not None
+    if phase4:
+        from scripts.phase4_policy import checked_write
+        args.output_dir = checked_write(args.output_dir)
+        checked_write(args.output_dir / f'{args.study_name}__trial{args.trial}.json')
     settings = bind_replay_settings(identity)
     path, meta = find_cached_bars(args.cache_dir, identity["data_fp"])
     start, end = date.fromisoformat(meta["start"]), date.fromisoformat(meta["end"])
@@ -281,7 +291,19 @@ def main(argv=None):
     filled = sorted(set(baseline) - set(params))       # older studies lack the later dimensions
     params = {**baseline, **params}
     expected = stored_digest(args.study_db, args.study_name, number)
-    bars, trades, n_search, folds = replay_and_verify(path, meta, params, settings, expected)
+    kwargs = {}
+    if phase4 and identity['trade_signals'] != 'disabled':
+        from orderflow_system.config.settings import TradeSignalConfig
+        from scripts.phase4_studies import attach_cache, effective_trade_config
+        args.bar_type = meta['bar_type']
+        args.trade_signal_config = TradeSignalConfig(**identity['trade_signals']['signals'])
+        if args.trade_cache is None:
+            raise ValueError('trade diagnostics require --trade-cache')
+        attach_cache(args, opt.CachedBars(path, meta['bar_type']))
+        if args.trade_cache_identity != identity['trade_cache']:
+            raise ValueError('diagnostic trade cache identity mismatch')
+        kwargs = {'trade_updates':args.trade_updates,'trade_config':effective_trade_config(args,params)}
+    bars, trades, n_search, folds = replay_and_verify(path, meta, params, settings, expected, **kwargs)
     scored = scored_only(trades, bars, folds)
     report = {"study": args.study_name, "trial": number, "params": params,
               "replay_digest": trades.attrs["replay_digest"], "stored_digest": expected, "digest_matches": True,
@@ -295,7 +317,10 @@ def main(argv=None):
         report["floors"] = {str(m): floors(report["decomposition"], settings["n_splits"], m)
                             for m in (0.5, 1.0, 2.0)}
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    opt.atomic_json(args.output_dir / f"{args.study_name}__trial{number}.json", report)
+    target = args.output_dir / f"{args.study_name}__trial{number}.json"
+    if phase4:
+        target = checked_write(target)
+    opt.atomic_json(target, report)
     return report
 
 

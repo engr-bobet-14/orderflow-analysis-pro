@@ -274,3 +274,214 @@ Default split (`CLAUDE.md`): 2019-2023 development, hyperparameter optimization 
    - **Bar construction** must match the development study (dataset source, calibration hyperparameters, creation time, git SHA, data-processing fingerprint); otherwise the run is refused before reading bars, and the evaluated dataset provenance is stored in each result. Time-bar studies need `--trades-root` (default: the optimizer's, honouring `ORDERFLOW_TRADES_ROOT`).
    - **Confirmation:** a candidate is confirmed only if its account never went bankrupt (missing solvency evidence also fails), its net expectancy is positive and its lower bound is above zero (Bonferroni over the candidates, standard error inflated for positive serial correlation). If none is confirmed the run stops. The independence assumption on trades is unverified. Deflated Sharpe is attached as a diagnostic.
 6. **Final test** on 2026 only once, when explicitly decided. No script here reads 2026.
+
+## Phase 4: opt-in trade signal research
+
+Phase 4 uses the existing 2019-09-10 through 2023-12-31 information bars and an
+exact, memory-mapped trade feature cache. Defaults remain bar-only. Minute bars,
+post-2023 dates, warm starts, multiple workers within a study, and legacy holdout
+selection are refused in Phase 4. Trade flags, a trade cache, frozen parameters,
+a campaign manifest, a holdout request, or destinations under
+`output/optimize/phase4/` imply Phase 4 controls.
+
+All writable paths must resolve inside this checkout's
+`output/optimize/phase4/`, `output/optimize/trade_cache/`, `output/phase4/`, or
+`output/duckdb_tmp/`. Symlinks cannot grant writes into protected paths or an
+external checkout. Existing study databases are read-only sources.
+
+The build approval permits bounded verification only. For example (end exclusive):
+
+```bash
+python scripts/trade_feature_cache.py build --start 2021-05-19 --end 2021-05-20
+python scripts/trade_feature_cache.py verify --against tests/fixtures/phase4_reference_digests.json
+python -m pytest -q -p no:cacheprovider -m real_data tests/test_phase4_real.py
+python scripts/phase4_benchmark.py --days 2019-09-11,2021-05-19,2023-10-16 --out output/phase4/benchmark
+```
+
+Run from this checkout with the project virtual environment. Bounded builds pin
+`source_state` before and after replay and produce `bounded_verification` caches;
+the optimizer accepts only clean-tree, full-history `production` caches. Bounded
+builds default to `output/phase4/bounded_cache/` and refuse the production
+`output/optimize/trade_cache/` root. Production builds refuse the bounded root.
+Cache discovery counts only production manifests for the registered dataset.
+`verify --against ...` selects certified references by start/end window and
+refuses an unknown window; `--start` and `--end` can select a window to verify. Builds
+longer than four days require explicit `--full-history --owner-approved TOKEN`,
+with no explicit dates. The selector must identify a verified host approval
+record; arbitrary strings are refused. That command and all experiments require
+later owner approval. The development policy excludes post-2023 manifest entries before raw
+file hashing or DuckDB queries, including the terminal full-stream hash sweep.
+Legacy unbounded replay behavior is unchanged.
+
+The benchmark requires the protected baseline at
+`output/phase4/build/protected-before.sha256` and full-development bar-cache JSON
+manifests at `output/phase4/inputs/bar-cache-manifests/` (or
+`--bar-cache-manifests DIR`). It authenticates their bar counts against the paired
+dataset, uses measured child-process RSS and mapped-page residency, and records
+formulas, inputs, uncertainty, and resource gates in `benchmark.json` and
+`REPORT.md`. It creates no Optuna study or trial.
+
+For later campaigns, `phase4_campaign.py register` seals the campaign JSON and
+writes a draft host driver in `output/phase4/run_scripts/`. `driver` prints a dry
+run unless `--execute` is specified. Execution requires owner approval, an
+independently inspected driver hash, the preflight, and gates U/FH1–FH4/R. Keep
+one worker per study and at most six concurrent study processes. B0 uses 200
+cold trials per bar type; A2/E2 use 100 feature-only trials on verified frozen B0
+parameters; P2 writes one content-addressed candidate and creates no study.
+
+`--freeze-params FILE` expects `study_db`, `study`, `trial`, `budget`, `params`,
+and `replay_digest`. Generate it with `phase4_campaign.py freeze` after B0
+finishes. The source must be its study's best feasible trial at the exact budget;
+the optimizer verifies its stored search replay digest before using its values.
+
+`phase4_report.py` reads stored studies and immutable database snapshots using
+SQLite `mode=ro`. It reports CSCV, campaign multiplicity and deflated Sharpe,
+joint UTC-day gross-R bootstrap, gross/net decomposition, the cost grid, funding
+exposure, frequency multiples, boundaries and parameter neighbourhoods. Pass
+`--study-name NAME --baseline-study B0_NAME`, or `--candidate SHA256` for P2,
+plus `--study-db`, `--campaign-manifest`, and the appropriate `--trade-cache`.
+P2 reports PBO and top-three as `not_applicable` and shows B0's selection risk.
+
+The separate `--holdout-look STUDY:TRIAL` or
+`--holdout-look candidate:SHA256` command requires a G2 report. Before replay it
+persists a locked reservation. Repeating the identical request returns the stored
+result; an interrupted request may finish that candidate; a different candidate
+for an exposed arm is refused. The pseudo-holdout remains conditional on
+full-history bar calibration. 2024–2025 dataset construction and OOS evaluation
+remain outside Phase 4. `phase4_d6_probe.py` is an owner-gated read-only evidence
+probe; it never changes fingerprint compatibility.
+
+The frequency gate uses the largest per-signal-type multiple, so other detectors
+cannot dilute an absorption increase. Reports include both per-type and total
+multiples. A new signal type with no baseline count fails the frequency gate.
+
+Campaign registration records three legacy database paths and SHA256 values
+(`register --snapshots FILE`, a JSON list of `{path, sha256}` entries), plus the
+Phase 4 database path without a prospective hash. Reporting first refuses any
+missing, duplicate, RUNNING/WAITING, or off-budget campaign study. It then uses
+SQLite's backup API with a `mode=ro` source to create a content-addressed Phase 4
+snapshot under `output/phase4/reports/snapshots/`. The report records that hash
+alongside the three legacy hashes and reads the resulting immutable union.
+Frozen B0 sources must belong to the attached campaign, use that campaign's B0
+budget, and resolve within this checkout's `output/optimize/phase4/`. A second
+study for the same arm/campaign is refused; implied activation is a study attr,
+not part of its hashed identity.
+
+Host approvals are read only from `~/.orderflow-approvals/phase4/`, resolving home
+through `pwd.getpwuid(os.getuid()).pw_dir`; `$HOME` is ignored. Approval directories,
+records and gates must belong to the current uid and must not be group/world-writable.
+Only the host
+may write these records, after explicit owner approval in chat. This build never
+creates real approvals. `--owner-approved SHA256` selects `SHA256.json`; the
+file must contain canonical sorted compact JSON bytes plus a newline, and its
+name must match the SHA256 of those bytes. Required fields are:
+
+```json
+{
+  "scope": "full_history_tfc or campaign",
+  "plan_sha256": "frozen plan SHA256",
+  "campaign_sha256": "campaign scope only",
+  "command_argv": ["/absolute/python", "scripts/command.py", "arguments"],
+  "base_commit": "current HEAD",
+  "source_state": {"base": "HEAD commit", "sha256": "source hash", "dirty": false},
+  "created_utc": "2026-11-05T00:00:00Z"
+}
+```
+
+The full-history scope omits `campaign_sha256`. The command is compared with
+Python's original argv; only `--owner-approved SHA256` (or its `=` spelling) is
+removed, avoiding a self-referential record hash. Plan, campaign, base and source
+hashes must match the running checkout. A campaign additionally needs the
+host-owned `gates-<campaign_sha256>.json` in the same directory, containing
+`plan_sha256`, `campaign_sha256`, `base_commit`, `source_state`, `created_utc`,
+and flat `U`, `FH1`, `FH2`, `FH3`, `FH4`, `R` fields equal to `pass`.
+`output/phase4/gates.json` cannot authorize execution. The driver requires a
+matching host record for each child command; it never mints child approvals.
+Verified approval/gate hashes are recorded in manifests, study attrs and logs.
+Each actual admission writes an audit line to `<sha256>.consumed` in that directory.
+A full-history build consumes its record exclusively before replay; the same record
+cannot authorize a second build, including after an interrupted attempt. Campaign
+admissions append one line per use. Tests patch the OS home resolver and never
+create real approval records. Any process running as this user can write records:
+these are consent/audit artefacts, not a security boundary against the same user.
+D6 execution also requires a host campaign-scoped command record and
+`--campaign-manifest`; it remains code-only in this build.
+
+Production caches are discoverable only after `COMPLETE.json` is written last,
+binding every lane manifest hash. A partial multi-type publish cannot attach or
+verify. Campaign registration stages both files, replaces the seal first and the
+manifest last, and refuses a half-sealed campaign after an interrupted publish.
+
+Daily-return payloads record `blown`. On bankruptcy the actual daily loss is
+clipped at -1.0, with zero returns afterwards; these finite bad candidates remain
+in CSCV. Calendar mismatches are checked independently from non-finite data.
+
+The benchmark separately times cache-open hashing and digest verification.
+Hash time scales by cache bytes and digest time by full-history bars. Each trade
+study includes one open per process, amortized over its trial budget; P2 includes
+one open for its single evaluation. Stage A opens once per bar type for all six
+modes and checks protected hashes before/after that group. Campaign totals and
+speed gates include these open costs; B0 has no trade-cache open.
+
+The benchmark fits build wall as fixed plus per-processed-trade cost by ordinary
+least squares, shows residuals and the Phase 3 8063–8804 s replay anchor, and
+retains the conservative whole-run upper bound. Disk is fitted from separately
+measured fixed metadata, per-bar arrays and finalised-day arrays, since the three
+one-day windows cannot identify a joint fixed/day coefficient. Fitted and
+conservative resource gates are reported separately without changing thresholds.
+
+Production cache build and verification admission uses this order: validate the
+command-bound approval without consuming it, run the production preflight, then
+consume approval and begin work. Preflight checks the mount, registered paired
+root, destination filesystem free space, conflicts, owner protected baseline,
+source pin and total-memory admission. Required free space is
+`max(100 GiB, 2 * estimated cache bytes)`; production uses the 40 GiB hard artifact
+ceiling as its conservative estimate. Process enumeration errors refuse production;
+bounded verification may report `unavailable`. Preflight values are saved in the
+build report and `cache-build.json`. Protected and source states are checked again
+before publishing the completion marker. A failed preflight leaves approval and
+the destination untouched; an interruption after admission consumes that approval.
+
+Production `verify` and cache attachment read only the six lanes listed in
+`COMPLETE.json`, verify every listed manifest hash, and report unlisted orphan
+directories without opening them. A retry after an interrupted publish needs a
+new command-bound approval and may use the incomplete destination. A destination
+with an existing completion marker is refused; the owner must explicitly move or
+delete it. Successful retries retain orphan names for auditing.
+
+Phase 4 study resume holds both exclusive study and worker locks while failing
+orphan RUNNING/WAITING rows and running the sequential trial loop. Each orphan gets
+`phase4_reconciled` (original state, UTC time, reason and known worker pid/host);
+`phase4_reconciliation_audit` appends study-level records and repairs interrupted
+audit appends. COMPLETE records are never changed. FAIL trials do not consume the
+approved COMPLETE budget. Results, reports and holdout admission records include
+FAIL/reconciled counts; admission still requires the exact COMPLETE budget and no
+RUNNING/WAITING rows. Legacy studies retain their original resume behavior.
+
+On macOS Phase 4 measures RSS/`ru_maxrss` and private `phys_footprint`, including
+the kernel lifetime peak from `proc_pid_rusage(RUSAGE_INFO_V4)`. Child monitoring
+also retains `wait4` peak RSS. Non-macOS uses sampled psutil USS. If private
+measurement is unavailable, RSS is reported without any mapping allowance and
+Phase 4 memory admission fails closed; it does not substitute RSS for private
+memory. Private memory must stay <= 4 GiB. TFC build and bar-only B0 retain the
+strict <= 4 GiB RSS limit. A process mapping a TFC additionally permits
+`RSS <= 4 GiB + measured mapped TFC bytes`: arrays/bars are read-only file-backed
+clean pages, shared across processes and reclaimable by the OS. This explicit
+owner-approved accounting avoids charging shared cache pages as private memory.
+Files are deduplicated and rounded to OS pages; B0 receives no TFC allowance.
+
+Before each campaign/verify child starts work, planned private budgets plus
+unique mapped files must be <= 24 GiB, and available memory must be >= 8 GiB.
+macOS availability is exactly vm_stat free + inactive + speculative pages.
+The existing driver launches one study process at a time; Stage A and verification
+hold one lane at a time. Dry-run reports its serial plan and whether production
+caches are available. Benchmark also reports the hypothetical six-study plan;
+that plan is refused if six private budgets plus cache mappings exceed 24 GiB.
+This does not change trial budgets or permit extra concurrency.
+
+Benchmark records per-child private/RSS/mapped bytes, memory admission and both
+resource bounds. It retains the per-observed-sample <= 3x speed gate and all
+previous speed accounting. Release-readiness evidence is provisioned read-only
+under `output/phase4/inputs/release-readiness/`; historical bar-only trial durations,
+the 8,063 s full replay anchor and the per-level A2 model are diagnostic additions.
+The supplied detector prescreen experiment is never executed or used in that model.

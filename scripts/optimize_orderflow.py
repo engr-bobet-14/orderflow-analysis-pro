@@ -37,8 +37,9 @@ from orderflow_system.config.settings import INFO_BARS, get_all_configs
 from orderflow_system.data.infobar_feed import open_bars
 from orderflow_system.data.models import BarType, InfoBar
 from orderflow_system.ledger import TradeLedger
-from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest
+from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest, RawSignalDigest
 from scripts.dataset_policy import DEV_END, DEV_START
+from scripts.phase4_studies import TRADE_SEARCH_SPACE_BOUNDS, effective_trade_config
 
 
 def json_safe(value):
@@ -375,18 +376,27 @@ def suggest_params(trial, space=None):
     return params
 
 
-def run_backtest(bars, instrument_config, price_proximity_pct, bar_type=None, prefix_ends=()):
-    replay = bar_only_pipeline(instrument_config, bar_type)
+def run_backtest(bars, instrument_config, price_proximity_pct, bar_type=None, prefix_ends=(),
+                 trade_updates=None, trade_config=None):
+    replay = (bar_only_pipeline(instrument_config, bar_type) if trade_updates is None else
+              InfoBarPipeline(instrument_config, bar_type, trade_config=trade_config))
+    if trade_updates is not None and len(trade_updates) < len(bars):
+        raise ValueError('trade cache has fewer updates than bars')
+    raw = RawSignalDigest() if trade_updates is not None else None
     replay.aggregator.price_proximity_pct = price_proximity_pct
     ledger, digest = TradeLedger(), ReplayDigest()
     prefix_digests = {}
     for idx, bar in enumerate(bars):
-        result = replay.process_bar(bar)
+        result = replay.process_bar(bar) if trade_updates is None else replay.process_bar(bar, trade_updates[idx])
+        if raw is not None:
+            raw.update(result)
         ledger.process_result(result)
         digest.update(result)
         if idx in prefix_ends:
             prefix_digests[idx] = digest.hexdigest()
-    return {"ledger": ledger, "replay_digest": digest.hexdigest(), "prefix_digests": prefix_digests}
+    return {"ledger": ledger, "replay_digest": digest.hexdigest(), "prefix_digests": prefix_digests,
+            "signal_counts": dict(replay.signal_counts),
+            **({"raw_signal_digest": raw.hexdigest()} if raw is not None else {})}
 
 
 def closed_execution_rows(shared_ledger):
@@ -569,11 +579,13 @@ def score_window(full, bars, start, end, min_trades):
             "n_scored_bars": end - start + 1}, trades
 
 
-def evaluate_fold(fold, bars, params, args, full=None):
+def evaluate_fold(fold, bars, params, args, full=None, trade_updates=None, trade_config=None):
     start, end = fold["score_start_idx"], int(fold["test_idx"].max())
     if full is None:
         result = run_backtest(bars[:end + 1], build_instrument_config(params, args.symbol),
-                              params["price_proximity_pct"], bars[0].bar_type)
+                              params["price_proximity_pct"], bars[0].bar_type,
+                              **({"trade_updates": trade_updates, "trade_config": trade_config}
+                                 if trade_updates is not None else {}))
         full = simulate_trades_risk_based(result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     metrics, _ = score_window(full, bars, start, end, args.min_trades_per_fold)
     return {**metrics, "n_context_bars": len(fold["context_idx"]), "n_test_bars": len(fold["test_idx"])}
@@ -581,8 +593,13 @@ def evaluate_fold(fold, bars, params, args, full=None):
 
 def objective(trial, bars, folds, args):
     params = suggest_params(trial, args.space)
+    replay_kwargs = {}
+    if getattr(args, 'phase4', False):
+        from scripts.phase4_studies import merged_params, trial_replay_kwargs
+        params = merged_params(args, params)
+        replay_kwargs = trial_replay_kwargs(args, params)
     result = run_backtest(bars, build_instrument_config(params, args.symbol),
-                          params["price_proximity_pct"], bars[0].bar_type)
+                          params["price_proximity_pct"], bars[0].bar_type, **replay_kwargs)
     full = simulate_trades_risk_based(result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     results = [evaluate_fold(fold, bars, params, args, full) for fold in folds]
     value, feasible = trial_score(results, args.n_splits, args.min_trades_per_fold, args.min_total_trades)
@@ -596,6 +613,15 @@ def objective(trial, bars, folds, args):
              "n_scored_bars": sum(r["n_scored_bars"] for r in results), "n_bars_search": len(bars),
              "n_penalized_folds": sum(r["penalized"] for r in results),
              "raw_daily_sharpe": float(np.mean(raw)) if raw else None, "replay_digest": result["replay_digest"]}
+    if getattr(args, 'phase4', False):
+        import base64
+        from scripts.phase4_report import search_returns
+        returns = search_returns(full, bars, folds)
+        attrs.update(daily_returns_search={'dtype': '<f4', 'start': str(returns.index[0].date()),
+                     'blown': bool(returns.attrs['blown']),
+                     'n': len(returns), 'base64': base64.b64encode(returns.to_numpy(dtype='<f4').tobytes()).decode()},
+                     signal_counts=result['signal_counts'], raw_signal_digest=result.get('raw_signal_digest'),
+                     trade_signal_config=asdict(effective_trade_config(args, params).signals))
     for key, value in json_safe(attrs).items():
         trial.set_user_attr(key, value)
     return attrs["cv_sharpe_mean"]
@@ -658,6 +684,17 @@ def study_identity(args, metadata, warm_start=False):
                 "n_splits": args.n_splits, "embargo": args.embargo,
                 "holdout_fraction": args.holdout_fraction, "min_trades_per_fold": args.min_trades_per_fold,
                 "seed": args.seed}
+    if getattr(args, 'phase4', False):
+        from scripts.phase4_studies import arm_key
+        identity.update(phase='phase4',arm=arm_key(args),
+                        trade_signals=trade_signal_identity(effective_trade_config(args, {})),
+                        trade_cache=getattr(args, 'trade_cache_identity', None),
+                        frozen_params=getattr(args, 'frozen_identity', None),
+                        pruner='NopPruner', sampler={'name':'TPESampler', 'seed':args.seed},
+                        campaign_sha256=getattr(args, 'campaign_identity', None),
+                        phase4_source_fp=hashlib.sha256(b''.join((ROOT/name).read_bytes() for name in
+                            ('scripts/optimize_orderflow.py', 'scripts/phase4_studies.py',
+                             'scripts/phase4_policy.py', 'scripts/phase4_report.py'))).hexdigest())
     if warm_start:   # the seeds are not hashed: they are persisted in the stored identity (resolve_study)
         identity["warm_start"] = {"max": args.warm_start_max}
     space_fp = fingerprint(identity)
@@ -671,6 +708,8 @@ def study_lock_path(db, name):
 
 
 def open_study(args, name, identity, worker_index=0):
+    from scripts.phase4_studies import legacy_study_guard
+    legacy_study_guard(args, name)
     bar_only_pipeline(instrument_config(args.symbol), None if args.bar_type == "time_1m" else BarType(args.bar_type))
     import optuna
     args.study_db.parent.mkdir(parents=True, exist_ok=True)
@@ -678,6 +717,9 @@ def open_study(args, name, identity, worker_index=0):
     with file_lock(str(args.study_db) + ".init.lock"):
         storage = optuna.storages.RDBStorage(f"sqlite:///{args.study_db.resolve()}",
                                            engine_kwargs={"connect_args": {"timeout": 60}})
+        if getattr(args,'phase4',False):
+            from scripts.phase4_studies import campaign_arm
+            campaign_arm(args,name,under_init_lock=True)
         study = optuna.create_study(storage=storage, study_name=name, direction="maximize",
                                    sampler=optuna.samplers.TPESampler(seed=args.seed),
                                    pruner=optuna.pruners.NopPruner(), load_if_exists=True)
@@ -691,6 +733,10 @@ def open_study(args, name, identity, worker_index=0):
         if "identity" not in stored:
             study.set_user_attr("identity", identity)
             study.set_user_attr("versions", versions)
+        if getattr(args,'phase4',False):
+            study.set_user_attr('phase4_implied',getattr(args,'phase4_implied',False))
+            study.set_user_attr('owner_approval_sha256',args.approval_sha256)
+            study.set_user_attr('gates_sha256',args.gates_sha256)
         # Warm-start reconcile: the identity (intent, with the seeds) is persisted above and the marker is set
         # last, so a crash at any point is repaired here. A seed trial in any state counts as present.
         seeds = identity.get("warm_start", {}).get("seeds")
@@ -711,6 +757,28 @@ def complete_trials(study):
     return study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
 
 
+def reconcile_phase4_trials(study,args):
+    """Caller holds exclusive study AND worker locks; no live worker can own pending rows."""
+    if not getattr(args,'phase4',False):return
+    from optuna.trial import TrialState
+    audit=list(study.user_attrs.get('phase4_reconciliation_audit',[]))
+    known={entry['trial'] for entry in audit}
+    for trial in study.get_trials():
+        record=trial.user_attrs.get('phase4_reconciled')
+        if trial.state in (TrialState.RUNNING,TrialState.WAITING):
+            owner=trial.user_attrs.get('phase4_worker',{})
+            record=record or {'trial':trial.number,'from_state':trial.state.name,
+                'reconciled_utc':datetime.now(timezone.utc).isoformat(),'reason':'orphan after interruption',
+                **{k:owner[k] for k in ('pid','host') if k in owner}}
+            study._storage.set_trial_user_attr(trial._trial_id,'phase4_reconciled',record)
+            study._storage.set_trial_state_values(trial._trial_id,TrialState.FAIL)
+        # Repair an interruption between marking FAIL and appending its audit entry.
+        if record and trial.number not in known:
+            audit.append(record);known.add(trial.number)
+    if audit!=study.user_attrs.get('phase4_reconciliation_audit',[]):
+        study.set_user_attr('phase4_reconciliation_audit',audit)
+
+
 def optimize_loop(study, bars, folds, args, parent_pid=None):
     import optuna
     while parent_pid is None or os.getppid() == parent_pid:
@@ -719,7 +787,18 @@ def optimize_loop(study, bars, folds, args, parent_pid=None):
         # Per-trial seeding makes sequential resumes reproduce uninterrupted proposals.
         study.sampler = optuna.samplers.TPESampler(seed=(args.seed + getattr(args, "worker_index", 0) * 1_000_003 + len(study.trials)) % 2**32,
                                                   constant_liar=args.n_jobs > 1)
-        study.optimize(lambda trial: objective(trial, bars, folds, args), n_trials=1)
+        if getattr(args,'phase4',False):
+            def run_trial(trial):
+                import socket
+                trial.set_user_attr('phase4_worker',{'pid':os.getpid(),'host':socket.gethostname()})
+                return objective(trial,bars,folds,args)
+            study.optimize(run_trial, n_trials=1)
+        else:
+            study.optimize(lambda trial: objective(trial, bars, folds, args), n_trials=1)
+        if getattr(args,'phase4',False):
+            from scripts.phase4_resources import enforce_current,mapped_cache_files
+            updates=getattr(args,'trade_updates',None)
+            enforce_current(sum(mapped_cache_files(updates.path).values()) if updates is not None else 0)
 
 
 def worker_main(args, name, identity, cache_path, n_search, parent_pid, index):
@@ -1034,7 +1113,9 @@ def deflated_gate(study, returns, *, ineligible_reason=None, campaign=None):
                      if entries else {**base, "passes": None, "status": "indeterminate"})
 
 
-def evaluate_holdout(study, bars, n_search, args):
+def evaluate_holdout(study, bars, n_search, args, trade_updates=None, trade_config=None):
+    if getattr(args, 'phase4', False):
+        raise ValueError('Phase 4 requires --holdout-look')
     prior_evaluations = sum(key.startswith("holdout::") for key in study.user_attrs)
     if prior_evaluations > 0:
         print("Warning: repeated looks erode holdout independence "
@@ -1050,7 +1131,9 @@ def evaluate_holdout(study, bars, n_search, args):
         return {**base, "status": "not_evaluated", "reason": "no feasible trial to evaluate"}
     best = max(candidates, key=lambda t: t.value)
     replay = run_backtest(bars, build_instrument_config(best.params, args.symbol),
-                           best.params["price_proximity_pct"], bars[0].bar_type)
+                           best.params["price_proximity_pct"], bars[0].bar_type,
+                           **({"trade_updates": trade_updates, "trade_config": trade_config}
+                              if trade_updates is not None else {}))
     full = simulate_trades_risk_based(replay["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     start = n_search + int(len(bars) * args.embargo)
     metrics, trades = score_window(full, bars, start, len(bars) - 1, args.min_trades_per_fold)
@@ -1089,8 +1172,18 @@ def study_result(study, args, metadata, identity):
     best_infeasible = max(trials, key=lambda t: t.value).number if best_degenerate else None
     if best_degenerate:
         print(f"Warning: {study.study_name}: no feasible trial; best_* fields are empty")
-    return json_safe({"study_name": study.study_name, "symbol": args.symbol, "bar_type": args.bar_type,
-        "best_params": best.params if best else None, "best_objective": best.value if best else None,
+    recovery={}
+    if getattr(args,'phase4',False):
+        from scripts.phase4_studies import trial_recovery
+        from scripts.phase4_resources import current_memory,enforce_memory,mapped_cache_files
+        updates=getattr(args,'trade_updates',None)
+        mapped=sum(mapped_cache_files(updates.path).values()) if updates is not None else 0
+        sample=current_memory()
+        recovery={'trial_recovery':trial_recovery(study.trials),'memory':sample,
+                  'memory_bounds':enforce_memory(sample,mapped),'mapped_cache_bytes':mapped}
+    return json_safe({**recovery,"study_name": study.study_name, "symbol": args.symbol, "bar_type": args.bar_type,
+        "best_params": (best.user_attrs['params'] if getattr(args, 'phase4', False) else best.params) if best else None,
+        "best_objective": best.value if best else None,
         "best_trial_number": best.number if best else None, "best_degenerate": best_degenerate,
         "best_infeasible_trial_number": best_infeasible,
         "n_scored_bars": best.user_attrs["n_scored_bars"] if best else 0,
@@ -1135,7 +1228,8 @@ def dry_run_plan(args, cache_path, resolved):
     bars = CachedBars(cache_path, args.bar_type)
     n_search, _ = split_timeline(bars, args)
     widened = [n for n, (lo, hi, _) in args.space.items()
-               if lo < SEARCH_SPACE_BOUNDS[n][0] or hi > SEARCH_SPACE_BOUNDS[n][1]]
+               if lo < {**SEARCH_SPACE_BOUNDS, **TRADE_SEARCH_SPACE_BOUNDS}[n][0]
+               or hi > {**SEARCH_SPACE_BOUNDS, **TRADE_SEARCH_SPACE_BOUNDS}[n][1]]
     prior = (sum(key.startswith("holdout::") for key in read_study_attrs(args.study_db, resolved["name"]))
              if resolved["mode"].startswith("resume") else 0)
     plan = json_safe({
@@ -1156,13 +1250,35 @@ def dry_run_plan(args, cache_path, resolved):
 
 
 def optimize_study(args, cache_path, metadata):
+    if getattr(args, 'phase4', False):
+        from scripts import phase4_studies as p4
+        bars = CachedBars(cache_path, args.bar_type)
+        p4.attach_cache(args, bars)
+        if args.campaign_manifest:
+            p4.campaign_arm(args)
+        if args.holdout_look:
+            if args.dry_run:
+                return {'dry_run':True, 'study_name':'holdout_plan', 'holdout_candidate':args.holdout_look}
+            return p4.holdout_look(args, bars)
+        p4.load_frozen(args, bars)
+        if args.trade_signals == 'framing_trades':
+            if args.dry_run:
+                return {'dry_run':True, 'study_name':'deterministic_candidate', 'params':args.frozen_values,
+                        'trade_cache':args.trade_cache_identity}
+            return p4.write_candidate(args, bars)
+        if not args.space:
+            raise ValueError('empty search space; use deterministic candidate evaluation')
     resolved = resolve_study(args, metadata)
     name, identity = resolved["name"], resolved["identity"]
+    if getattr(args,'phase4',False) and args.campaign_manifest:
+        p4.campaign_arm(args,name)
     for skip in resolved["skipped"]:
         print(f"Warm start: skipped {skip['study']} trial {skip['trial']}: {skip['reason']}", file=sys.stderr)
     print(f"Warm start: {resolved['mode']}, {len(resolved['seeds'])} seed(s) [{name}]", file=sys.stderr)
     if args.dry_run:
         return dry_run_plan(args, cache_path, resolved)
+    from scripts.phase4_studies import legacy_study_guard
+    legacy_study_guard(args, name)
     study = open_study(args, name, identity)
     if resolved["mode"] == "new_warm":
         study.set_user_attr("warm_start_skipped", resolved["skipped"])
@@ -1173,11 +1289,14 @@ def optimize_study(args, cache_path, metadata):
         # Orphan workers retain their own shared descriptors even after parent death.
         with file_lock(str(lock) + ".workers", nonblocking=True,
                        message="orphaned workers still running; wait or kill pid(s)"):
-            pass
-        if args.n_jobs == 1:
-            optimize_loop(study, bars[:n_search], folds, args)
-        else:
-            run_workers(study, args, name, identity, cache_path, n_search)
+            if getattr(args,'phase4',False):
+                reconcile_phase4_trials(study,args)
+                optimize_loop(study,bars[:n_search],folds,args)
+        if not getattr(args,'phase4',False):
+            if args.n_jobs == 1:
+                optimize_loop(study, bars[:n_search], folds, args)
+            else:
+                run_workers(study, args, name, identity, cache_path, n_search)
         with file_lock(str(lock) + ".workers", nonblocking=True,
                        message="orphaned workers still running; wait or kill pid(s)"):
             if args.evaluate_holdout:
@@ -1236,8 +1355,10 @@ def bar_types(value):
     return list(dict.fromkeys(values))
 
 
-def load_space(path):
+def load_space(path, *, include_trade=False):
     space = dict(SEARCH_SPACE_BOUNDS)
+    if include_trade:
+        space.update(TRADE_SEARCH_SPACE_BOUNDS)
     if path is None:
         return space
     overrides = json.loads(Path(path).read_text())
@@ -1251,12 +1372,16 @@ def load_space(path):
         lo, hi, kind = bounds["low"], bounds["high"], space[name][2]
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (lo, hi)):
             raise ValueError(f"{name}: bounds must be finite numbers")
-        if lo > hi or lo <= 0 or (kind == "int" and any(int(v) != v for v in (lo, hi))):
+        if lo > hi or (lo < 0 if name == 'ts_max_through_bps' else lo <= 0) or (kind == "int" and any(int(v) != v for v in (lo, hi))):
             raise ValueError(f"{name}: invalid ordered positive bounds")
         if name in ("volume_decline_pct", "delta_failure_pct", "absorption_min_delta_pct",
                     "initiative_min_delta_pct") and hi > 1:
             raise ValueError(f"{name}: fractions must not exceed 1")
         space[name] = (int(lo), int(hi), kind) if kind == "int" else (lo, hi, kind)
+        if name.startswith('ts_'):
+            from orderflow_system.config.settings import TradeSignalConfig
+            TradeSignalConfig(**{name[3:]:lo})
+            TradeSignalConfig(**{name[3:]:hi})
     return space
 
 
@@ -1290,6 +1415,13 @@ def build_parser():
     parser.add_argument("--study-db", type=Path, default=output / "studies.db")
     parser.add_argument("--cache-dir", type=Path, default=output / "cache")
     parser.add_argument("--output", type=Path, default=output / "results.json")
+    parser.add_argument('--phase4', action='store_true')
+    parser.add_argument('--trade-signals', default='off')
+    parser.add_argument('--trade-cache', type=Path)
+    parser.add_argument('--freeze-params', type=Path)
+    parser.add_argument('--holdout-look')
+    parser.add_argument('--campaign-manifest', type=Path)
+    parser.add_argument('--owner-approved', help='owner approval token for later experiments')
     return parser
 
 
@@ -1297,6 +1429,8 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        from scripts import phase4_studies as p4
+        p4.configure(args)
         for name in ("study_db", "output", "cache_dir"):
             setattr(args, name, getattr(args, name).expanduser().resolve())
         if args.start_date > args.end_date:
@@ -1315,7 +1449,9 @@ def main(argv=None):
         for symbol in args.symbol:
             for bar_type in args.bar_type:
                 bar_only_pipeline(instrument_config(symbol), None if bar_type == "time_1m" else BarType(bar_type))
-        args.space = load_space(args.search_space)
+        args.space = load_space(args.search_space, include_trade=True) if args.phase4 else load_space(args.search_space)
+        if args.phase4:
+            args.space = p4.active_space(args.space, args.trade_signal_config, frozen=args.freeze_params is not None)
         # Validate all mount roots before doing any work.
         if any(b != "time_1m" for b in args.bar_type):
             require_source(args.data_root)
@@ -1331,7 +1467,7 @@ def main(argv=None):
                 # Reject unusable holdout/CV geometry before creating or running a study.
                 split_timeline(CachedBars(path, bar_type), study_args)
                 entry = optimize_study(study_args, path, metadata)
-                results["symbols"][symbol][bar_type] = {entry["study_name"]: entry}
+                results["symbols"][symbol][bar_type] = {entry.get("study_name", "candidate"): entry}
         return results
     except (ValueError, RuntimeError, OSError) as exc:
         parser.error(str(exc))
