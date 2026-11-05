@@ -26,7 +26,7 @@ ORIGINAL_DIMS = ("price_proximity_pct", "min_composite_score", "signal_cooldown_
 COLD_KEYS = {"data_fp", "space_fp", "search_space", "strategy_fp", "instrument_defaults", "initial_capital_usd",
              "risk_per_trade_pct", "min_stop_loss_pct", "annualization_periods", "objective", "accounting",
              "infeasible_base", "feasible_floor", "min_total_trades", "fee_bps", "slippage_bps", "n_splits",
-             "embargo", "holdout_fraction", "min_trades_per_fold", "seed"}
+             "embargo", "holdout_fraction", "min_trades_per_fold", "seed", "trade_signals"}
 
 
 def src(tag, start="2023-01-01", end="2023-02-01", symbol="BTCUSDT", bar_type="fixed_dollar_imbalance",

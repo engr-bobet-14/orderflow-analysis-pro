@@ -225,9 +225,11 @@ class TradeStream:
 
 
 class _Lane:
-    def __init__(self, ds, reader, pipeline, ranges):
+    def __init__(self, ds, reader, pipeline, ranges, raw_ranges=None, window_signals=False):
         from orderflow_system.analytics.trade_accumulator import TradeAccumulator
-        from orderflow_system.pipeline import ReplayDigest, TradeDigest
+        from orderflow_system.pipeline import ReplayDigest, TradeDigest, RawSignalDigest
+        from orderflow_system.data.models import SignalType
+        from collections import Counter
 
         self.reader, self.pipeline = reader, pipeline
         self.iterator = iter(reader)
@@ -250,6 +252,16 @@ class _Lane:
         self.accumulator.warm_end = self.previous
         self.accumulator.pending_end = self.pending.seq
         self.replay_digest, self.trade_digest = ReplayDigest(), TradeDigest(ranges=ranges)
+        self.raw_signal_digest = None
+        if cfg.signals.any_enabled:
+            raw_ranges = raw_ranges or {}
+            self.raw_signal_digest = RawSignalDigest()
+            self.raw_digests = {
+                'absorption': RawSignalDigest(ranges=raw_ranges.get('absorption', ()), detector=SignalType.ABSORPTION),
+                'exhaustion': RawSignalDigest(ranges=raw_ranges.get('exhaustion', ()), detector=SignalType.EXHAUSTION,
+                                             skip_bars=pipeline.config.exhaustion.min_bars_declining + 1 if window_signals else 0),
+            }
+            self.signal_detail_counts = Counter()
         self.warm_n = self.warm_lots = self.bar_n = self.bar_lots = self.footprint_lots = 0
         self.final_lots = self.n_tail = self.lots_tail = self.bars = 0
         self.first_seq = self.pending.seq
@@ -279,7 +291,7 @@ class TradeReplay:
     Optional digest ranges use inclusive global closing-trade ordinals (InfoBar.seq).
     """
     def __init__(self, ds: PairedDataset, lanes, *, temp_dir: Path, threads=4, memory_limit='1GB',
-                 batch_rows=1_000_000, digest_ranges=None):
+                 batch_rows=1_000_000, digest_ranges=None, raw_signal_ranges=None, window_signals=False):
         self.ds = ds
         self.lanes = {}
         for reader, pipeline in lanes:
@@ -288,7 +300,12 @@ class TradeReplay:
                 raise ValueError('lanes must have unique registered bar types')
             if reader.info.parquet_path.resolve() != ds.bar_path(bt).resolve() or not reader.strict:
                 raise DataIntegrityError('trade replay requires strict readers from the authenticated dataset')
-            self.lanes[bt] = _Lane(ds, reader, pipeline, (digest_ranges or {}).get(bt, ()))
+            from orderflow_system.config.settings import validate_trade_signal_range
+            validate_trade_signal_range(pipeline.trade_config.signals, datetime.fromtimestamp(reader.start_ms/1000, timezone.utc).isoformat() if reader.start_ms is not None else None,
+                                        datetime.fromtimestamp(reader.end_ms/1000, timezone.utc).isoformat() if reader.end_ms is not None else None,
+                                        ds.manifest['requested_range'])
+            self.lanes[bt] = _Lane(ds, reader, pipeline, (digest_ranges or {}).get(bt, ()),
+                                   (raw_signal_ranges or {}).get(bt), window_signals)
         if not self.lanes:
             raise ValueError('at least one lane is required')
         self.full = all(l.reader.start_ms is None and l.reader.end_ms is None for l in self.lanes.values())
@@ -341,6 +358,12 @@ class TradeReplay:
                     result = lane.pipeline.process_bar(bar, update)
                     lane.replay_digest.update(result)
                     lane.trade_digest.update(result, update)
+                    if lane.raw_signal_digest is not None:
+                        lane.raw_signal_digest.update(result)
+                        for digest in lane.raw_digests.values():
+                            digest.update(result)
+                        for signal in result.signals:
+                            lane.signal_detail_counts[signal.details.get('type', signal.signal_type.value)] += 1
                     lane.bars += 1
                     lane.previous = bar.seq
                     lane.pending = next(lane.iterator, None)
@@ -380,7 +403,14 @@ class TradeReplay:
                             'B': [lane.initial_previous+1, lane.last_tn],
                             'T': [lane.last_tn+1, self.ds.manifest['n_trades'] if self.full else lane.last_tn]},
                 'identities': identities, 'replay_digest': lane.replay_digest.hexdigest(),
-                'trade_digest': lane.trade_digest.hexdigest()}
+                'trade_digest': lane.trade_digest.hexdigest(),
+                'signal_counts': dict(lane.pipeline.signal_counts)}
+            if lane.raw_signal_digest is not None:
+                report_lanes[bt].update({
+                    'raw_signal_digest': lane.raw_signal_digest.hexdigest(),
+                    'raw_signal_digests': {name: d.hexdigest() for name, d in lane.raw_digests.items()},
+                    'signal_detail_counts': dict(lane.signal_detail_counts),
+                })
         self.ds.recheck()
         self.report = {'dataset_id': self.ds.dataset_id, 'root_hash': self.ds.root_hash,
                        'full_history': self.full, 'stream': self.stream.report, 'lanes': report_lanes,

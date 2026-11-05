@@ -376,7 +376,7 @@ def suggest_params(trial, space=None):
 
 
 def run_backtest(bars, instrument_config, price_proximity_pct, bar_type=None, prefix_ends=()):
-    replay = InfoBarPipeline(instrument_config, bar_type)
+    replay = bar_only_pipeline(instrument_config, bar_type)
     replay.aggregator.price_proximity_pct = price_proximity_pct
     ledger, digest = TradeLedger(), ReplayDigest()
     prefix_digests = {}
@@ -602,6 +602,23 @@ def objective(trial, bars, folds, args):
 # END STRATEGY
 
 
+def trade_signal_identity(trade_config):
+    if not trade_config.signals.any_enabled:
+        return "disabled"
+    return {"signals": asdict(trade_config.signals), "footprint_bucket": trade_config.footprint_bucket,
+            "profile_bucket": trade_config.profile_bucket}
+
+
+def bar_only_pipeline(config, bar_type=None):
+    replay = InfoBarPipeline(config, bar_type)
+    if replay.trade_config.signals.any_enabled:
+        raise ValueError("trade-signal calibration is not supported by the bar-only optimizer")
+    return replay
+
+
+# STRATEGY_FP is a conservative source hash: any edit to fingerprinted files changes it,
+# including opt-in code. Cross-version stored-study use requires re-tuning or a reviewed
+# compatibility entry backed by per-trial stored-digest replay evidence.
 def source_fingerprints():
     source = Path(__file__).read_text()
     data_section = source.split("# BEGIN DATA PROCESSING", 1)[1].split("# END DATA PROCESSING", 1)[0]
@@ -630,8 +647,10 @@ def library_versions(bar_type=None):
 
 
 def study_identity(args, metadata, warm_start=False):
+    config = instrument_config(args.symbol)
+    replay = bar_only_pipeline(config, None if args.bar_type == "time_1m" else BarType(args.bar_type))
     identity = {"search_space": args.space, "strategy_fp": STRATEGY_FP,
-                "instrument_defaults": asdict(instrument_config(args.symbol)),
+                "instrument_defaults": asdict(config), "trade_signals": trade_signal_identity(replay.trade_config),
                 "initial_capital_usd": INITIAL_CAPITAL_USD, "risk_per_trade_pct": RISK_PER_TRADE_PCT,
                 "min_stop_loss_pct": MIN_STOP_LOSS_PCT, "annualization_periods": ANNUALIZATION_PERIODS,
                 "objective": OBJECTIVE_VERSION, "accounting": ACCOUNTING_VERSION, "infeasible_base": INFEASIBLE_BASE,
@@ -652,6 +671,7 @@ def study_lock_path(db, name):
 
 
 def open_study(args, name, identity, worker_index=0):
+    bar_only_pipeline(instrument_config(args.symbol), None if args.bar_type == "time_1m" else BarType(args.bar_type))
     import optuna
     args.study_db.parent.mkdir(parents=True, exist_ok=True)
     # Database-wide schema/Alembic/create-study serialisation, before study admission.
@@ -1293,7 +1313,8 @@ def main(argv=None):
         if args.evaluate_holdout and args.holdout_fraction == 0:
             raise ValueError("evaluate-holdout requires positive holdout-fraction")
         for symbol in args.symbol:
-            instrument_config(symbol)
+            for bar_type in args.bar_type:
+                bar_only_pipeline(instrument_config(symbol), None if bar_type == "time_1m" else BarType(bar_type))
         args.space = load_space(args.search_space)
         # Validate all mount roots before doing any work.
         if any(b != "time_1m" for b in args.bar_type):

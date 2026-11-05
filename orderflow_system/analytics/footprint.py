@@ -214,3 +214,20 @@ class FootprintEngine:
             else:
                 break
         return count
+
+
+def validate_trade_bucket_ticks(width: Optional[int]) -> None:
+    """An explicit width must match the accumulator; never assume $1."""
+    from numbers import Integral
+    if isinstance(width, bool) or not isinstance(width, Integral) or width <= 0:
+        raise ValueError('trade_bucket_ticks must be a positive integer')
+
+
+def clipped_trade_bounds(bar: InfoBar, centre: float, width: int) -> tuple[float, float]:
+    """Integer half-tick bucket endpoints, clipped to the executed bar range.
+
+    Half-even ties may belong to either endpoint. Including both is conservative.
+    Odd tick widths retain their exact half-tick endpoints.
+    """
+    centre_half_ticks = 2 * round(centre * 100)
+    return max((centre_half_ticks - int(width)) / 200, bar.low), min((centre_half_ticks + int(width)) / 200, bar.high)

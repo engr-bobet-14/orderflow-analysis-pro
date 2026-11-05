@@ -110,9 +110,10 @@ class InfoBarPipeline:
         self.delta_engine = DeltaEngine(tick_size=config.tick_size)
         self.footprint_engine = FootprintEngine(tick_size=config.tick_size)
 
-        self.absorption = AbsorptionDetector(config.absorption, tick_size=config.tick_size, clock=self.clock)
+        self.absorption = AbsorptionDetector(config.absorption, tick_size=config.tick_size, clock=self.clock,
+                                             signals=self.trade_config.signals)
         self.initiative = InitiativeDetector(config.initiative, tick_size=config.tick_size)
-        self.exhaustion = ExhaustionDetector(config.exhaustion)
+        self.exhaustion = ExhaustionDetector(config.exhaustion, signals=self.trade_config.signals)
         self.divergence = DivergenceDetector(config.divergence)
         self.detectors = [self.absorption, self.initiative, self.exhaustion, self.divergence]
 
@@ -145,6 +146,18 @@ class InfoBarPipeline:
     # ── main entry ──────────────────────────────────────────
 
     def process_bar(self, bar: InfoBar, trade: Optional[TradeBarUpdate] = None) -> BarResult:
+        """Process a close, optionally with a matching trade update.
+
+        A2/E2 trade must come from a TradeAccumulator built with
+        round(self.trade_config.footprint_bucket*100), as _Lane does.
+        A2/E2 geometry takes its width from this pipeline's TradeFlowConfig.
+        """
+        if self.trade_config.signals.any_enabled and trade is None:
+            raise ValueError('enabled trade signals require trade input')
+        signals = self.trade_config.signals
+        if signals.absorption_levels or signals.exhaustion_contrarian != 'off':
+            if trade.fp_bucket_ticks is None or trade.fp_bucket_ticks != round(self.trade_config.footprint_bucket*100):
+                raise DataIntegrityError('trade footprint bucket width differs from pipeline configuration')
         if self._last_ts is not None and bar.timestamp_ms < self._last_ts:
             raise ValueError(
                 f"Out-of-order bar: {bar.timestamp_ms} < {self._last_ts}. "
@@ -153,7 +166,12 @@ class InfoBarPipeline:
         self._last_ts = bar.timestamp_ms
         self.clock.set(bar.timestamp_ms)
 
-        closed_profile, bias = self._roll_session(bar)
+        trade_footprint, trade_stats, trade_profiles = None, None, []
+        if trade is not None:
+            if self.trade_view is None:
+                self.trade_view = TradeView(self.trade_config, self.config.volume_profile)
+            trade_footprint, trade_stats, trade_profiles = self.trade_view.update(bar, trade)
+        closed_profile, bias = self._roll_session(bar, trade_profiles)
 
         # Exits first: a trade opened on this bar's close must not fill on this bar.
         aggregated: list[AggregatedSignal] = []
@@ -172,10 +190,11 @@ class InfoBarPipeline:
         result = BarResult(
             bar=bar, delta=delta, footprint=footprint, aggregated=aggregated,
             closed_profile=closed_profile, bias=bias,
+            trade_footprint=trade_footprint, trade_stats=trade_stats, trade_profiles=trade_profiles,
         )
 
         # Every detector sees every bar, keeping price/delta/rate histories aligned.
-        signals = self._detect(bar, delta, footprint)
+        signals = self._detect(bar, delta, footprint, trade_footprint)
         if bar.data_gap:
             # Gap rates are unknown and any emitted patterns are discarded.
             self.gap_bars_skipped += 1
@@ -206,10 +225,6 @@ class InfoBarPipeline:
         for agg in aggregated:
             agg.bar_seq = bar.seq
             self.action_counts[agg.action] += 1
-        if trade is not None:
-            if self.trade_view is None:
-                self.trade_view = TradeView(self.trade_config, self.config.volume_profile)
-            result.trade_footprint, result.trade_stats, result.trade_profiles = self.trade_view.update(bar, trade)
         return result
 
     # ── internals ───────────────────────────────────────────
@@ -224,22 +239,42 @@ class InfoBarPipeline:
         self._last_display = t
         return t
 
-    def _detect(self, bar: InfoBar, delta: DeltaResult, footprint: FootprintBar) -> list[Signal]:
+    def _detect(self, bar: InfoBar, delta: DeltaResult, footprint: FootprintBar,
+                trade_footprint: Optional[FootprintBar] = None) -> list[Signal]:
         signals: list[Signal] = []
         recent = list(self._recent)
+        cfg = self.trade_config.signals
+        trade_args = dict(trade_footprint=trade_footprint,
+                          trade_bucket_ticks=round(self.trade_config.footprint_bucket * 100))
         for sig in (
-            self.absorption.check_bar(bar, footprint, delta, bar.close),
+            self.absorption.check_bar(bar, footprint, delta, bar.close,
+                                      **(trade_args if cfg.absorption_levels else {})),
             self.initiative.check_bar(bar, delta, footprint),
-            self.exhaustion.check_bar(bar, delta, self.delta_engine, footprint, recent),
+            self.exhaustion.check_bar(bar, delta, self.delta_engine, footprint, recent,
+                                      **(trade_args if cfg.exhaustion_contrarian != 'off' else {})),
             self.divergence.check_bar(bar, self.delta_engine),
         ):
             if sig:
                 signals.append(sig)
         return signals
 
-    def _roll_session(self, bar: InfoBar) -> tuple[Optional[VolumeProfileResult], Optional[DailyBias]]:
+    def _roll_session(self, bar: InfoBar, trade_profiles=()) -> tuple[Optional[VolumeProfileResult], Optional[DailyBias]]:
         """Finalise the previous UTC-day profile when a bar closes in a new day."""
         day = bar.timestamp_ms // _DAY_MS
+        if self.trade_config.signals.framing_profile_source == 'trades':
+            first = self._session_day is None
+            rolled = not first and day != self._session_day
+            if not first and rolled != bool(trade_profiles):
+                raise DataIntegrityError('trade finalisation and UTC session rollover disagree')
+            if first or rolled:
+                self._session_bars = []
+                self._session_day, self._session_date = day, utc_date(bar.timestamp_ms)
+            if not trade_profiles:
+                return None, None
+            for profile in trade_profiles:
+                self.profile_framing.add_profile(profile)
+                self.sessions_closed += 1
+            return self._frame_profile(trade_profiles[-1], bar)
         if self._session_day is None:
             self._session_day, self._session_date = day, utc_date(bar.timestamp_ms)
             return None, None
@@ -253,9 +288,12 @@ class InfoBarPipeline:
             return None, None
 
         self.profile_framing.add_profile(profile)
+        self.sessions_closed += 1
+        return self._frame_profile(profile, bar)
+
+    def _frame_profile(self, profile, bar):
         last_close = self._recent[-1].close if self._recent else bar.open
         bias = self.profile_framing.analyze(last_close)
-        self.sessions_closed += 1
 
         # New session -> new levels. Open positions are untouched.
         self.aggregator.reset_watching(self.symbol)
@@ -371,6 +409,35 @@ class TradeDigest:
             if lo <= result.bar.seq <= hi:
                 digest.update(leaf)
         self.bars += 1
+
+    def hexdigest(self):
+        return self._h.hexdigest()
+
+    def range_hexdigest(self, lo, hi):
+        return self._ranges[(lo, hi)].hexdigest()
+
+
+class RawSignalDigest:
+    """Canonical per-bar raw signals, optionally filtered, with bounded seq ranges."""
+    def __init__(self, ranges=(), detector=None, skip_bars=0):
+        self._h = hashlib.sha256()
+        self._ranges = {tuple(r): hashlib.sha256() for r in ranges}
+        self.detector = detector
+        self._skip_bars = skip_bars
+
+    def update(self, result):
+        if self._skip_bars:
+            self._skip_bars -= 1
+            return
+        import json
+        signals = [(s.signal_type.value, s.direction.value, s.price_level, s.strength, s.details)
+                   for s in result.signals if self.detector is None or s.signal_type == self.detector]
+        leaf = hashlib.sha256(json.dumps([result.bar.seq, signals], sort_keys=True,
+                                         separators=(',', ':'), allow_nan=False).encode()).digest()
+        self._h.update(leaf)
+        for (lo, hi), digest in self._ranges.items():
+            if lo <= result.bar.seq <= hi:
+                digest.update(leaf)
 
     def hexdigest(self):
         return self._h.hexdigest()

@@ -1343,3 +1343,64 @@ def test_accounting_change_is_versioned_in_the_study_identity(tmp_path):
     _, identity = opt.study_identity(args_for(tmp_path), {"fingerprint": "f" * 64})
     assert identity["objective"] == "two_tier_day_weighted_v2"
     assert identity["accounting"] == "continuous_equity_anchor_v2"
+
+
+# Phase 3: explicit bar-only configuration identity and admission.
+def test_new_study_identity_explicitly_disables_trade_signals(tmp_path):
+    _, identity = opt.study_identity(args_for(tmp_path), {"fingerprint": "a"*64})
+    assert identity["trade_signals"] == "disabled"
+
+
+def test_disabled_trade_signal_identity_ignores_unused_buckets():
+    from orderflow_system.config.settings import TradeFlowConfig
+    assert opt.trade_signal_identity(TradeFlowConfig()) == "disabled"
+    assert opt.trade_signal_identity(TradeFlowConfig(footprint_bucket=.05, profile_bucket=20.)) == "disabled"
+
+
+@pytest.mark.parametrize("signals", [
+    {"absorption_levels": True}, {"exhaustion_contrarian": "bonus"},
+    {"exhaustion_contrarian": "required"}, {"framing_profile_source": "trades"},
+])
+def test_enabled_trade_signal_identity_includes_thresholds_and_buckets(signals):
+    from dataclasses import asdict
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    cfg = TradeFlowConfig(footprint_bucket=.05, profile_bucket=20., signals=TradeSignalConfig(**signals))
+    assert opt.trade_signal_identity(cfg) == {"signals": asdict(cfg.signals),
+                                            "footprint_bucket": .05, "profile_bucket": 20.}
+
+
+@pytest.mark.parametrize("signals", [
+    {"absorption_levels": True}, {"exhaustion_contrarian": "bonus"},
+    {"exhaustion_contrarian": "required"}, {"framing_profile_source": "trades"},
+])
+@pytest.mark.parametrize("entry", ["main", "open_study"])
+def test_bar_only_optimizer_refuses_trade_signals_before_files(tmp_path, monkeypatch, capsys, signals, entry):
+    from orderflow_system import pipeline
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    args = args_for(tmp_path)
+    argv = cli_args(tmp_path)
+    cfg = TradeFlowConfig(signals=TradeSignalConfig(**signals))
+    # Patch the default actually used by InfoBarPipeline, rather than an independent optimizer config.
+    monkeypatch.setattr(pipeline, "TradeFlowConfig", lambda: cfg)
+    before = {p.relative_to(tmp_path) for p in tmp_path.rglob("*")}
+    if entry == "main":
+        with pytest.raises(SystemExit) as exc:
+            opt.main(argv)
+        assert exc.value.code == 2
+        error = capsys.readouterr().err
+    else:
+        with pytest.raises(ValueError) as exc:
+            opt.open_study(args, "must-not-open", {})
+        error = str(exc.value)
+    assert {p.relative_to(tmp_path) for p in tmp_path.rglob("*")} == before
+    assert not args.study_db.exists() and not args.output.exists()
+    assert "trade-signal calibration is not supported by the bar-only optimizer" in error
+
+
+def test_bar_only_backtest_refuses_enabled_empty_replay(monkeypatch):
+    from orderflow_system import pipeline
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    cfg = TradeFlowConfig(signals=TradeSignalConfig(absorption_levels=True))
+    monkeypatch.setattr(pipeline, "TradeFlowConfig", lambda: cfg)
+    with pytest.raises(ValueError, match="trade-signal calibration is not supported"):
+        opt.run_backtest([], get_btcusd_config(), .001)

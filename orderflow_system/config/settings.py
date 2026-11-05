@@ -12,6 +12,7 @@ info-bar dataset (tracked as the next step in CLAUDE.md).
 
 from dataclasses import dataclass, field
 from enum import Enum
+from numbers import Real
 from typing import Optional
 
 from orderflow_system.data.models import BarType
@@ -182,6 +183,91 @@ DB_PATH = "orderflow_data.db"
 LOG_LEVEL = "INFO"
 
 
+@dataclass(frozen=True)
+class TradeSignalConfig:
+    """Untuned development defaults; every trade strategy input is opt-in."""
+    absorption_levels: bool = False
+    exhaustion_contrarian: str = "off"
+    framing_profile_source: str = "bar_vwap"
+    level_zone_frac: float = 0.25
+    min_level_share: float = 0.05
+    min_side_ratio: float = 0.65
+    min_reject_bps: float = 2.0
+    max_through_bps: float = 1.0
+    contrarian_ratio: float = 2.5
+    contrarian_zone_frac: float = 0.30
+    contrarian_min_level_share: float = 0.02
+
+    def __post_init__(self):
+        import math
+        import numpy as np
+        if not isinstance(self.absorption_levels, bool):
+            raise ValueError('absorption_levels must be a bool')
+        for name in ('exhaustion_contrarian', 'framing_profile_source'):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f'{name} must be a str')
+        if self.exhaustion_contrarian not in ('off', 'bonus', 'required'):
+            raise ValueError('invalid exhaustion_contrarian')
+        if self.framing_profile_source not in ('bar_vwap', 'trades'):
+            raise ValueError('invalid framing_profile_source')
+        for name in ('level_zone_frac', 'min_level_share', 'min_side_ratio', 'min_reject_bps',
+                     'max_through_bps', 'contrarian_ratio', 'contrarian_zone_frac', 'contrarian_min_level_share'):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                raise ValueError(f'{name} must be a real number, not bool')
+            value = float(value)
+            object.__setattr__(self, name, value)
+            if not math.isfinite(value):
+                raise ValueError(f'{name} must be finite')
+        for name in ('level_zone_frac', 'min_level_share', 'contrarian_zone_frac', 'contrarian_min_level_share'):
+            if not 0 < getattr(self, name) <= 1:
+                raise ValueError(f'{name} must be in (0, 1]')
+        if not 0.5 < self.min_side_ratio <= 1:
+            raise ValueError('min_side_ratio must be in (0.5, 1]')
+        if self.min_reject_bps <= 0 or self.max_through_bps < 0 or self.contrarian_ratio <= 1:
+            raise ValueError('invalid rejection, travel or contrarian threshold')
+
+    @property
+    def any_enabled(self) -> bool:
+        return (self.absorption_levels or self.exhaustion_contrarian != 'off'
+                or self.framing_profile_source != 'bar_vwap')
+
+
+def parse_trade_signals(value: str) -> TradeSignalConfig:
+    """Shared CLI spelling, refusing unknown and conflicting modes."""
+    names = value.split(',') if value else []
+    allowed = {'absorption_levels', 'exhaustion_bonus', 'exhaustion_required', 'framing_trades'}
+    if any(name not in allowed for name in names) or len(set(names)) != len(names):
+        raise ValueError('invalid --trade-signals list')
+    if 'exhaustion_bonus' in names and 'exhaustion_required' in names:
+        raise ValueError('exhaustion_bonus and exhaustion_required are mutually exclusive')
+    return TradeSignalConfig(
+        absorption_levels='absorption_levels' in names,
+        exhaustion_contrarian=('required' if 'exhaustion_required' in names else
+                               'bonus' if 'exhaustion_bonus' in names else 'off'),
+        framing_profile_source='trades' if 'framing_trades' in names else 'bar_vwap',
+    )
+
+
+def validate_trade_signal_range(signals, start, end, requested_range=None):
+    """Phase 3 reads only the development period; end is exclusive."""
+    if not signals.any_enabled:
+        return
+    from datetime import datetime, timezone
+    def instant(value):
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt).astimezone(timezone.utc)
+    first = instant('2019-09-10')
+    stop = instant('2024-01-01')
+    if ((start is not None and not first <= instant(start) < stop) or
+            (end is not None and not first < instant(end) <= stop)):
+        raise ValueError('trade signals require the 2019-09-10 through 2023-12-31 development range')
+    if requested_range is not None:
+        lo, hi = requested_range
+        if instant(lo) < first or instant(hi) >= stop:
+            raise ValueError('trade signals require a development-only paired dataset')
+
+
 @dataclass
 class TradeFlowConfig:
     """Authenticated replay settings; legacy profile settings remain independent."""
@@ -192,6 +278,7 @@ class TradeFlowConfig:
     duckdb_memory_limit: str = "1GB"
     duckdb_temp_dir: str = "output/duckdb_tmp"
     report_dir: str = "output/trade_replay"
+    signals: TradeSignalConfig = field(default_factory=TradeSignalConfig)
 
     def __post_init__(self):
         import math
