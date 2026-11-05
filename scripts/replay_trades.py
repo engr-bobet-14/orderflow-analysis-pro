@@ -12,6 +12,7 @@ import platform
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
+from dataclasses import asdict
 from importlib.metadata import version
 from pathlib import Path
 
@@ -24,7 +25,8 @@ try:
 except ImportError:
     psutil = None
 
-from orderflow_system.config.settings import TradeFlowConfig, get_btcusd_config
+from orderflow_system.config.settings import (TradeFlowConfig, get_btcusd_config, parse_trade_signals,
+                                             validate_trade_signal_range)
 from orderflow_system.data.infobar_feed import DataIntegrityError, open_bars
 from orderflow_system.data.paired_dataset import open_registered, sha256_file
 from orderflow_system.data.trade_stream import TradeReplay
@@ -177,8 +179,12 @@ def run(dataset_id, *, config=None, bar_types=None, start=None, end=None, window
         raise ValueError('--certificate requires a full-range replay without --start/--end')
     begun = time.perf_counter()
     config = config or TradeFlowConfig()
+    if certificate is not None and config.signals.any_enabled:
+        raise ValueError('--certificate cannot be combined with enabled --trade-signals')
+    validate_trade_signal_range(config.signals, start, end)
     # Authentication and certificate identity precede all reader iteration.
     ds = open_registered(Path(config.paired_root), dataset_id)
+    validate_trade_signal_range(config.signals, start, end, ds.manifest['requested_range'])
     types = list(bar_types or ds.bar_types)
     if not types or len(set(types)) != len(types) or any(bt not in ds.bar_types for bt in types):
         raise ValueError('bar types must be unique members of the paired dataset')
@@ -189,23 +195,40 @@ def run(dataset_id, *, config=None, bar_types=None, start=None, end=None, window
     certificate_hash = sha256_file(Path(certificate)) if certificate else None
     expected = _certificate(certificate, ds, types)
 
-    def make_replay(lo=None, hi=None, ranges=None):
+    def make_replay(lo=None, hi=None, ranges=None, raw_ranges=None, window_signals=False):
         lanes = [(open_bars(ds.bars_root, ds.manifest['symbol'], bt, lo, hi, version=ds.manifest['stamp']),
                   InfoBarPipeline(get_btcusd_config(), trade_config=config)) for bt in types]
         return TradeReplay(ds, lanes, temp_dir=Path(config.duckdb_temp_dir), threads=config.duckdb_threads,
-                           memory_limit=config.duckdb_memory_limit, batch_rows=batch_rows, digest_ranges=ranges)
+                           memory_limit=config.duckdb_memory_limit, batch_rows=batch_rows, digest_ranges=ranges,
+                           raw_signal_ranges=raw_ranges, window_signals=window_signals)
 
     drawn = _draw_windows(ds, windows, seed)
     bounds, ranges = [], {bt: [] for bt in types}
+    raw_ranges = {bt: {'absorption': [], 'exhaustion': []} for bt in types}
+    signal_bounds = []
     # Retain only bounds, not window readers/pipelines and their Arrow buffers.
     for lo, hi in drawn:
         probe = make_replay(lo, hi)
         bound = {bt: (lane.first_seq, lane.last_tn) for bt, lane in probe.lanes.items()}
         bounds.append(bound)
+        e_bounds = {}
+        for bt, lane in probe.lanes.items():
+            # The probe already holds the first bar; exclude n+1 bars by count,
+            # never by adding to a closing-trade ordinal.
+            first_after_prefix = None
+            for _ in range(lane.pipeline.config.exhaustion.min_bars_declining + 1):
+                first_after_prefix = next(lane.iterator, None)
+                if first_after_prefix is None:
+                    break
+            first = first_after_prefix.seq if first_after_prefix is not None else lane.last_tn + 1
+            e_bounds[bt] = (first, lane.last_tn)
+            raw_ranges[bt]['absorption'].append(bound[bt])
+            raw_ranges[bt]['exhaustion'].append(e_bounds[bt])
+        signal_bounds.append(e_bounds)
         for bt, pair in bound.items():
             ranges[bt].append(pair)
         del probe
-    replay = make_replay(start, end, ranges)
+    replay = make_replay(start, end, ranges, raw_ranges)
     snapshots = {}
     ends = {bt: {pair[1] for pair in pairs} for bt,pairs in ranges.items()}
     for bt,result in replay:
@@ -220,11 +243,11 @@ def run(dataset_id, *, config=None, bar_types=None, start=None, end=None, window
                 raise DataIntegrityError(f'{bt}: legacy ReplayDigest differs from certificate')
         report['certificate_match'] = True
     else:
-        report['certificate_match'] = None
+        report['certificate_match'] = ('not_applicable: trade signals enabled' if config.signals.any_enabled else None)
     report['windows'] = []
-    for (lo, hi), bound in zip(drawn, bounds):
+    for (lo, hi), bound, e_bound in zip(drawn, bounds, signal_bounds):
         window_begun = time.perf_counter()
-        window = make_replay(lo, hi)
+        window = make_replay(lo, hi, window_signals=True)
         for _ in window:
             pass
         checks = {}
@@ -234,7 +257,17 @@ def run(dataset_id, *, config=None, bar_types=None, start=None, end=None, window
             checks[bt] = {'digest_equal': lane['trade_digest'] == replay.lanes[bt].trade_digest.range_hexdigest(first,last),
                           'developing_equal': histogram == snapshots[(bt,last)], 'identities': lane['identities'],
                           'trade_digest': lane['trade_digest'], 'first_seq':first, 'last_seq':last}
-        equal = all(c['digest_equal'] and c['developing_equal'] and all(c['identities'].values()) for c in checks.values())
+            signal_checks = {}
+            for name, enabled, pair in (
+                ('absorption', config.signals.absorption_levels, (first, last)),
+                ('exhaustion', config.signals.exhaustion_contrarian != 'off', e_bound[bt]),
+            ):
+                if enabled:
+                    signal_checks[name] = (lane['raw_signal_digests'][name] ==
+                                           replay.lanes[bt].raw_digests[name].range_hexdigest(*pair))
+            checks[bt]['raw_signal_equal'] = signal_checks
+            checks[bt]['exhaustion_excluded_prefix_bars'] = get_btcusd_config().exhaustion.min_bars_declining + 1
+        equal = all(all(c['raw_signal_equal'].values()) and c['digest_equal'] and c['developing_equal'] and all(c['identities'].values()) for c in checks.values())
         if not equal:
             raise DataIntegrityError(f'window {lo}..{hi}: trade range/state differs from full replay')
         report['windows'].append({'start':lo,'end':hi,'equal':equal,'lanes':checks,
@@ -244,7 +277,7 @@ def run(dataset_id, *, config=None, bar_types=None, start=None, end=None, window
     ds.recheck()
     if certificate and sha256_file(Path(certificate)) != certificate_hash:
         raise DataIntegrityError('certificate changed during replay')
-    report.update({'status':'passed', 'wall_seconds':time.perf_counter()-begun,
+    report.update({'trade_signals': asdict(config.signals), 'status':'passed', 'wall_seconds':time.perf_counter()-begun,
                    'requested_window':[start,end], 'seed':seed, 'predrawn_windows':drawn,
                    'authentication_limit':'authenticated against our frozen archive, not Binance originals',
                    'certificate_sha256':certificate_hash,
@@ -274,10 +307,18 @@ def main(argv=None):
     p.add_argument('--windows', type=int, default=0)
     p.add_argument('--seed', type=int, default=20261103)
     p.add_argument('--certificate', type=Path)
+    p.add_argument('--trade-signals', default='', help='Comma-separated absorption_levels, exhaustion_bonus|exhaustion_required, framing_trades')
     p.add_argument('--enforce-memory-gates', action='store_true',
                    help='Exit nonzero after writing the report unless every memory gate passes')
     args = p.parse_args(argv)
-    report = run(args.paired_dataset, config=TradeFlowConfig(paired_root=args.paired_root),
+    try:
+        signals = parse_trade_signals(args.trade_signals)
+        validate_trade_signal_range(signals, args.start, args.end)
+        if args.certificate and signals.any_enabled:
+            p.error('--certificate cannot be combined with enabled --trade-signals')
+    except ValueError as exc:
+        p.error(str(exc))
+    report = run(args.paired_dataset, config=TradeFlowConfig(paired_root=args.paired_root, signals=signals),
                  bar_types=args.bar_types, start=args.start, end=args.end, windows=args.windows,
                  seed=args.seed, certificate=args.certificate)
     output = Path(__file__).resolve().parents[1]/'output'/'trade_replay'

@@ -39,6 +39,8 @@ from orderflow_system.config.settings import (
     InfoBarConfig,
     InstrumentConfig,
     TradeFlowConfig,
+    parse_trade_signals,
+    validate_trade_signal_range,
     get_all_configs,
 )
 from orderflow_system.alerts.telegram_bot import TelegramAlertBot
@@ -76,6 +78,9 @@ class OrderflowSystem:
             raise ValueError('trade replay cannot persist or send alerts')
         self.paired_dataset = paired_dataset
         self.trade_config = trade_config or TradeFlowConfig()
+        if self.trade_config.signals.any_enabled and not paired_dataset:
+            raise ValueError('enabled trade signals require --trades')
+        validate_trade_signal_range(self.trade_config.signals, info_bars.start, info_bars.end)
         self.dataset = None
         self.trade_report: Optional[dict] = None
         instruments = instruments or get_all_configs()
@@ -129,6 +134,8 @@ class OrderflowSystem:
             from orderflow_system.data.paired_dataset import open_registered
 
             self.dataset = open_registered(Path(self.trade_config.paired_root), self.paired_dataset)
+            validate_trade_signal_range(self.trade_config.signals, self.info_bars.start, self.info_bars.end,
+                                        self.dataset.manifest['requested_range'])
             if (self.info_bars.bar_type.value not in self.dataset.bar_types or
                     self.info_bars.symbol != self.dataset.manifest['symbol']):
                 raise ValueError('instrument or bar type is absent from the paired dataset')
@@ -258,6 +265,8 @@ class OrderflowSystem:
     def _write_trade_report(self, replay, status: str, error: Optional[BaseException]) -> None:
         report = dict(replay.report) if status == 'passed' else {}
         report.update({
+            'trade_signals': asdict(self.trade_config.signals),
+            'certificate_match': 'not_applicable: trade signals enabled' if self.trade_config.signals.any_enabled else None,
             'status': status, 'dataset_id': self.dataset.dataset_id, 'root_hash': self.dataset.root_hash,
             'bar_type': self.info_bars.bar_type.value,
             'effective_root': str(self.dataset.bars_root.resolve()),
@@ -401,7 +410,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--trades", action="store_true", help="Replay authenticated trade analytics")
     p.add_argument("--paired-dataset")
     p.add_argument("--paired-root", default=TradeFlowConfig().paired_root)
+    p.add_argument('--trade-signals', default='')
     args = p.parse_args(argv)
+    try:
+        args.trade_signals = parse_trade_signals(args.trade_signals)
+        validate_trade_signal_range(args.trade_signals, args.start, args.end)
+    except ValueError as exc:
+        p.error(str(exc))
+    if args.trade_signals.any_enabled and not args.trades:
+        p.error('enabled --trade-signals requires --trades')
     if args.trades and (not args.paired_dataset or args.persist or args.alerts):
         p.error('--trades requires --paired-dataset and refuses --persist / --alerts')
     if args.trades and not args.no_dashboard:
@@ -426,7 +443,7 @@ def main(argv: Optional[list[str]] = None):
 
     system = OrderflowSystem(info_bars=cfg, send_alerts=args.alerts,
         paired_dataset=args.paired_dataset if args.trades else None,
-        trade_config=TradeFlowConfig(paired_root=args.paired_root))
+        trade_config=TradeFlowConfig(paired_root=args.paired_root, signals=args.trade_signals))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

@@ -1,6 +1,6 @@
 """Shared-pass lanes, warm-up domains, reconciliation and conservation."""
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 
 import pytest
@@ -36,6 +36,7 @@ def test_shared_pass_conservation_and_multiday_tail(tmp_path, batch):
     results = list(r)
     assert len(results) == 12
     assert r.report['stream']['n_verified'] == len(trades)
+    assert 'trade_signals' not in r.report
     for bt in TYPES:
         lane = r.report['lanes'][bt]
         last = 270 if bt == TYPES[0] else 250
@@ -184,6 +185,7 @@ def test_replay_script_authentication_report_and_certificate(tmp_path, monkeypat
     cfg=script.TradeFlowConfig(duckdb_temp_dir=str(tmp_path/'spill'), report_dir=str(tmp_path/'reports'))
     result=script.run(ds.dataset_id, config=cfg, bar_types=TYPES)
     assert result['full_history']
+    assert result['trade_signals'] == asdict(cfg.signals)
     assert all(x['identities']['I4'] for x in result['lanes'].values())
     cert=tmp_path/'cert.json'
     cert.write_text(json.dumps({'certification':'dataset-pipeline', 'pipeline_equivalent_default':True,
@@ -261,11 +263,13 @@ def test_mutation_never_reaches_pipeline(tmp_path):
     assert pipe.bars_processed==0 and pipe.trade_view is None
 
 
-def test_main_replay_finishes_and_rechecks_without_double_processing(tmp_path, monkeypatch):
+@pytest.mark.parametrize('signals_enabled', [False, True])
+def test_main_replay_finishes_and_rechecks_without_double_processing(tmp_path, monkeypatch, signals_enabled):
     from orderflow_system import main as app
-    from orderflow_system.config.settings import TradeFlowConfig
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
     ds,_=setup(tmp_path,ends={TYPES[0]:[4,99,101,270]})
-    cfg=TradeFlowConfig(duckdb_temp_dir=str(tmp_path/'spill'), report_dir=str(tmp_path/'reports'))
+    cfg=TradeFlowConfig(duckdb_temp_dir=str(tmp_path/'spill'), report_dir=str(tmp_path/'reports'),
+                        signals=TradeSignalConfig(absorption_levels=signals_enabled))
     system=app.OrderflowSystem(paired_dataset=ds.dataset_id,trade_config=cfg)
     system.dataset=ds
     system.reader=open_bars(ds.bars_root,'BTCUSDT',TYPES[0],version=STAMP)
@@ -275,6 +279,7 @@ def test_main_replay_finishes_and_rechecks_without_double_processing(tmp_path, m
     assert system.replay_finished
     assert system.pipelines['BTCUSDT'].bars_processed==4
     assert system.trade_report['lanes'][TYPES[0]]['identities']['I4']
+    assert system.trade_report['trade_signals'] == asdict(cfg.signals)
     assert not list((tmp_path/'spill').iterdir())
 
 
@@ -569,6 +574,7 @@ def test_trade_main_writes_one_terminal_report(tmp_path, monkeypatch, caplog, ou
     assert report['status'] == status
     assert report['dataset_id'] == ds.dataset_id and report['root_hash'] == ds.root_hash
     assert report['bar_type'] == TYPES[0]
+    assert report['trade_signals'] == asdict(system.trade_config.signals)
     assert report['effective_root'] == str(ds.bars_root.resolve())
     assert report['effective_version'] == STAMP
     expected_bars = {'passed': 4, 'stopped': 1, 'initially_stopped': 0, 'integrity_failed': 0, 'callback_failed': 1}[outcome]
@@ -973,3 +979,94 @@ def test_replay_memory_anchor_sums_authenticated_hour_trade_counts(tmp_path, mon
     assert stability['anchor_source'] == 'hours.parquet n_trades'
     assert stability['n_post_anchor'] == 1
     assert stability['status'] == 'not_evaluable'
+
+
+def test_flags_off_noncanonical_details_preserve_certified_digests(tmp_path, monkeypatch):
+    import json
+    import numpy as np
+    from unittest.mock import Mock
+    from orderflow_system.data.models import Signal, SignalType, Side
+
+    ds, _ = setup(tmp_path, ends={TYPES[0]: [4, 99, 101, 270]})
+    digests = []
+    for noncanonical in (True, False):
+        pipe = InfoBarPipeline(get_btcusd_config())
+        def emit(bar, *args, **kwargs):
+            details = {'type': 'fixture'}
+            if noncanonical:
+                details.update(numpy_int=np.int64(7), nan=float('nan'))
+            return Signal(bar.timestamp_ms, SignalType.ABSORPTION, Side.SELL,
+                          bar.close, strength=50., details=details)
+        monkeypatch.setattr(pipe.absorption, 'check_bar', emit)
+        reader = open_bars(ds.bars_root, 'BTCUSDT', TYPES[0], version=STAMP)
+        run = TradeReplay(ds, [(reader, pipe)], temp_dir=tmp_path/'spill')
+        with monkeypatch.context() as scoped:
+            serialize = Mock(wraps=json.dumps)
+            scoped.setattr(json, 'dumps', serialize)
+            results = list(run)
+            serialize.assert_not_called()
+        assert len(results) == 4
+        if noncanonical:
+            assert isinstance(results[0][1].signals[0].details['numpy_int'], np.int64)
+            assert np.isnan(results[0][1].signals[0].details['nan'])
+        lane = run.report['lanes'][TYPES[0]]
+        assert not {'raw_signal_digest', 'raw_signal_digests', 'signal_detail_counts'} & lane.keys()
+        digests.append((lane['replay_digest'], lane['trade_digest']))
+    assert digests[0] == digests[1]
+
+
+def test_flags_off_windows_never_build_raw_signal_digests(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from orderflow_system import pipeline
+    from scripts import replay_trades as script
+
+    ds, _ = setup(tmp_path)
+    monkeypatch.setattr(script, 'open_registered', lambda *args: ds)
+    raw = Mock(side_effect=AssertionError('flags-off raw digest construction'))
+    monkeypatch.setattr(pipeline, 'RawSignalDigest', raw)
+    report = script.run(ds.dataset_id, windows=2)
+    raw.assert_not_called()
+    for lane in report['lanes'].values():
+        assert not {'raw_signal_digest', 'raw_signal_digests', 'signal_detail_counts'} & lane.keys()
+        assert isinstance(lane['signal_counts'], dict)
+    assert all(w['equal'] and all(not lane['raw_signal_equal'] for lane in w['lanes'].values())
+               for w in report['windows'])
+
+
+@pytest.mark.parametrize('detail', ['numpy_int', 'nan'])
+def test_enabled_raw_signal_details_remain_strict(tmp_path, monkeypatch, detail):
+    import numpy as np
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+    from orderflow_system.data.models import Signal, SignalType, Side
+
+    ds, _ = setup(tmp_path, ends={TYPES[0]: [4, 99, 101, 270]})
+    cfg = TradeFlowConfig(signals=TradeSignalConfig(absorption_levels=True))
+    pipe = InfoBarPipeline(get_btcusd_config(), trade_config=cfg)
+    value = np.int64(7) if detail == 'numpy_int' else float('nan')
+    def emit(bar, *args, **kwargs):
+        return Signal(bar.timestamp_ms, SignalType.ABSORPTION, Side.SELL,
+                      bar.close, strength=50., details={detail: value})
+    monkeypatch.setattr(pipe.absorption, 'check_bar', emit)
+    reader = open_bars(ds.bars_root, 'BTCUSDT', TYPES[0], version=STAMP)
+    run = TradeReplay(ds, [(reader, pipe)], temp_dir=tmp_path/'spill')
+    with pytest.raises(TypeError if detail == 'numpy_int' else ValueError):
+        list(run)
+
+
+def test_raw_signal_work_is_enabled_per_lane(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from orderflow_system import pipeline
+    from orderflow_system.config.settings import TradeFlowConfig, TradeSignalConfig
+
+    ds, _ = setup(tmp_path)
+    lanes = [(open_bars(ds.bars_root, 'BTCUSDT', bt, version=STAMP),
+              InfoBarPipeline(get_btcusd_config(), trade_config=TradeFlowConfig(
+                  signals=TradeSignalConfig(absorption_levels=bt == TYPES[0])))) for bt in TYPES]
+    raw = Mock(wraps=pipeline.RawSignalDigest)
+    monkeypatch.setattr(pipeline, 'RawSignalDigest', raw)
+    run = TradeReplay(ds, lanes, temp_dir=tmp_path/'spill')
+    list(run)
+    assert raw.call_count == 3  # One full digest and two detector digests for the enabled lane.
+    raw_keys = {'raw_signal_digest', 'raw_signal_digests', 'signal_detail_counts'}
+    assert raw_keys <= run.report['lanes'][TYPES[0]].keys()
+    assert not raw_keys & run.report['lanes'][TYPES[1]].keys()

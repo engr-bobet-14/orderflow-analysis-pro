@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import Optional
 
 import numpy as np
 
@@ -112,6 +113,7 @@ class TradeBarUpdate:
     stats: TradeBarStats
     footprint_levels: tuple[np.ndarray, np.ndarray, np.ndarray]
     finalised_days: list[tuple[int, np.ndarray, np.ndarray]]
+    fp_bucket_ticks: Optional[int] = None
 
 
 class TradeAccumulator:
@@ -183,7 +185,7 @@ class TradeAccumulator:
         levels = (_array(keys), _array([self._buy.get(k, 0) for k in keys]),
                   _array([self._sell.get(k, 0) for k in keys]))
         final = [_profile(d, self._days.pop(d)) for d in sorted(self._days) if d < close_ms//DAY_MS]
-        result = TradeBarUpdate(self._stats, levels, final)
+        result = TradeBarUpdate(self._stats, levels, final, fp_bucket_ticks=self.fp_bucket_ticks)
         self._stats, self._buy, self._sell = None, {}, {}
         return result
 

@@ -24,8 +24,8 @@ from typing import Optional
 
 from orderflow_system.data.models import InfoBar, Signal, SignalType, Side
 from orderflow_system.analytics.delta import DeltaEngine, DeltaResult
-from orderflow_system.analytics.footprint import FootprintBar
-from orderflow_system.config.settings import ExhaustionConfig
+from orderflow_system.analytics.footprint import FootprintBar, clipped_trade_bounds, validate_trade_bucket_ticks
+from orderflow_system.config.settings import ExhaustionConfig, TradeSignalConfig
 
 
 class ExhaustionDetector:
@@ -39,8 +39,9 @@ class ExhaustionDetector:
     4. Optional: contrarian imbalance at extreme
     """
 
-    def __init__(self, config: ExhaustionConfig):
+    def __init__(self, config: ExhaustionConfig, *, signals: Optional[TradeSignalConfig] = None):
         self.config = config
+        self.signals = signals or TradeSignalConfig()
         self._signal_history: deque[Signal] = deque(maxlen=5000)
 
     def check_bar(
@@ -50,8 +51,18 @@ class ExhaustionDetector:
         delta_engine: DeltaEngine,
         footprint: FootprintBar,
         recent_bars: list[InfoBar],
+        *,
+        trade_footprint: Optional[FootprintBar] = None,
+        trade_bucket_ticks: Optional[int] = None,
     ) -> Optional[Signal]:
-        """Check for exhaustion after a completed bar."""
+        """Check for exhaustion after a completed bar.
+
+        E2's trade_footprint must originate from a TradeAccumulator built with
+        round(trade_config.footprint_bucket*100), as _Lane does. The pipeline
+        supplies trade_bucket_ticks from its TradeFlowConfig for geometry.
+        """
+        if trade_footprint is not None:
+            validate_trade_bucket_ticks(trade_bucket_ticks)
         n = self.config.min_bars_declining
         if len(recent_bars) < n + 1:
             return None
@@ -62,14 +73,14 @@ class ExhaustionDetector:
 
         # ── Check for BULLISH exhaustion (price up, volume/delta declining) ──
         bull_exhaustion = self._check_bullish_exhaustion(
-            lookback, bar, delta, delta_engine, footprint
+            lookback, bar, delta, delta_engine, footprint, trade_footprint, trade_bucket_ticks
         )
         if bull_exhaustion:
             return bull_exhaustion
 
         # ── Check for BEARISH exhaustion (price down, volume/delta declining) ──
         return self._check_bearish_exhaustion(
-            lookback, bar, delta, delta_engine, footprint
+            lookback, bar, delta, delta_engine, footprint, trade_footprint, trade_bucket_ticks
         )
 
     def _check_bullish_exhaustion(
@@ -79,6 +90,8 @@ class ExhaustionDetector:
         delta: DeltaResult,
         delta_engine: DeltaEngine,
         footprint: FootprintBar,
+        trade_footprint: Optional[FootprintBar] = None,
+        trade_bucket_ticks: Optional[int] = None,
     ) -> Optional[Signal]:
         """
         Price making new highs but volume and delta are declining.
@@ -110,7 +123,7 @@ class ExhaustionDetector:
         # Optional: contrarian imbalance at extreme (sellers at the top)
         contrarian_bonus = 0
         # Contrarian imbalance needs real price levels; with none it is not evaluable and skipped.
-        if self.config.requires_contrarian_imbalance and footprint.has_price_levels:
+        if self.signals.exhaustion_contrarian == 'off' and self.config.requires_contrarian_imbalance and footprint.has_price_levels:
             imbalances = footprint.imbalance_levels(threshold=2.5)
             sell_imbalances_at_high = sum(
                 1 for price, d in imbalances
@@ -120,6 +133,15 @@ class ExhaustionDetector:
                 contrarian_bonus = 20
             elif self.config.requires_contrarian_imbalance:
                 return None  # Required but not found
+
+        trade_details = {}
+        if self.signals.exhaustion_contrarian != 'off':
+            count = self._trade_contrarian(current, trade_footprint, trade_bucket_ticks, Side.SELL)
+            if self.signals.exhaustion_contrarian == 'required' and not count:
+                return None
+            contrarian_bonus = 20 if count else 0
+            trade_details = dict(delta_source='tick_rule', contrarian_source='aggressor',
+                                 contrarian_levels=count, contrarian=None if count is None else count > 0)
 
         strength = min(100.0, (
             40                                          # Base: participation declining while price up
@@ -135,6 +157,7 @@ class ExhaustionDetector:
             price_level=current.high,
             strength=strength,
             details={
+                **trade_details,
                 "type": "bullish_exhaustion",
                 "declining_bars": n,
                 "volume_slope": round(vol_trend, 2),
@@ -153,6 +176,8 @@ class ExhaustionDetector:
         delta: DeltaResult,
         delta_engine: DeltaEngine,
         footprint: FootprintBar,
+        trade_footprint: Optional[FootprintBar] = None,
+        trade_bucket_ticks: Optional[int] = None,
     ) -> Optional[Signal]:
         """
         Price making new lows but volume and delta declining.
@@ -179,7 +204,7 @@ class ExhaustionDetector:
             return None
 
         contrarian_bonus = 0
-        if self.config.requires_contrarian_imbalance and footprint.has_price_levels:
+        if self.signals.exhaustion_contrarian == 'off' and self.config.requires_contrarian_imbalance and footprint.has_price_levels:
             imbalances = footprint.imbalance_levels(threshold=2.5)
             buy_imbalances_at_low = sum(
                 1 for price, d in imbalances
@@ -189,6 +214,15 @@ class ExhaustionDetector:
                 contrarian_bonus = 20
             elif self.config.requires_contrarian_imbalance:
                 return None
+
+        trade_details = {}
+        if self.signals.exhaustion_contrarian != 'off':
+            count = self._trade_contrarian(current, trade_footprint, trade_bucket_ticks, Side.BUY)
+            if self.signals.exhaustion_contrarian == 'required' and not count:
+                return None
+            contrarian_bonus = 20 if count else 0
+            trade_details = dict(delta_source='tick_rule', contrarian_source='aggressor',
+                                 contrarian_levels=count, contrarian=None if count is None else count > 0)
 
         strength = min(100.0, (
             40
@@ -204,6 +238,7 @@ class ExhaustionDetector:
             price_level=current.low,
             strength=strength,
             details={
+                **trade_details,
                 "type": "bearish_exhaustion",
                 "declining_bars": n,
                 "volume_slope": round(vol_trend, 2),
@@ -214,6 +249,32 @@ class ExhaustionDetector:
         )
         self._signal_history.append(signal)
         return signal
+
+    def _trade_contrarian(self, bar, footprint, width, direction) -> Optional[int]:
+        if footprint is None or not footprint.has_price_levels:
+            return None
+        volume = sum(lv.total_volume for lv in footprint.levels.values())
+        if volume <= 0:
+            return None
+        if bar.range_size <= 0:
+            return 0
+        count = 0
+        cfg = self.signals
+        for centre, lv in footprint.levels.items():
+            if lv.total_volume / volume < cfg.contrarian_min_level_share:
+                continue
+            lo, hi = clipped_trade_bounds(bar, centre, width)
+            if lo > hi:
+                continue
+            if direction == Side.SELL:
+                inside = lo >= bar.high - cfg.contrarian_zone_frac * bar.range_size
+                dominant, other = lv.bid_volume, lv.ask_volume
+            else:
+                inside = hi <= bar.low + cfg.contrarian_zone_frac * bar.range_size
+                dominant, other = lv.ask_volume, lv.bid_volume
+            if inside and dominant > 0 and dominant >= cfg.contrarian_ratio * other:
+                count += 1
+        return count
 
     @staticmethod
     def _abs_deltas(delta_engine: DeltaEngine, n: int) -> list[float]:
