@@ -157,7 +157,7 @@ def test_r3_5_memory_bounds_and_total_budget():
     r=importlib.import_module('scripts.phase4_resources')
     assert not r.memory_bounds({'rss_bytes':3*GiB,'private_bytes':5*GiB},2*GiB)['pass']
     assert not r.memory_bounds({'rss_bytes':7*GiB,'private_bytes':3*GiB},2*GiB)['pass']
-    assert r.memory_bounds({'rss_bytes':5*GiB,'private_bytes':3*GiB},2*GiB)['pass']
+    assert not r.memory_bounds({'rss_bytes':5*GiB,'private_bytes':3*GiB},2*GiB)['pass']
     baseline=r.memory_bounds({'rss_bytes':5*GiB,'private_bytes':3*GiB},0)
     assert not baseline['pass'] and baseline['private_limit_bytes']==4*GiB
     plan=[{'private_budget_bytes':4*GiB,'mapped_files':{'same-cache':2*GiB}}]*2
@@ -417,5 +417,5 @@ def test_r3_5_campaign_dry_run_reports_memory_plan(tmp_path,monkeypatch):
         p=tmp_path/f'legacy-{i}';p.write_bytes(bytes([i]));snapshots.append({'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
     manifest=tmp_path/'campaign.json';campaign.register(manifest,snapshots)
     result=campaign.run_driver(manifest)
-    assert not result['executed'] and len(result['memory_plans'])==10
+    assert not result['executed'] and len(result['memory_plans'])==13
     assert all(plan['planned_concurrency']==1 and plan['planned_private_bytes']==4*GiB for plan in result['memory_plans'])

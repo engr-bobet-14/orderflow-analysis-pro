@@ -52,7 +52,7 @@ def process_memory(pid=None):
                     'private_metric':'psutil USS (sampled)','private_is_fallback':False}
         except (psutil.Error,AttributeError):
             pass
-    # Missing private measurement never grants the file-mapping RSS allowance.
+    # Missing private measurement fails closed; RSS remains a separate strict bound.
     return {'rss_bytes':rss,'private_bytes':None,'peak_private_bytes':None,
             'private_metric':'RSS only; private measurement unavailable','private_is_fallback':True}
 
@@ -60,10 +60,9 @@ def process_memory(pid=None):
 def memory_bounds(sample,mapped_bytes=0):
     rss=sample.get('peak_rss_bytes',sample.get('rss_bytes',0))
     private=sample.get('peak_private_bytes',sample.get('private_bytes'))
-    credit=mapped_bytes if not sample.get('private_is_fallback',False) and private is not None else 0
-    private_ok=private is not None and private<=PRIVATE_BUDGET
-    return {'pass':bool(rss<=PRIVATE_BUDGET+credit and private_ok),'rss_bytes':rss,'private_bytes':private,
-            'mapped_cache_bytes':mapped_bytes,'rss_limit_bytes':PRIVATE_BUDGET+credit,
+    private_ok=private is not None and not sample.get('private_is_fallback',False) and private<=PRIVATE_BUDGET
+    return {'pass':bool(rss<=PRIVATE_BUDGET and private_ok),'rss_bytes':rss,'private_bytes':private,
+            'mapped_cache_bytes':mapped_bytes,'mapped_rss_credit_bytes':0,'rss_limit_bytes':PRIVATE_BUDGET,
             'private_limit_bytes':PRIVATE_BUDGET,
             'private_measurement_available':private is not None}
 
@@ -134,7 +133,13 @@ def memory_plan(plans,available_bytes=None):
         'minimum_available_bytes':MIN_AVAILABLE,'available_source':source,'error':error,'mapped_files':mapped}
 
 
+class MemoryAdmissionError(ValueError):
+    def __init__(self,report):
+        self.report=report
+        super().__init__(f'Phase 4 total-memory admission refused: {report}')
+
+
 def require_memory_plan(plans):
     result=memory_plan(plans)
-    if not result['pass']:raise ValueError(f'Phase 4 total-memory admission refused: {result}')
+    if not result['pass']:raise MemoryAdmissionError(result)
     return result

@@ -323,15 +323,16 @@ formulas, inputs, uncertainty, and resource gates in `benchmark.json` and
 
 For later campaigns, `phase4_campaign.py register` seals the campaign JSON and
 writes a draft host driver in `output/phase4/run_scripts/`. `driver` prints a dry
-run unless `--execute` is specified. Execution requires owner approval, an
+run unless `--execute --stage A|B|C` is specified. Execution requires a separate
+owner approval for the selected stage, an
 independently inspected driver hash, the preflight, and gates U/FH1–FH4/R. Keep
-one worker per study and at most six concurrent study processes. B0 uses 200
+one worker per study and one study process at a time. B0 uses 200
 cold trials per bar type; A2/E2 use 100 feature-only trials on verified frozen B0
 parameters; P2 writes one content-addressed candidate and creates no study.
 
 `--freeze-params FILE` expects `study_db`, `study`, `trial`, `budget`, `params`,
-and `replay_digest`. Generate it with `phase4_campaign.py freeze` after B0
-finishes. The source must be its study's best feasible trial at the exact budget;
+and `replay_digest`. Stage B generates and verifies both frozen files after its
+two B0 studies finish. The source must be its study's best feasible trial at the exact budget;
 the optimizer verifies its stored search replay digest before using its values.
 
 `phase4_report.py` reads stored studies and immutable database snapshots using
@@ -461,16 +462,13 @@ RUNNING/WAITING rows. Legacy studies retain their original resume behavior.
 On macOS Phase 4 measures RSS/`ru_maxrss` and private `phys_footprint`, including
 the kernel lifetime peak from `proc_pid_rusage(RUSAGE_INFO_V4)`. Child monitoring
 also retains `wait4` peak RSS. Non-macOS uses sampled psutil USS. If private
-measurement is unavailable, RSS is reported without any mapping allowance and
-Phase 4 memory admission fails closed; it does not substitute RSS for private
-memory. Private memory must stay <= 4 GiB. TFC build and bar-only B0 retain the
-strict <= 4 GiB RSS limit. A process mapping a TFC additionally permits
-`RSS <= 4 GiB + measured mapped TFC bytes`: arrays/bars are read-only file-backed
-clean pages, shared across processes and reclaimable by the OS. This explicit
-owner-approved accounting avoids charging shared cache pages as private memory.
-Files are deduplicated and rounded to OS pages; B0 receives no TFC allowance.
+measurement is unavailable, Phase 4 admission fails closed. Every Phase 4
+campaign/study process must satisfy **RSS <= 4 GiB and private memory <= 4 GiB**,
+including processes mapping a TFC lane. Mapped bytes remain a separate diagnostic;
+they grant no RSS credit. The driver's external `wait4` peak check is also strict.
+This supersedes the earlier mapped-cache RSS allowance (owner decision 2026-11-06).
 
-Before each campaign/verify child starts work, planned private budgets plus
+Before each campaign child and each study admission in the child, planned private budgets plus
 unique mapped files must be <= 24 GiB, and available memory must be >= 8 GiB.
 macOS availability is exactly vm_stat free + inactive + speculative pages.
 The existing driver launches one study process at a time; Stage A and verification
@@ -485,3 +483,243 @@ previous speed accounting. Release-readiness evidence is provisioned read-only
 under `output/phase4/inputs/release-readiness/`; historical bar-only trial durations,
 the 8,063 s full replay anchor and the per-level A2 model are diagnostic additions.
 The supplied detector prescreen experiment is never executed or used in that model.
+
+### Campaign admission after fix round 4
+
+Phase 4 runs one study process at a time, with `--n-jobs 1`. Campaign manifests
+may specify `concurrency: 1` and `n_jobs: 1`; any other value, including an arm
+requesting parallelism, is refused. Driver dry-runs report `concurrency: 1`.
+An exclusive checkout-wide execution lock serializes optimizer and Stage A
+processes; a competing launch is refused. The benchmark's historical six-worker
+projection remains evidence, not permission to launch six workers.
+
+Host gate labels alone cannot admit a campaign. In addition to the fields above,
+`gates-<campaign_sha256>.json` must bind these exact artifacts by SHA256:
+
+| Gate field | Artifact relative to this checkout |
+| --- | --- |
+| `benchmark_sha256` | `output/phase4/benchmark/benchmark.json` |
+| `complete_sha256` | `output/optimize/trade_cache/20261103T011635Z-d3a7b9603b37/COMPLETE.json` |
+| `build_report_sha256` | `output/phase4/cache-build.json` |
+| `verify_report_sha256` | `output/phase4/fullhistory/verify.stdout` |
+
+Admission checks every `resource_gates` entry, including conservative-bound
+entries, and verifies all six marker-listed lane manifests against the build
+report, certified reference trade/replay digests, and off/all verification report.
+A missing, changed, incomplete or failing artifact refuses the driver, Stage A
+and optimizer children before any study database or cache arrays are opened.
+
+Only the host may waive a failed benchmark gate. The gates record lists waiver
+hashes in `waivers: ["<sha256>"]`. Each selects
+`~/.orderflow-approvals/phase4/waiver-<sha256>.json`, with the same ownership,
+permissions, symlink and canonical content-addressing rules as approvals:
+
+```json
+{
+  "gate_path": "extrapolation.arms_under_3x",
+  "benchmark_sha256": "exact benchmark SHA256",
+  "plan_sha256": "frozen plan SHA256",
+  "campaign_sha256": "sealed campaign SHA256",
+  "created_utc": "2026-11-06T00:00:00Z",
+  "replacement_gate": {
+    "name": "host-approved replacement measurement",
+    "threshold_spec": {"metric": ["trial_seconds"], "operator": "<=", "value": 60},
+    "measured_artifact_path": "/absolute/path/to/measurement.json",
+    "measured_artifact_sha256": "measurement SHA256"
+  }
+}
+```
+
+`metric` is a nonempty list of JSON object keys; the measured value and threshold
+must be finite numbers. Supported comparisons are `<=`, `<`, `>=`, `>`, `==`.
+Waivers identify a full gate path, omitting the `resource_gates` container: for
+example `extrapolation.conservative_upper_bound.build_under_4h`. If the same gate
+name fails in multiple blocks, each path requires its own waiver. Legacy name-only,
+unknown, duplicate, stale or mismatched waivers, or failing replacement
+measurements, refuse admission. Code never creates waiver records. Gate thresholds
+and the benchmark artifact remain unchanged.
+
+Each campaign study arm may optionally contain positive finite
+`max_trial_seconds` and `max_study_seconds`. Omission leaves runtime enforcement
+disabled. Every Phase 4 trial records `phase4_wall_seconds`; study elapsed
+optimization time accumulates across resumes from monotonic loop measurements.
+A metadata heartbeat thread checkpoints `phase4_heartbeat_utc` and measured loop
+time at trial start, every 30 seconds of work, and trial exit. Failed checkpoints
+are retried on each later pulse. `phase4_heartbeat_health` records consecutive and
+total failures, the last error, and the longest gap between successful checkpoints.
+Transient failures that recover retain the trial as COMPLETE. The final checkpoint
+has three bounded attempts; exhaustion raises and stops the loop before any next
+trial, without writing a final `phase4_wall_seconds`.
+
+An independent watchdog uses a 90-second stale bound (three heartbeat intervals).
+It exits non-zero, after logging to stderr, before that bound expires if successful
+checkpoints cease, even if the checkpoint thread is blocked. The active trial stays
+RUNNING. When measured trial wall time exceeds `max_trial_seconds`, it persists a
+live `phase4_runtime_stop` with trial, measurement, limit and UTC time, then exits.
+A fatal path prevents Optuna from finishing the active row during stop persistence.
+Stop persistence has a bounded wait so storage trouble cannot disable termination.
+
+On admission, every non-COMPLETE trial with timing but no final wall time is charged
+**last heartbeat elapsed + the stale bound**, exactly once. This includes a FAIL
+caused by final-checkpoint exhaustion. `phase4_reconciled` records
+`accounting: "conservative_upper_bound"`, the charged seconds, bound and cumulative
+runtime boundary; the study audit and persisted runtime are repaired idempotently.
+The existing checkpoint credit is replaced by the bound, rather than charged twice.
+Resume downtime is excluded. This intentionally over-counts unfinished work by up
+to the stale bound. A legacy interrupted row without any timing record has no
+measured work to charge; its start-to-reconciliation duration is never used.
+
+`max_study_seconds` remains checked between trials; its worst overshoot is one
+live trial ceiling when configured. Post-trial checks remain active. Runtime
+stops block resume, candidate, holdout and report admission until the existing
+host-written runtime decision clears them. `phase4_runtime_policy` stores the
+interval, stale bound and accounting rule in the study; `phase4_report` emits them
+with reconciliation and preflight diagnostics.
+
+Every heartbeat samples RSS and private memory, recording `phase4_memory` peaks
+and the private-memory metric. RSS > 4 GiB, private > 4 GiB, or unavailable private
+measurement persists a live memory stop and terminates the process. Private memory
+is required in addition to RSS; clean mapped pages do not relax either bound.
+
+The driver and child both run the same system-memory preflight before a study;
+the child does so before study writes or bar/trade-cache opens. Each accepted
+study admission appends its report and UTC time to `phase4_memory_preflight`.
+The campaign log includes every command's preflight, including `status: refused`
+when a failed preflight prevents child launch. Execution is **sequential only**,
+with `--n-jobs 1` and one study process at a time, enforced by the shared execution
+lock. This supersedes the plan's <= 6 concurrent processes (owner decision
+2026-11-06). Historical benchmark fields are preserved; the benchmark was not
+rerun or rewritten for these conditions.
+
+`owner_approval_sha256` and `gates_sha256` retain their first values. Every
+subsequent study admission appends `{approval_sha256, gates_sha256, utc}` to
+`phase4_approvals`. Phase 4 sampler seeds count COMPLETE trials, excluding failed
+and reconciled attempts, so interrupted resumes reproduce the COMPLETE proposal
+sequence. Legacy sampler behavior is unchanged.
+
+Known cache-builder limitations, deferred to preserve the certified builder
+fingerprint: P4-RV-02's projected disk/wall early abort is not implemented;
+P4-RV-03's `build --bar-type` selector is currently ignored and build captures all
+six lanes. The build RSS limit is checked during capture, not during final
+write/hash; the observed transient peak was 3.83 GiB against the 4 GiB limit.
+
+
+### Fix round 4b: registering runtime limits and owner recovery
+
+Register optional limits before sealing the campaign. `ARM` is the full registered
+key `SYMBOL:BAR_TYPE:MODE`; only study arms accept limits (P2 is a deterministic
+candidate). Both flags are repeatable, require finite positive seconds, and reject
+duplicate/unknown arms. For example, registration arguments may include:
+
+```text
+--max-trial-seconds BTCUSDT:fixed_tick_imbalance:off=120
+--max-study-seconds BTCUSDT:fixed_tick_imbalance:off=24000
+```
+
+The sealed manifest and driver dry-run commands retain these limits; optimizer
+arguments must match the registered arm. An existing manifest cannot be silently
+registered with different limits. Omitted limits remain disabled.
+
+A stopped study can be cleared only by a host-written canonical, content-addressed
+`~/.orderflow-approvals/phase4/runtime-decision-<sha256>.json` record, with the same
+ownership, mode and symlink checks as other approval records:
+
+```json
+{
+  "plan_sha256": "frozen plan SHA256",
+  "study_identity_sha256": "optimize_orderflow.fingerprint(study identity)",
+  "stop_sha256": "optimize_orderflow.fingerprint(exact phase4_runtime_stop)",
+  "decision": "clear_and_restart_budget",
+  "created_utc": "2026-11-06T00:00:00Z"
+}
+```
+
+The two identity hashes use the existing `fingerprint()` JSON serialization;
+the filename hashes the record's canonical bytes. The code never creates a
+decision record. To apply a host decision:
+
+```bash
+python scripts/phase4_campaign.py clear-runtime-stop \
+  --study-db output/optimize/phase4/studies.db --study-name STUDY \
+  --runtime-decision SHA256
+```
+
+The command requires an existing stopped Phase 4 study with no pending trials and
+holds the exclusive execution/study/worker locks. It verifies the record before
+opening writable study storage, appends the full old stop, decision hash, decision,
+UTC timestamp and reset boundary to `phase4_runtime_decisions`, then clears the
+stop to JSON null. A partial application can be repaired with the identical record.
+
+`clear_and_restart_budget` explicitly acknowledges past overruns and starts a new
+runtime-limit window; it does not erase cumulative `phase4_runtime_seconds`,
+trials, limits or the audit. Subsequent overruns stop again. Missing, stale,
+tampered or mismatched decisions refuse. Campaign approval and benchmark gates
+still apply to every later run; this recovery command cannot waive them.
+
+
+### Fix round 5b: separate stage approvals and checkpoints
+
+A driver invocation executes exactly one stage and exits at its checkpoint.
+Preview the entire grouped plan, or just one stage, without execution:
+
+```bash
+python scripts/phase4_campaign.py driver --manifest output/phase4/campaign.json
+python scripts/phase4_campaign.py driver --manifest output/phase4/campaign.json --stage B
+```
+
+| Stage | Ordered commands | Preconditions |
+| --- | --- | --- |
+| A | One `ablation` child: 36 fixed-default replays across six bar types | No valid A checkpoint already exists |
+| B | Two B0 studies, then two registered B0 freeze children | Valid A checkpoint for this campaign |
+| C | Six feature studies, then two P2 deterministic optimizer commands | Valid B checkpoint and both frozen B0 sources re-verified before any child starts |
+
+P2 uses the existing optimizer's deterministic candidate path; it writes immutable
+candidate artifacts and creates no P2 Optuna study. The registered freeze children
+select B0 by campaign/bar type, enforce the exact COMPLETE budget with no pending
+trials/runtime stop, write frozen params and re-verify the stored search replay.
+Stage C checks the checkpoint chain, all frozen-file hashes, live completed B0
+specs/params/budgets and both replay digests before launching any C child.
+
+After reviewing a stage's dry-run, the host writes a fresh argv-bound campaign
+approval for that driver command and the existing per-child approval records.
+For example, the stage-A driver record authorizes the exact invocation:
+
+```bash
+python scripts/phase4_campaign.py driver --manifest output/phase4/campaign.json \
+  --execute --stage A --owner-approved SHA256 \
+  --driver output/phase4/run_scripts/driver.py --inspected-driver DRIVER_SHA256
+```
+
+Review A's checkpoint before requesting the independent B approval, and B's
+checkpoint before C. The stage flag is part of the approved driver argv; A's
+approval cannot authorize B or C. Missing child approval is an error, rather than
+the mechanism that separates stages. Execution remains sequential with one study
+process and `--n-jobs 1`; all prior gates and strict RSS/private preflights remain.
+
+Successful checkpoints are atomically published at
+`output/phase4/checkpoints/<campaign_sha256>/stage-A.json` (similarly B/C).
+They bind campaign, stage, parent/child approval hashes, gates, source state,
+protected hashes before/after, every command's status/preflight/wall/RSS/private
+measurement, output artifacts with SHA256, study counts and any runtime stops.
+Every checkpoint states `next_stage_requires_owner_approval: true`. The campaign
+log seals its SHA256, and a content-addressed copy retains the record. Per-study
+summary artifacts are immutable; the live campaign database can continue growing
+in C without invalidating B's checkpoint. P2 artifacts and frozen files are also
+bound by hash.
+
+Child failure (including any non-zero exit), a runtime or memory stop, gate
+recheck failure, or source/protected change produces `stage-X.stopped.json`
+instead of a completed checkpoint. Stopped attempts and log entries are retained.
+A partial stage requires a new driver approval to retry; the existing exact-budget
+logic resumes/skips completed studies without duplicates. A `stage_started` log
+entry enforces fresh approval even if the driver was killed before it could write
+a stopped record. A stage with a valid complete checkpoint refuses to run again.
+
+The owner accepted the round-5 storage-outage termination priority with this
+additional safeguard: reconciliation reconstructs a missing live stop before any
+new trial if the conservatively charged wall time exceeds the arm's trial ceiling,
+or the last durable heartbeat health contains a memory breach. It persists
+`phase4_runtime_stop` with `live: false` and `reconciled: true`, blocking admission
+until the same host-written runtime-decision mechanism clears it. Historical
+reconciled trials acknowledged by an existing clear decision are not blocked
+again. No approval/decision records are created by the code.

@@ -221,6 +221,8 @@ def approval_record(monkeypatch,scope='campaign',campaign='c'*64,argv=None,chang
 
 def test_b4_valid_bound_record_and_host_gates(monkeypatch):
     approvals,record,digest=approval_record(monkeypatch)
+    # Artifact validation is exercised with complete synthetic evidence in round 4.
+    monkeypatch.setattr(approvals,'verify_campaign_artifacts',lambda *a:None)
     gates={key:record[key] for key in ('plan_sha256','campaign_sha256','base_commit','source_state','created_utc')}
     gates.update({key:'pass' for key in approvals.GATES})
     gatefile=approvals.approval_root()/('gates-'+record['campaign_sha256']+'.json')

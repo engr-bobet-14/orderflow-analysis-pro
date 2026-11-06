@@ -23,6 +23,19 @@ pytestmark = [pytest.mark.real_data,pytest.mark.skipif(not (Path(TradeFlowConfig
 ALL = 'absorption_levels,exhaustion_bonus,framing_trades'
 
 
+@pytest.mark.parametrize('bar_type', sorted(tfc.PRODUCTION_LANES))
+def test_certified_production_builder_fingerprint_and_open(bar_type):
+    """Read the certified generation only; never rebuild or rewrite its evidence."""
+    root=ROOT/'output/optimize/trade_cache'/DATASET
+    generation=tfc.production_generation(root)
+    lane=Path(generation['lanes'][bar_type])
+    manifest=json.loads((lane/'manifest.json').read_bytes())
+    assert tfc.builder_fingerprint()==manifest['builder_fp']
+    cache=tfc.CachedTradeUpdates(lane,production=True,dataset_id=DATASET,bar_type=bar_type)
+    assert len(cache)==manifest['n_bars']
+    assert cache.identity['builder_fp']==tfc.builder_fingerprint()
+
+
 @pytest.mark.parametrize('start,end', [('2021-05-19','2021-05-20'),('2019-09-11','2019-09-12'),
                                       ('2023-10-16','2023-10-17'),('2023-12-30','2024-01-01')])
 def test_bounded_real_cache_and_live(start,end):

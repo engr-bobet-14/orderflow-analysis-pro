@@ -125,12 +125,17 @@ def report_snapshots(campaign,campaign_hash,study_db,outdir=None):
         raise ValueError('Phase 4 snapshots must be under output/phase4/reports/snapshots')
     with opt._readonly_db(source) as con:
         admitted={}
-        recovery={}
+        recovery={};runtime={}
         for sid,name,raw in con.execute('SELECT s.study_id,s.study_name,a.value_json FROM studies s '
                 "JOIN study_user_attributes a ON a.study_id=s.study_id AND a.key='identity'"):
             identity=json.loads(raw)
             if identity.get('campaign_sha256')!=campaign_hash:
                 continue
+            attrs={key:json.loads(value) for key,value in con.execute('SELECT key,value_json FROM study_user_attributes WHERE study_id=?',(sid,))}
+            runtime[name]=runtime_diagnostics(attrs)
+            stop=con.execute("SELECT value_json FROM study_user_attributes WHERE study_id=? AND key='phase4_runtime_stop'",(sid,)).fetchone()
+            if stop and json.loads(stop[0]) is not None:
+                raise ValueError('Phase 4 runtime stop requires owner decision before report admission')
             arm=p4.study_arm(identity,name)
             if arm in admitted or arm not in campaign['arms'] or campaign['arms'][arm].get('kind','study')!='study':
                 raise ValueError('duplicate or unregistered campaign study arm')
@@ -156,7 +161,13 @@ def report_snapshots(campaign,campaign_hash,study_db,outdir=None):
             else:
                 path.rename(final)
     return [*legacy,{'path':str(final),'sha256':digest,'source_path':str(source),'campaign_sha256':campaign_hash,
-                     'trial_recovery':recovery}]
+                     'trial_recovery':recovery,'runtime_diagnostics':runtime}]
+
+
+def runtime_diagnostics(attrs):
+    return {'policy':attrs.get('phase4_runtime_policy'),'runtime_seconds':attrs.get('phase4_runtime_seconds'),
+            'memory_preflight':attrs.get('phase4_memory_preflight',[]),
+            'reconciliation':attrs.get('phase4_reconciliation_audit',[])}
 
 
 def _gross_days(trades, days):
@@ -396,7 +407,8 @@ def main(argv=None):
             cli.baseline_study = artifact['source_b0']['source_study']
         if not cli.baseline_study:
             raise ValueError('--baseline-study is required for a study report')
-        identity = opt.read_study_attrs(cli.study_db,cli.study_name or cli.baseline_study)['identity']
+        study_attrs=opt.read_study_attrs(cli.study_db,cli.study_name or cli.baseline_study)
+        identity = study_attrs['identity']
         if identity.get('phase')!='phase4' or identity['strategy_fp']!=opt.STRATEGY_FP:
             raise ValueError('report requires current Phase 4 identity')
         if identity.get('campaign_sha256') != campaign_hash or (artifact and artifact['campaign_sha256'] != campaign_hash):
@@ -445,6 +457,7 @@ def main(argv=None):
             result = build_study_report(args,bars,trials,baseline,baseline_args,snapshots,identity['search_space'])
         out.mkdir(parents=True,exist_ok=True)
         result['database_snapshots']=snapshots
+        result['runtime_diagnostics']=runtime_diagnostics(study_attrs)
         opt.atomic_json(out/(opt.fingerprint(reservation)+'.json'),result)
         return result
     except (ValueError, OSError) as exc:

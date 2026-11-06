@@ -151,9 +151,11 @@ def test_no_worker_budget_overshoot(monkeypatch):
     # No real trial/storage: admission counts COMPLETE only and stops exactly at the budget.
     from types import SimpleNamespace
     a = SimpleNamespace(n_trials=3,seed=42,n_jobs=1,phase4=True)
-    study = SimpleNamespace(trials=[SimpleNamespace(state='FAIL')])
+    row=lambda state:SimpleNamespace(state=state,datetime_start=None,datetime_complete=None)
+    study = SimpleNamespace(trials=[row('FAIL')],user_attrs={})
+    study.set_user_attr=lambda key,value:study.user_attrs.__setitem__(key,value)
     monkeypatch.setattr(opt,'complete_trials',lambda s:[t for t in s.trials if t.state=='COMPLETE'])
-    study.optimize = lambda objective,n_trials:study.trials.append(SimpleNamespace(state='COMPLETE'))
+    study.optimize = lambda objective,n_trials:study.trials.append(row('COMPLETE'))
     opt.optimize_loop(study,None,None,a)
     assert len(study.trials)==4 and len(opt.complete_trials(study))==3
 

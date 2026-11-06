@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from datetime import date
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +45,8 @@ def mode_for(signals):
 
 def is_phase4(args):
     return bool(getattr(args, 'phase4', False) or getattr(args, 'trade_signals', 'off') != 'off'
-        or any(getattr(args, k, None) for k in ('trade_cache', 'freeze_params', 'holdout_look', 'campaign_manifest'))
+        or any(getattr(args, k, None) for k in ('trade_cache', 'freeze_params', 'holdout_look', 'campaign_manifest',
+                                              'max_trial_seconds','max_study_seconds'))
         or any(Path(getattr(args, k)).expanduser().resolve().is_relative_to(ROOT/'output/optimize/phase4')
                for k in ('study_db', 'output', 'cache_dir')))
 
@@ -83,8 +85,6 @@ def configure(args):
         verified=require_gates(args.owner_approved,args.campaign_identity)
         args.approval_sha256=verified['sha256']
         args.gates_sha256=verified['gates_sha256']
-        from scripts.phase4_resources import require_memory_plan
-        require_memory_plan([{'mapped_files':{}}])
     if args.holdout_look and (len(args.bar_type) != 1 or len(args.symbol) != 1):
         raise ValueError('holdout-look requires one symbol and bar type')
 
@@ -136,6 +136,8 @@ def attach_cache(args, bars):
     args.memory_admission=require_memory_plan([{'mapped_files':mapped_cache_files(path)}])
     args.trade_cache_orphans=generation['orphans']
     cache = CachedTradeUpdates(path, bars, production=True, bar_type=args.bar_type,dataset_id=expected)
+    from scripts.phase4_resources import enforce_current
+    enforce_current(args.memory_admission['unique_mapped_bytes'])
     args.trade_updates = cache
     args.trade_cache_identity = cache.identity
 
@@ -159,7 +161,15 @@ def read_campaign(path):
     campaign = json.loads(raw)
     if campaign.get('phase') != 'phase4':
         raise ValueError('not a Phase 4 campaign')
+    sequential_campaign(campaign)
     return campaign, expected
+
+
+def sequential_campaign(campaign):
+    for settings in (campaign,*campaign.get('arms',{}).values()):
+        for key in ('concurrency','n_jobs'):
+            if key in settings and (type(settings[key]) is not int or settings[key]!=1):
+                raise ValueError(f'Phase 4 sequential execution requires {key} == 1')
 
 
 def arm_key(args):
@@ -174,6 +184,13 @@ def campaign_arm(args,study_name=None,*,under_init_lock=False):
     if 'phase4_db' in campaign and Path(args.study_db).resolve()!=Path(campaign['phase4_db']).resolve():
         raise ValueError('study database differs from the registered campaign database')
     arm = campaign['arms'][key]
+    for name in ('max_trial_seconds','max_study_seconds'):
+        value=arm.get(name)
+        if value is not None and (type(value) not in (int,float) or not math.isfinite(value) or value<=0):
+            raise ValueError(f'campaign {name} must be finite and positive')
+        if getattr(args,name,None) is not None and getattr(args,name)!=value:
+            raise ValueError(f'campaign runtime limit mismatch: {name}')
+        setattr(args,name,value)
     for name in ('seed', 'fee_bps', 'slippage_bps', 'min_total_trades', 'min_trades_per_fold',
                  'n_splits', 'embargo', 'holdout_fraction'):
         if getattr(args, name) != campaign[name]:
@@ -258,6 +275,8 @@ def completed_candidate(db, study_name, number, budget):
     identity = attrs.get('identity')
     if not identity or identity.get('phase') != 'phase4':
         raise ValueError('candidate must come from a Phase 4 study')
+    if attrs.get('phase4_runtime_stop') is not None:
+        raise ValueError('Phase 4 runtime stop requires owner decision before candidate admission')
     trials = opt.read_study_trials(db, study_name)
     complete = [t for t in trials if t['state'] == 'COMPLETE']
     if len(complete) != budget or any(t['state'] in ('RUNNING', 'WAITING') for t in trials):
