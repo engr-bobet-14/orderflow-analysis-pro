@@ -143,6 +143,7 @@ def preflight(manifest, protected_paths):
 def freeze_baseline(db, study_name, budget, output):
     from scripts import optimize_orderflow as opt
     from scripts.phase4_studies import completed_candidate
+    opt.phase4_db_admission(db,study_name)
     trials = [t for t in opt.read_study_trials(db,study_name) if t['state']=='COMPLETE' and t['feasible']]
     if not trials:
         raise ValueError('no feasible trial')
@@ -170,12 +171,16 @@ def clear_runtime_stop(db,study_name,selector):
     workers=checked_write(str(lock)+'.workers')
     with opt.phase4_execution(True),opt.file_lock(lock,nonblocking=True),opt.file_lock(workers,nonblocking=True):
         attrs=opt.read_study_attrs(db,study_name);identity=attrs.get('identity');stop=attrs.get('phase4_runtime_stop')
+        if identity and identity.get('phase')=='phase4' and (attrs.get('phase4_accounting_pending') or attrs.get('phase4_memory_check_pending')):
+            study=optuna.load_study(storage='sqlite:///'+str(db),study_name=study_name)
+            opt.resolve_phase4_pending(study)
+            attrs=study.user_attrs;stop=attrs.get('phase4_runtime_stop')
         if not identity or identity.get('phase')!='phase4' or not stop:
             raise ValueError('runtime decision requires a stopped Phase 4 study')
         verified=verify_runtime_decision(selector,identity,stop)
-        trials=opt.read_study_trials(db,study_name)
-        if any(t['state'] in ('RUNNING','WAITING') for t in trials):raise ValueError('cannot clear runtime stop with pending trials')
         study=optuna.load_study(storage='sqlite:///'+str(db),study_name=study_name)
+        opt.reconcile_phase4_trials(study,SimpleNamespace(phase4=True))
+        trials=opt.read_study_trials(db,study_name)
         audit=list(attrs.get('phase4_runtime_decisions',[]))
         if audit and audit[-1]['decision_sha256']==selector:
             entry=audit[-1]  # Repair interruption after audit persistence, before clearing.
@@ -357,6 +362,7 @@ def freeze_registered(path,bt,output,owner_approved):
         preflight(manifest,())
         command_memory_plan(['--trade-signals','off'],strict=True)
         name,_=campaign_study(manifest,digest,'BTCUSDT:'+bt+':off')
+        opt.phase4_db_admission(manifest['phase4_db'],name)
         budget=manifest['arms']['BTCUSDT:'+bt+':off']['budget']
         with opt._shared_lock_readonly(opt.study_lock_path(manifest['phase4_db'],name)):
             freeze_baseline(manifest['phase4_db'],name,budget,expected)
@@ -496,13 +502,13 @@ def run_driver(path, *, owner_approved=None, inspected_driver=None, driver=None,
         if checkpoint_path(digest,stage).exists():
             validate_checkpoint(manifest,digest,stage,before,path)
             raise ValueError('stage already has a valid checkpoint')
-        stopped=checkpoint_path(digest,stage,True)
-        if stopped.exists() and json.loads(stopped.read_bytes())['owner_approval_sha256']==owner_approved:
-            raise ValueError('interrupted stage requires a new owner approval')
         events=[json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-        starts=[e for e in events if e.get('status')=='stage_started' and e.get('campaign_sha256')==digest and e.get('stage')==stage]
-        if starts and starts[-1]['owner_approval_sha256']==owner_approved:
-            raise ValueError('interrupted stage requires a new owner approval')
+        checkpoints=[json.loads(p.read_bytes()) for p in
+                     [*lock.parent.glob('stage-*.json'),*(lock.parent/'records').glob('*.json')]]
+        if any(e.get('campaign_sha256')==digest and e.get('owner_approval_sha256')==owner_approved
+               and e.get('status') in ('stage_started','stage_stopped','stage_complete','stopped','complete')
+               for e in [*events,*checkpoints]):
+            raise ValueError('stage approval already used; a new owner approval is required')
         append_log(log,{'status':'stage_started','stage':stage,'campaign_sha256':digest,
                         'owner_approval_sha256':verified['sha256'],'gates_sha256':verified['gates_sha256']})
         rows=[];artifacts=[];runtime_stops=[];prerequisite=None

@@ -67,10 +67,17 @@ def memory_bounds(sample,mapped_bytes=0):
             'private_measurement_available':private is not None}
 
 
+class MemoryBoundsError(ValueError):
+    def __init__(self,sample,bounds):
+        self.measurement=sample
+        self.bounds=bounds
+        super().__init__(f'Phase 4 process memory bounds exceeded or unavailable: {bounds}')
+
+
 def enforce_memory(sample,mapped_bytes=0):
     result=memory_bounds(sample,mapped_bytes)
     if not result['pass']:
-        raise ValueError(f'Phase 4 process memory bounds exceeded or unavailable: {result}')
+        raise MemoryBoundsError(sample,result)
     return result
 
 
@@ -78,7 +85,7 @@ def current_memory():
     import resource
     result=process_memory()
     peak=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    result['peak_rss_bytes']=int(peak if sys.platform=='darwin' else peak*1024)
+    result['peak_rss_bytes']=max(result['rss_bytes'],int(peak if sys.platform=='darwin' else peak*1024))
     return result
 
 

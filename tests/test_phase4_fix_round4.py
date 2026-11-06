@@ -32,6 +32,7 @@ def bound_gate(tmp_path,monkeypatch):
     import pwd
     monkeypatch.setattr(pwd,'getpwuid',lambda uid:SimpleNamespace(pw_dir=str(tmp_path/'home')))
     monkeypatch.setattr(approvals,'ROOT',tmp_path)
+    for module in (campaign,policy,opt,p4):monkeypatch.setattr(module,'ROOT',tmp_path)
     _,record,selector=approval_record(monkeypatch)
     generation=tmp_path/'output/optimize/trade_cache/20261103T011635Z-d3a7b9603b37'
     refs={'full_off':{'lanes':{}},'full_all':{'lanes':{}}};marker={'manifests':{}};lanes={};paths={};verify={}
@@ -80,6 +81,7 @@ def test_r4_1_failed_speed_gate_before_any_open(bound_gate,monkeypatch,entry):
     if entry=='require':call=b.admit
     elif entry=='driver':
         driver=b.artifacts['benchmark']
+        assert campaign.ROOT==policy.ROOT==driver.parents[3], 'campaign tests must use a temporary checkpoint root'
         call=lambda:campaign.run_driver('unit',stage='A',owner_approved=b.selector,driver=driver,inspected_driver=hashlib.sha256(driver.read_bytes()).hexdigest(),dry_run=False)
     elif entry=='ablation':call=lambda:campaign.ablation(b.selector,'unit')
     else:

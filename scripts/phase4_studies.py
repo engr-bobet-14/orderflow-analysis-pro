@@ -271,7 +271,7 @@ def trial_recovery(trials):
 
 def completed_candidate(db, study_name, number, budget):
     from scripts import optimize_orderflow as opt
-    attrs = opt.read_study_attrs(db, study_name)
+    attrs = opt.phase4_db_admission(db,study_name)
     identity = attrs.get('identity')
     if not identity or identity.get('phase') != 'phase4':
         raise ValueError('candidate must come from a Phase 4 study')
@@ -388,6 +388,10 @@ def read_candidate(digest):
 
 def holdout_look(args, bars):
     from scripts import optimize_orderflow as opt
+    if args.holdout_look.startswith('candidate:'):
+        source=read_freeze_spec(args)
+        opt.phase4_db_admission(source['study_db'],source['study'])
+    else:opt.phase4_db_admission(args.study_db,args.holdout_look.rsplit(':',1)[0])
     arm = campaign_arm(args)
     candidate_ref = args.holdout_look
     if candidate_ref.startswith('candidate:'):

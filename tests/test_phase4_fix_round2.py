@@ -178,6 +178,7 @@ def test_rev05_campaign_seal_precedes_manifest_and_half_seal_errors(tmp_path,mon
 
 
 def test_rev05_empty_freeze_and_missing_source_identity(monkeypatch,tmp_path):
+    monkeypatch.setattr(opt,'read_study_attrs',lambda *a:{})
     monkeypatch.setattr(opt,'read_study_trials',lambda *a:[])
     with pytest.raises(ValueError,match='^no feasible trial$'):
         campaign.freeze_baseline(tmp_path/'db','B0',200,tmp_path/'out')

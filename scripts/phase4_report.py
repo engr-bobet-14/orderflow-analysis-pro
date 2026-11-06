@@ -1,4 +1,4 @@
-"""Read-only Phase 4 diagnostics and pre-registered gross-edge gates."""
+"""Phase 4 marker admission repair, read-only diagnostics and pre-registered gross-edge gates."""
 from __future__ import annotations
 
 import argparse
@@ -114,6 +114,9 @@ def report_snapshots(campaign,campaign_hash,study_db,outdir=None):
     source=policy.phase4_db_path(study_db)
     if source!=policy.phase4_db_path(campaign['phase4_db']):
         raise ValueError('snapshot source differs from the registered Phase 4 DB')
+    for name in opt.list_study_names(source):
+        if opt.read_study_attrs(source,name).get('identity',{}).get('campaign_sha256')==campaign_hash:
+            opt.phase4_db_admission(source,name)
     if len({Path(item['path']).resolve() for item in legacy})!=3 or any(Path(item['path']).resolve()==source for item in legacy):
         raise ValueError('legacy snapshot paths must be three distinct sources')
     for item in legacy:
@@ -132,6 +135,8 @@ def report_snapshots(campaign,campaign_hash,study_db,outdir=None):
             if identity.get('campaign_sha256')!=campaign_hash:
                 continue
             attrs={key:json.loads(value) for key,value in con.execute('SELECT key,value_json FROM study_user_attributes WHERE study_id=?',(sid,))}
+            if attrs.get('phase4_accounting_pending') or attrs.get('phase4_memory_check_pending'):
+                raise ValueError('Phase 4 unresolved markers; retry report admission')
             runtime[name]=runtime_diagnostics(attrs)
             stop=con.execute("SELECT value_json FROM study_user_attributes WHERE study_id=? AND key='phase4_runtime_stop'",(sid,)).fetchone()
             if stop and json.loads(stop[0]) is not None:
@@ -460,7 +465,7 @@ def main(argv=None):
         result['runtime_diagnostics']=runtime_diagnostics(study_attrs)
         opt.atomic_json(out/(opt.fingerprint(reservation)+'.json'),result)
         return result
-    except (ValueError, OSError) as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         parser.error(str(exc))
 
 

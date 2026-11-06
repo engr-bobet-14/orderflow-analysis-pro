@@ -543,6 +543,9 @@ Each campaign study arm may optionally contain positive finite
 `max_trial_seconds` and `max_study_seconds`. Omission leaves runtime enforcement
 disabled. Every Phase 4 trial records `phase4_wall_seconds`; study elapsed
 optimization time accumulates across resumes from monotonic loop measurements.
+The study's `phase4_terminal_wall_seconds` map records each trial's monotonic
+duration through its durable terminal commit. This duration governs the trial
+ceiling before the accounting marker is cleared.
 A metadata heartbeat thread checkpoints `phase4_heartbeat_utc` and measured loop
 time at trial start, every 30 seconds of work, and trial exit. Failed checkpoints
 are retried on each later pulse. `phase4_heartbeat_health` records consecutive and
@@ -559,15 +562,23 @@ live `phase4_runtime_stop` with trial, measurement, limit and UTC time, then exi
 A fatal path prevents Optuna from finishing the active row during stop persistence.
 Stop persistence has a bounded wait so storage trouble cannot disable termination.
 
-On admission, every non-COMPLETE trial with timing but no final wall time is charged
-**last heartbeat elapsed + the stale bound**, exactly once. This includes a FAIL
-caused by final-checkpoint exhaustion. `phase4_reconciled` records
+On admission, every orphan RUNNING/WAITING row and unfinished FAIL with timing is
+charged **max(heartbeat elapsed, recorded wall) + the stale bound**, exactly once.
+This includes pending rows with a final wall marker and FAIL rows caused by
+final-checkpoint exhaustion. `phase4_reconciled` records
 `accounting: "conservative_upper_bound"`, the charged seconds, bound and cumulative
 runtime boundary; the study audit and persisted runtime are repaired idempotently.
 The existing checkpoint credit is replaced by the bound, rather than charged twice.
 Resume downtime is excluded. This intentionally over-counts unfinished work by up
-to the stale bound. A legacy interrupted row without any timing record has no
-measured work to charge; its start-to-reconciliation duration is never used.
+to the stale bound. A pending row without timing evidence has zero measured
+elapsed work but still receives the stale bound; its start-to-reconciliation
+duration is never used.
+
+The independent watchdog remains active through Optuna's terminal-state commit
+and the following runtime update; returning from the objective or writing
+`phase4_wall_seconds` does not release it. A stalled or failed terminal write leaves
+the row RUNNING for reconciliation. Reconciliation applies both trial and study
+ceilings before another trial starts.
 
 `max_study_seconds` remains checked between trials; its worst overshoot is one
 live trial ceiling when configured. Post-trial checks remain active. Runtime
@@ -644,11 +655,17 @@ python scripts/phase4_campaign.py clear-runtime-stop \
   --runtime-decision SHA256
 ```
 
-The command requires an existing stopped Phase 4 study with no pending trials and
-holds the exclusive execution/study/worker locks. It verifies the record before
-opening writable study storage, appends the full old stop, decision hash, decision,
-UTC timestamp and reset boundary to `phase4_runtime_decisions`, then clears the
-stop to JSON null. A partial application can be repaired with the identical record.
+The command requires an existing stopped Phase 4 study and holds the exclusive
+execution/study/worker locks. If a marker is pending, it first repairs the study
+and the stop may change; the host must re-read the stop and re-sign the decision
+to bind the repaired stop. With no pending marker, it verifies the record before
+opening writable study storage, reconciles orphan RUNNING/WAITING rows to FAIL
+with the usual conservative
+runtime accounting and audit, then appends the full old stop, decision hash,
+decision, UTC timestamp and reset boundary to `phase4_runtime_decisions` and clears
+the stop to JSON null. No preliminary optimizer invocation is needed after a live
+memory or runtime stop. An invalid record leaves trial rows and the stop unchanged.
+A partial application can be repaired with the identical record.
 
 `clear_and_restart_budget` explicitly acknowledges past overruns and starts a new
 runtime-limit window; it does not erase cumulative `phase4_runtime_seconds`,
@@ -712,14 +729,55 @@ recheck failure, or source/protected change produces `stage-X.stopped.json`
 instead of a completed checkpoint. Stopped attempts and log entries are retained.
 A partial stage requires a new driver approval to retry; the existing exact-budget
 logic resumes/skips completed studies without duplicates. A `stage_started` log
+reserves that selector for one attempt across all stages of the campaign; every
+prior start and stopped/complete checkpoint record counts, including archives.
+The same selector cannot be reused after intervening approvals. A `stage_started`
 entry enforces fresh approval even if the driver was killed before it could write
 a stopped record. A stage with a valid complete checkpoint refuses to run again.
 
 The owner accepted the round-5 storage-outage termination priority with this
 additional safeguard: reconciliation reconstructs a missing live stop before any
 new trial if the conservatively charged wall time exceeds the arm's trial ceiling,
-or the last durable heartbeat health contains a memory breach. It persists
+or the last durable heartbeat health contains a memory breach, including at the
+first checkpoint before any timing record exists. Checkpoints enforce peak RSS
+(`ru_maxrss`) and lifetime peak private memory, recording both in `phase4_memory`.
+Memory-bound violations and measurement exceptions from `current_memory` or
+`process_memory` during post-trial or result-generation checks persist a memory
+stop before being re-raised. Result stops carry `phase: "result"`; unavailable
+measurements include the error text. A completed trial budget cannot bypass a
+persisted stop on retry. An earlier stop retains its reason, limits and timestamp;
+later memory evidence is attached as `memory_breach`. Reconciliation persists
 `phase4_runtime_stop` with `live: false` and `reconciled: true`, blocking admission
 until the same host-written runtime-decision mechanism clears it. Historical
 reconciled trials acknowledged by an existing clear decision are not blocked
 again. No approval/decision records are created by the code.
+
+### Fix round 5e: write-ahead evidence
+
+Phase 4 writes `phase4_accounting_pending` on the study before any terminal-state
+commit. It binds the trial, start/heartbeat times, measured wall so far, cumulative
+runtime before the trial, stale bound and registered runtime limits. The marker is
+cleared only after terminal durability, cumulative runtime and applicable stops
+are recorded. Recovery charges `max(recorded wall, heartbeat elapsed) + stale
+bound` once even if the trial is already COMPLETE. The durable study audit shares
+the existing conservative accounting records; COMPLETE trial rows are unchanged.
+
+Post-trial and result checks write `phase4_memory_check_pending` with phase, trial
+and UTC before measuring. They clear it only after a successful check or a durable
+memory stop. An interrupted check, including a failed stop write, becomes a
+blocking `memory` stop with `unresolved_check: true`, requiring the host runtime
+decision even when memory is normal on retry. A pending marker is never replaced
+by the next check. Failure to write a marker prevents the measurement or terminal
+commit entirely.
+
+Study opening, optimizer start, reconciliation, result/candidate/report admission,
+holdout looks and stage freezes resolve pending markers before accepting work.
+Ordinary reads remain read-only; marker repair writes only to the live Phase 4
+database under exclusive study/worker locks. Runtime-stop clearing resolves markers
+first too: the host decision must identify the resulting stop. The existing
+ownership, hash and authorization checks still apply.
+
+If the database itself is unwritable, the step is refused and the process exits
+non-zero. The driver records the stage stopped, and retry requires a new owner
+stage approval. This is the residual storage boundary; the code does not create
+approval or decision records.
