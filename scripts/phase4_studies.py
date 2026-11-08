@@ -549,10 +549,11 @@ class SearchPrefix:
         self.trade_cache_identity = getattr(updates, 'identity', None)
 
     @classmethod
-    def open(cls, bars_path, bar_type, trade_path, args, **cache_options):
+    def open(cls, bars_path, bars_type, trade_path, args, **cache_options):
+        # bars_type, not bar_type: production callers pass bar_type= as a cache identity option.
         from scripts.optimize_orderflow import CachedBars, split_timeline
         from scripts.trade_feature_cache import CachedTradeUpdates
-        bars = CachedBars(bars_path, bar_type)
+        bars = CachedBars(bars_path, bars_type)
         # Frozen constructor hashes all bytes and validates the full-length bars.
         updates = CachedTradeUpdates(trade_path, bars, **cache_options)
         n_search, _ = split_timeline(bars, args)
