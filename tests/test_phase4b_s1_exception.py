@@ -37,13 +37,14 @@ def proof_content(role, **changes):
     if role == 'unit':
         value = {'role': 'unit', 'argv': ['python', *proof.proof_argv('unit')[1:]],
                  'passed': 1747, 'failed': 0, 'errors': 0, 'skipped': 0, 'require_host': True,
-                 'summary': '1747 passed'}
+                 'returncode': 0, 'collected_count': 1747, 'summary': '1747 passed, 29 deselected in 2s'}
     elif role == 'real_data':
         collected = [f'tests/test_x.py::t{i}' for i in range(proof.EXPECTED_COLLECTED)]
         value = {'role': 'real_data', 'argv': ['python', '-m', 'pytest', '-q', *proof.real_data_selection()],
                  'collected': collected, 'horizon_utc': proof.HORIZON_UTC,
                  'amendment_sha256': hashlib.sha256(b'amendment A1').hexdigest(),
-                 'passed': proof.EXPECTED_COLLECTED, 'failed': 0, 'errors': 0, 'skipped': 0, 'summary': 'ok'}
+                 'passed': proof.EXPECTED_COLLECTED, 'failed': 0, 'errors': 0, 'skipped': 0, 'returncode': 0,
+                 'summary': f'{proof.EXPECTED_COLLECTED} passed, 1801 deselected in 9s'}
     else:
         return role.encode()
     value.update(changes)
@@ -216,7 +217,23 @@ def test_a2_exception_requires_stage_s1_explicitly(tmp_path):
     ('unit', {'skipped': None}, 'skipped'),
     ('unit', {'require_host': False}, 'PHASE4B_REQUIRE_HOST'),
     ('unit', {'require_host': 'true'}, 'PHASE4B_REQUIRE_HOST'),
-    ('unit', {'require_host': None}, 'PHASE4B_REQUIRE_HOST')])
+    ('unit', {'require_host': None}, 'PHASE4B_REQUIRE_HOST'),
+    # A1b: successful exit, every collected test passed, and well-formed integer results.
+    ('unit', {'returncode': 1}, 'exit'),
+    ('unit', {'returncode': None}, 'malformed'),
+    ('unit', {'returncode': False}, 'malformed'),
+    ('unit', {'passed': 1746, 'summary': '1746 passed in 2s'}, 'every collected'),
+    ('unit', {'collected_count': 0, 'passed': 0, 'summary': '0 passed'}, 'every collected'),
+    ('unit', {'collected_count': '1747'}, 'malformed'),
+    ('unit', {'passed': 1747.0}, 'malformed'),
+    ('unit', {'skipped': False}, 'malformed'),
+    ('unit', {'skipped': 0.0}, 'malformed'),
+    ('unit', {'failed': '0'}, 'malformed'),
+    ('unit', {'summary': 'Interrupted: 1 error during collection'}, 'summary'),
+    ('unit', {'summary': None}, 'summary'),
+    ('real_data', {'returncode': 2}, 'exit'),
+    ('real_data', {'returncode': None}, 'malformed'),
+    ('real_data', {'summary': 'no tests ran'}, 'summary')])
 def test_a1_gates_check_proof_artifact_content(tmp_path, role, changes, match):
     layout = layout_for(tmp_path, 'phase4b')
     roles = ('unit', 'digests', 'protected', 'real_data', 'inspection')
@@ -224,6 +241,28 @@ def test_a1_gates_check_proof_artifact_content(tmp_path, role, changes, match):
     write_gates(layout, 'pass', artifacts)
     with pytest.raises(ValueError, match=match):
         approvals.verify_phase4b_gates(layout, CAMPAIGN, 'S2t')
+
+
+@pytest.mark.parametrize('role,missing', [('unit', 'returncode'), ('unit', 'collected_count'), ('unit', 'passed'),
+                                          ('unit', 'summary'), ('real_data', 'returncode')])
+def test_a1b_missing_results_are_refused(tmp_path, role, missing):
+    layout = layout_for(tmp_path, 'phase4b')
+    value = json.loads(proof_content(role))
+    del value[missing]
+    roles = ('unit', 'digests', 'protected', 'real_data', 'inspection')
+    artifacts = [artifact(tmp_path, r, json.dumps(value).encode() if r == role else None) for r in roles]
+    write_gates(layout, 'pass', artifacts)
+    with pytest.raises(ValueError, match='malformed|summary'):
+        approvals.verify_phase4b_gates(layout, CAMPAIGN, 'S2t')
+
+
+def test_a1b_failed_unit_exit_is_refused_on_the_a2_s1_exception_path(tmp_path):
+    layout = layout_for(tmp_path, 'phase4b-s1')
+    base, interim, owner = exception_gates(tmp_path, layout)
+    base[0] = artifact(tmp_path, 'unit', proof_content('unit', returncode=1))
+    write_gates(layout, approvals.S1_EXCEPTION_R, [*base, interim, owner])
+    with pytest.raises(ValueError, match='exit'):
+        approvals.verify_phase4b_gates(layout, CAMPAIGN, 'S1')
 
 
 @pytest.mark.parametrize('missing', ['skipped', 'require_host'])

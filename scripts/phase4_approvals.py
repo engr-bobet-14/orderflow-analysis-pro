@@ -430,6 +430,19 @@ def _utc(value, what):
         raise ValueError(what+' created_utc must be an ISO UTC timestamp') from exc
 
 
+def _a1b_results(record,label,collected):
+    """A1b: well-formed integer results, test-process exit 0, every collected test passed, summary agrees."""
+    bad=[k for k in ('returncode','passed','failed','errors','skipped') if type(record.get(k)) is not int]
+    if type(collected) is not int:bad.append('collected')
+    if bad:raise ValueError(f'{label} proof results missing or malformed: {", ".join(bad)} (A1b)')
+    if record['returncode']!=0:raise ValueError(f'{label} proof test process must exit 0 (A1b)')
+    if not record['passed']==collected>0 or record['failed'] or record['errors'] or record['skipped']:
+        raise ValueError(f'{label} proof must pass every collected test (no failed/errors/skipped) (A1b)')
+    summary=record.get('summary')
+    if not isinstance(summary,str) or not re.search(rf'(?<!\d){collected} passed\b',summary):
+        raise ValueError(f'{label} proof summary does not confirm {collected} passed (A1b)')
+
+
 def verify_proof_artifacts(by_role):
     """A1: the unit artifact excludes real-data tests; the real_data artifact is the guarded search-only run."""
     from scripts import phase4b_proof as proof
@@ -440,6 +453,7 @@ def verify_proof_artifacts(by_role):
         raise ValueError('phase4b proof artifacts must be A1 JSON records') from exc
     if (unit.get('argv') or [None])[1:]!=proof.proof_argv('unit')[1:]:
         raise ValueError('unit proof must be exactly the A1 command (-m "not real_data")')
+    _a1b_results(unit,'unit',unit.get('collected_count'))
     if unit.get('failed')!=0 or unit.get('errors')!=0:
         raise ValueError('unit proof must have no failures or errors')
     # A1a: host-input tests must have run; a skipped or flagless unit proof cannot satisfy the gate.
@@ -449,6 +463,7 @@ def verify_proof_artifacts(by_role):
     selection=proof.real_data_selection();argv=real.get('argv') or []
     if argv[-len(selection):]!=selection:raise ValueError('real_data proof must be the A1 command')
     collected=real.get('collected') or []
+    _a1b_results(real,'real_data',len(collected) if isinstance(collected,list) else None)
     if (len(collected)!=proof.EXPECTED_COLLECTED or len(set(collected))!=len(collected)
             or any(c.startswith(d) for c in collected for d in proof.DESELECTED)):
         raise ValueError('real_data proof collected nodes do not match A1')
