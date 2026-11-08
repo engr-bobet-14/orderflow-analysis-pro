@@ -17,6 +17,9 @@ from scripts.phase4_policy import ROOT, canonical_bytes, source_state
 PLAN_SHA256 = '30bde18198de534eaad6b5d47cff0fdbe89f706fe6350093c25b31726ddee258'
 PLAN_PATH = ROOT/'docs/plans/phase4-optuna-trade-signals-plan.md'
 GATES = ('U','FH1','FH2','FH3','FH4','R')
+PHASE4B_PLAN_SHA256 = '75b22452c0b168f43fd91704a7aee23a4cb1c84c637f4a8f775b87be13857b7f'
+PHASE4B_PLAN_PATH = ROOT/'docs/plans/phase4b-full-strategy-plan-rev13.md'
+PHASE4_CAMPAIGN_SHA256 = 'b54076c64820ed75cfbaff35a311b1ffecd294944c4f5c1d1189c8c60df32434'
 
 
 def approval_root():
@@ -33,21 +36,22 @@ def trusted_path(path, *, directory=False):
         raise ValueError('invalid approval path type')
 
 
-def consume_approval(approval):
+def consume_approval(approval, *, layout=None):
     """Full builds are single-use; campaign admissions append one audit line per use."""
-    root=approval_root()
+    root=approval_root() if layout is None else layout.approval_root
     trusted_path(root.parent,directory=True)
     trusted_path(root,directory=True)
     trusted_path(root/(approval['sha256']+'.json'))
     path=root/(approval['sha256']+'.consumed')
-    single=approval['record']['scope']=='full_history_tfc'
+    single=approval['record']['scope']=='full_history_tfc' or approval['record'].get('phase') in ('phase4b','phase4b-s1')
     if path.exists() or path.is_symlink():
         trusted_path(path)
     flags=os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|(os.O_EXCL if single else os.O_APPEND)
     try:
         fd=os.open(path,flags,0o600)
     except FileExistsError as exc:
-        raise ValueError('full-history approval already consumed') from exc
+        raise ValueError('full-history approval already consumed' if layout is None else
+                         'single-use approval already consumed') from exc
     with os.fdopen(fd,'ab') as handle:
         handle.write(canonical_bytes({'approval_sha256':approval['sha256'],
             'command_argv':approval['record']['command_argv'],'pid':os.getpid(),
@@ -280,3 +284,214 @@ def approval_for_command(campaign_sha256,argv):
     if len(matches)!=1:
         raise ValueError('exactly one host approval record is required for this child command')
     return matches[0]
+
+
+def phase4_exposure_state(origin, bar_type):
+    """Resolve the canonical origin independently of the executing checkout."""
+    try:
+        root = Path(origin['root'])
+        manifest = Path(origin['manifest_path'])
+        exposure = Path(origin['exposure_path'])
+        if (not root.is_absolute() or manifest != root/'output/phase4/campaign.json'
+                or exposure != root/'output/phase4/holdout/exposures.json'):
+            return 'unavailable'
+        seal=Path(str(manifest)+'.sha256')
+        if (origin['sha256']!=PHASE4_CAMPAIGN_SHA256 or manifest.is_symlink() or not manifest.is_file()
+                or seal.is_symlink() or not seal.is_file() or seal.read_text().strip()!=PHASE4_CAMPAIGN_SHA256):
+            return 'unavailable'
+        raw = manifest.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != PHASE4_CAMPAIGN_SHA256 or json.loads(raw)['phase'] != 'phase4':
+            return 'unavailable'
+        if exposure.is_symlink():
+            return 'unavailable'
+        if not exposure.exists():
+            return 'verified_absent'
+        data = json.loads(exposure.read_bytes())
+        if not isinstance(data, dict):
+            return 'unavailable'
+        return 'present' if any(key.startswith(f'BTCUSDT:{bar_type}:') for key in data) else 'verified_absent'
+    except (OSError, KeyError, TypeError, ValueError):
+        return 'unavailable'
+
+
+def allocation_path(layout, interval):
+    if (set(interval) != {'dataset_id','symbol','bar_type','start_seq','end_seq'}
+            or interval['symbol'] != 'BTCUSDT'
+            or interval['bar_type'] not in ('fixed_tick_imbalance','fixed_volume_imbalance')
+            or not re.fullmatch(r'[A-Za-z0-9_-]+', interval['dataset_id'])
+            or any(type(interval[k]) is not int or interval[k] < 0 for k in ('start_seq','end_seq'))
+            or interval['start_seq'] > interval['end_seq']):
+        raise ValueError('invalid holdout allocation interval')
+    name = '{dataset_id}__{symbol}__{bar_type}__{start_seq}-{end_seq}.json'.format(**interval)
+    return layout.allocation_root/name
+
+
+def install_holdout_allocation(layout, interval, campaign_sha256, origin):
+    """Host-only installation primitive. Campaign execution never calls this."""
+    if layout.phase != 'phase4b' or not re.fullmatch('[0-9a-f]{64}', campaign_sha256):
+        raise ValueError('allocation requires a phase4b campaign hash')
+    if phase4_exposure_state(origin, interval['bar_type']) != 'verified_absent':
+        raise ValueError('canonical Phase 4 exposure is present or unavailable')
+    path = allocation_path(layout, interval)
+    allocation = {**interval,'phase':'phase4b','campaign_sha256':campaign_sha256,'phase4_origin':origin}
+    raw = canonical_bytes({'allocation':allocation,'sha256':hashlib.sha256(canonical_bytes(allocation)).hexdigest()})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    trusted_path(path.parent, directory=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(raw);handle.flush();os.fsync(handle.fileno())
+    return path
+
+
+def require_holdout_allocation(layout, interval, campaign_sha256, origin):
+    path = allocation_path(layout, interval)
+    try:
+        trusted_path(path.parent, directory=True)
+        trusted_path(path)
+        raw = path.read_bytes()
+        envelope = json.loads(raw)
+        allocation = envelope['allocation']
+        if (path.stat().st_mode & 0o777 != 0o600 or canonical_bytes(envelope) != raw
+                or hashlib.sha256(canonical_bytes(allocation)).hexdigest() != envelope['sha256']
+                or allocation != {**interval,'phase':'phase4b','campaign_sha256':campaign_sha256,'phase4_origin':origin}):
+            raise ValueError('holdout allocation content/hash mismatch')
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError('holdout allocation missing, untrusted or mismatched') from exc
+    state = phase4_exposure_state(origin, interval['bar_type'])
+    if state != 'verified_absent':
+        raise ValueError('canonical Phase 4 exposure/origin is '+state)
+    return allocation
+
+
+def verify_phase4b_approval(layout, selector, campaign_sha256, stage, argv=None):
+    """Use the same canonical, uid-owned, source/argv-bound host records as Phase 4."""
+    if not isinstance(selector,str) or not re.fullmatch('[0-9a-f]{64}',selector):
+        raise ValueError('host approval requires a content-addressed record hash')
+    root = layout.approval_root
+    for path in (root.parent,root):trusted_path(path,directory=True)
+    path = root/(selector+'.json');trusted_path(path)
+    raw=path.read_bytes();record=json.loads(raw)
+    fields={'scope','phase','stage','plan_sha256','campaign_sha256','source_state','base_commit','command_argv','created_utc'}
+    if (not isinstance(record,dict) or set(record)!=fields or canonical_bytes(record)!=raw
+            or hashlib.sha256(raw).hexdigest()!=selector):
+        raise ValueError('approval fields/content hash mismatch')
+    if (layout.phase not in ('phase4b','phase4b-s1') or record['scope']!='campaign'
+            or record['phase']!=layout.phase or record['stage']!=stage
+            or stage not in (('S1',) if layout.phase=='phase4b-s1' else ('S2t','S2v','S3'))):
+        raise ValueError('approval phase/stage mismatch')
+    if (record['plan_sha256']!=PHASE4B_PLAN_SHA256
+            or hashlib.sha256(PHASE4B_PLAN_PATH.read_bytes()).hexdigest()!=PHASE4B_PLAN_SHA256):
+        raise ValueError('approval plan hash mismatch')
+    current=source_state()
+    if record['source_state']!=current or record['base_commit']!=current['base'] or record['campaign_sha256']!=campaign_sha256:
+        raise ValueError('approval source/campaign mismatch')
+    try:
+        created=datetime.fromisoformat(record['created_utc'].replace('Z','+00:00'))
+        if created.tzinfo is None or created.utcoffset().total_seconds()!=0:raise ValueError('not UTC')
+    except (KeyError,TypeError,ValueError,AttributeError) as exc:
+        raise ValueError('approval created_utc must be UTC') from exc
+    if record['command_argv']!=command_argv(argv):
+        raise ValueError('approval command argv mismatch')
+    return {'sha256':selector,'record':record}
+
+
+def require_phase4b_approval(layout, selector, campaign_sha256, stage, argv=None, *, consume=False):
+    approval=verify_phase4b_approval(layout,selector,campaign_sha256,stage,argv)
+    gates_sha256=verify_phase4b_gates(layout,campaign_sha256)
+    if consume:consume_approval(approval,layout=layout)
+    return {**approval,'gates_sha256':gates_sha256}
+
+
+def verify_phase4b_gates(layout, campaign_sha256):
+    """Host proof gates (plan hash, U/AC1/AC7/R, proof artifacts); returns the gates record sha256."""
+    if hashlib.sha256(PHASE4B_PLAN_PATH.read_bytes()).hexdigest()!=PHASE4B_PLAN_SHA256:
+        raise ValueError('approval plan hash mismatch: the plan file changed')
+    path=layout.approval_root/f'gates-{campaign_sha256}.json';trusted_path(path)
+    raw=path.read_bytes();gates=json.loads(raw)
+    if (gates.get('plan_sha256')!=PHASE4B_PLAN_SHA256 or gates.get('campaign_sha256')!=campaign_sha256
+            or gates.get('source_state')!=source_state()
+            or any(gates.get(key)!='pass' for key in ('U','AC1','AC7','R'))):
+        raise ValueError('phase4b requires host unit, digest, preservation/real-data and inspection gates')
+    artifacts=gates.get('artifacts',[])
+    if {a.get('role') for a in artifacts} != {'unit','digests','protected','real_data','inspection'}:
+        raise ValueError('phase4b host proof artifacts incomplete')
+    for artifact in artifacts:
+        raw_artifact=Path(artifact['path']).read_bytes()
+        if hashlib.sha256(raw_artifact).hexdigest()!=artifact['sha256']:
+            raise ValueError('host proof artifact hash mismatch')
+    return hashlib.sha256(raw).hexdigest()
+
+
+# Rev 13: only an external/unknown termination is recoverable, and only with an owner record.
+RECOVERABLE_KIND = 'external_or_unknown_termination'
+RECOVERY_FIELDS = {'kind','phase','campaign_sha256','stage','termination_sha256','runtime_fingerprint','command_argv'}
+
+
+def recovery_root(layout):
+    return layout.approval_root/'recovery'
+
+
+def install_recovery_approval(layout, record):
+    """Host-only, after the owner's explicit decision: content-addressed, 0600, O_EXCL."""
+    if not isinstance(record,dict) or set(record)!=RECOVERY_FIELDS or record['kind']!='recovery':
+        raise ValueError('recovery approval fields invalid')
+    raw=canonical_bytes(record);root=recovery_root(layout)
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    path=root/(hashlib.sha256(raw).hexdigest()+'.json')
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as handle:
+        handle.write(raw);handle.flush();os.fsync(handle.fileno())
+    return path
+
+
+def require_recovery_approval(layout, selector, campaign_sha256, stage, termination, argv, *, consume=False):
+    """Bind manifest, stage, termination record, runtime fingerprint and exact argv; single use."""
+    from scripts.phase4b_runtime import runtime_fingerprint
+    if not isinstance(selector,str) or not re.fullmatch('[0-9a-f]{64}',selector):
+        raise ValueError('recovery approval requires a content-addressed record hash')
+    if termination.get('kind')!=RECOVERABLE_KIND:
+        raise ValueError('no recovery for termination kind '+str(termination.get('kind')))
+    root=recovery_root(layout);path=root/(selector+'.json')
+    try:
+        for directory in (layout.approval_root,root):trusted_path(directory,directory=True)
+        trusted_path(path)
+    except ValueError as exc:raise ValueError('recovery approval not trusted: '+str(exc)) from exc
+    if path.stat().st_mode&0o077:raise ValueError('recovery approval not trusted: mode must be 0600')
+    raw=path.read_bytes()
+    try:record=json.loads(raw)
+    except ValueError as exc:raise ValueError('recovery approval invalid') from exc
+    if canonical_bytes(record)!=raw or hashlib.sha256(raw).hexdigest()!=selector or set(record)!=RECOVERY_FIELDS:
+        raise ValueError('recovery approval content hash/fields mismatch')
+    expected={'kind':'recovery','phase':layout.phase,'campaign_sha256':campaign_sha256,'stage':stage,
+        'termination_sha256':hashlib.sha256(canonical_bytes(termination)).hexdigest(),
+        'runtime_fingerprint':runtime_fingerprint(),'command_argv':command_argv(argv)}
+    for key,value in expected.items():
+        if record[key]!=value:raise ValueError('recovery approval '+key+' mismatch')
+    consumed=root/(selector+'.consumed')
+    if consumed.exists() or consumed.is_symlink():raise ValueError('recovery approval already consumed')
+    if consume:
+        fd=os.open(consumed,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as handle:
+            handle.write(canonical_bytes({'recovery_sha256':selector,'termination_sha256':expected['termination_sha256'],
+                'stage':stage,'campaign_sha256':campaign_sha256,'pid':os.getpid(),
+                'used_utc':datetime.now(timezone.utc).isoformat()}))
+            handle.flush();os.fsync(handle.fileno())
+    return {'sha256':selector,'record':record}
+
+
+def consumed_recoveries(layout):
+    """termination_sha256 -> consumed recovery marker, for admission decisions."""
+    root=recovery_root(layout);found={}
+    if root.exists():
+        for path in root.glob('*.consumed'):
+            approval=root/(path.name[:-len('.consumed')]+'.json')
+            try:
+                trusted_path(path);trusted_path(approval)
+                raw=approval.read_bytes();record=json.loads(raw);marker=json.loads(path.read_bytes())
+            except (ValueError,OSError):continue
+            # Only a marker for a genuine, content-addressed approval that binds this termination counts.
+            if (hashlib.sha256(raw).hexdigest()!=approval.stem or record.get('kind')!='recovery'
+                    or marker.get('termination_sha256')!=record.get('termination_sha256')):
+                continue
+            found[marker['termination_sha256']]=marker
+    return found

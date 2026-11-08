@@ -231,3 +231,47 @@ def clipped_trade_bounds(bar: InfoBar, centre: float, width: int) -> tuple[float
     """
     centre_half_ticks = 2 * round(centre * 100)
     return max((centre_half_ticks - int(width)) / 200, bar.low), min((centre_half_ticks + int(width)) / 200, bar.high)
+
+
+def aggregate_levels(levels, mult):
+    """Cache (cents, buy lots, sell lots) → bucket index: (bid lots, ask lots).
+
+    Bucket indices retain gaps, so adjacency always means a step of one.
+    Python integer sums remain exact even above int64/float precision limits.
+    """
+    grouped = {}
+    for tick, ask, bid in zip(*levels):
+        index = int(tick) // (100 * mult)
+        old_bid, old_ask = grouped.get(index, (0, 0))
+        grouped[index] = old_bid + int(bid), old_ask + int(ask)
+    return dict(sorted(grouped.items()))
+
+
+def diagonal_imbalances(levels, ratio, min_share, total):
+    """Compare inside the traded range, filling missing aggregated levels with zero."""
+    results = []
+    if total <= 0 or not levels:
+        return results
+    from decimal import Decimal
+    ratio_num, ratio_den = Decimal(str(ratio)).as_integer_ratio()
+    share_num, share_den = Decimal(str(min_share)).as_integer_ratio()
+    for level in range(min(levels)+1, max(levels)+1):
+        ask, bid = levels.get(level, (0, 0))[1], levels.get(level-1, (0, 0))[0]
+        if ask + bid <= 0 or (ask + bid) * share_den < share_num * total:
+            continue
+        if ask * ratio_den >= ratio_num * bid:
+            results.append((level, 'buy'))
+        elif bid * ratio_den >= ratio_num * ask:
+            results.append((level, 'sell'))
+    return results
+
+
+def stacked_runs(imbalances, min_levels):
+    """Longest adjacent same-side run, with sub-threshold runs reported as zero."""
+    longest = {'buy': 0, 'sell': 0}
+    last_level, last_side, run = None, None, 0
+    for level, side in sorted(imbalances):
+        run = run + 1 if side == last_side and level == last_level + 1 else 1
+        longest[side] = max(longest[side], run)
+        last_level, last_side = level, side
+    return {side: length if length >= min_levels else 0 for side, length in longest.items()}

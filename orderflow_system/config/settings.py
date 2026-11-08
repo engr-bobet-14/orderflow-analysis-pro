@@ -197,21 +197,40 @@ class TradeSignalConfig:
     contrarian_ratio: float = 2.5
     contrarian_zone_frac: float = 0.30
     contrarian_min_level_share: float = 0.02
+    absorption_source: str = "bar"
+    initiative_imbalance: str = "off"
+    imbalance_ratio: float = 3.0
+    imbalance_min_level_share: float = 0.01
+    imbalance_bucket_mult: int = 1
+    stacked_min_levels: int = 0
 
     def __post_init__(self):
         import math
         import numpy as np
         if not isinstance(self.absorption_levels, bool):
             raise ValueError('absorption_levels must be a bool')
-        for name in ('exhaustion_contrarian', 'framing_profile_source'):
+        for name in ('exhaustion_contrarian', 'framing_profile_source', 'absorption_source', 'initiative_imbalance'):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f'{name} must be a str')
         if self.exhaustion_contrarian not in ('off', 'bonus', 'required'):
             raise ValueError('invalid exhaustion_contrarian')
         if self.framing_profile_source not in ('bar_vwap', 'trades'):
             raise ValueError('invalid framing_profile_source')
+        if self.absorption_source not in ('bar', 'trade') or (self.absorption_source == 'trade' and not self.absorption_levels):
+            raise ValueError('trade absorption_source requires absorption_levels=True')
+        if self.initiative_imbalance not in ('off', 'bonus', 'required'):
+            raise ValueError('invalid initiative_imbalance')
+        from numbers import Integral
+        for name, allowed in (('imbalance_bucket_mult', (1, 2, 5, 10)), ('stacked_min_levels', range(5))):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value not in allowed:
+                raise ValueError(f'invalid {name}')
+            object.__setattr__(self, name, int(value))
+        if self.initiative_imbalance == 'required' and not self.stacked_min_levels:
+            raise ValueError('required initiative_imbalance needs stacked_min_levels >= 1')
         for name in ('level_zone_frac', 'min_level_share', 'min_side_ratio', 'min_reject_bps',
-                     'max_through_bps', 'contrarian_ratio', 'contrarian_zone_frac', 'contrarian_min_level_share'):
+                     'max_through_bps', 'contrarian_ratio', 'contrarian_zone_frac', 'contrarian_min_level_share',
+                     'imbalance_ratio', 'imbalance_min_level_share'):
             value = getattr(self, name)
             if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
                 raise ValueError(f'{name} must be a real number, not bool')
@@ -219,18 +238,22 @@ class TradeSignalConfig:
             object.__setattr__(self, name, value)
             if not math.isfinite(value):
                 raise ValueError(f'{name} must be finite')
-        for name in ('level_zone_frac', 'min_level_share', 'contrarian_zone_frac', 'contrarian_min_level_share'):
+        for name in ('level_zone_frac', 'min_level_share', 'contrarian_zone_frac', 'contrarian_min_level_share',
+                     'imbalance_min_level_share'):
             if not 0 < getattr(self, name) <= 1:
                 raise ValueError(f'{name} must be in (0, 1]')
         if not 0.5 < self.min_side_ratio <= 1:
             raise ValueError('min_side_ratio must be in (0.5, 1]')
         if self.min_reject_bps <= 0 or self.max_through_bps < 0 or self.contrarian_ratio <= 1:
             raise ValueError('invalid rejection, travel or contrarian threshold')
+        if self.imbalance_ratio <= 1:
+            raise ValueError('imbalance_ratio must be > 1')
 
     @property
     def any_enabled(self) -> bool:
         return (self.absorption_levels or self.exhaustion_contrarian != 'off'
-                or self.framing_profile_source != 'bar_vwap')
+                or self.framing_profile_source != 'bar_vwap' or self.absorption_source == 'trade'
+                or self.initiative_imbalance != 'off')
 
 
 def parse_trade_signals(value: str) -> TradeSignalConfig:

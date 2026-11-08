@@ -373,6 +373,8 @@ def suggest_params(trial, space=None):
     for name, (lo, hi, kind) in (space or SEARCH_SPACE_BOUNDS).items():
         if kind == "int":
             params[name] = trial.suggest_int(name, lo, hi)
+        elif kind == 'categorical':
+            params[name] = trial.suggest_categorical(name, lo)
         else:
             params[name] = trial.suggest_float(name, lo, hi, log=kind == "float_log")
     return params
@@ -594,7 +596,17 @@ def evaluate_fold(fold, bars, params, args, full=None, trade_updates=None, trade
 
 
 def objective(trial, bars, folds, args):
+    phase4b = getattr(args, 'phase', None) == 'phase4b'
+    if phase4b:
+        from scripts.phase4_studies import SearchPrefix
+        if not isinstance(bars, SearchPrefix):
+            raise TypeError('phase4b objective requires SearchPrefix')
+        args = argparse.Namespace(**{**vars(args), 'trade_updates':bars.trade_updates})
+        bars = bars.bars
     params = suggest_params(trial, args.space)
+    if phase4b:
+        from scripts.phase4_studies import full_strategy_params
+        params = full_strategy_params(params, args.symbol)
     replay_kwargs = {}
     if getattr(args, 'phase4', False):
         from scripts.phase4_studies import merged_params, trial_replay_kwargs
@@ -615,6 +627,8 @@ def objective(trial, bars, folds, args):
              "n_scored_bars": sum(r["n_scored_bars"] for r in results), "n_bars_search": len(bars),
              "n_penalized_folds": sum(r["penalized"] for r in results),
              "raw_daily_sharpe": float(np.mean(raw)) if raw else None, "replay_digest": result["replay_digest"]}
+    if phase4b:
+        attrs['replay_identity'] = {'inert_params': {'absorption_min_delta_pct': params['absorption_min_delta_pct']}}
     if getattr(args, 'phase4', False):
         import base64
         from scripts.phase4_report import search_returns
@@ -688,7 +702,7 @@ def study_identity(args, metadata, warm_start=False):
                 "seed": args.seed}
     if getattr(args, 'phase4', False):
         from scripts.phase4_studies import arm_key
-        identity.update(phase='phase4',arm=arm_key(args),
+        identity.update(phase=getattr(args,'phase','phase4'),arm=arm_key(args),
                         trade_signals=trade_signal_identity(effective_trade_config(args, {})),
                         trade_cache=getattr(args, 'trade_cache_identity', None),
                         frozen_params=getattr(args, 'frozen_identity', None),
@@ -697,6 +711,9 @@ def study_identity(args, metadata, warm_start=False):
                         phase4_source_fp=hashlib.sha256(b''.join((ROOT/name).read_bytes() for name in
                             ('scripts/optimize_orderflow.py', 'scripts/phase4_studies.py',
                              'scripts/phase4_policy.py', 'scripts/phase4_report.py'))).hexdigest())
+        if getattr(args,'phase',None)=='phase4b':
+            identity['inert_params']={'absorption_min_delta_pct':config.absorption.min_delta_pct}
+            identity['comparator']=args.comparator_identity
     if warm_start:   # the seeds are not hashed: they are persisted in the stored identity (resolve_study)
         identity["warm_start"] = {"max": args.warm_start_max}
     space_fp = fingerprint(identity)
@@ -722,7 +739,10 @@ def phase4_study_preflight(args):
 
 def open_study(args, name, identity, worker_index=0):
     if getattr(args,'phase4',False) and name in _study_names(args.study_db):
-        phase4_db_admission(args.study_db,name,args)
+        if getattr(args,'phase_layout',None) is None:
+            phase4_db_admission(args.study_db,name,args)
+        else:
+            phase4_db_admission(args.study_db,name,args,layout=args.phase_layout)
     from scripts.phase4_studies import legacy_study_guard
     legacy_study_guard(args, name)
     if getattr(args,'phase4',False) and args.n_jobs!=1:
@@ -907,19 +927,25 @@ def resolve_phase4_pending(study,args=None):
         study.set_user_attr('phase4_memory_check_pending',None)
 
 
-def phase4_db_admission(db,name,args=None):
+def phase4_db_admission(db,name,args=None,*,layout=None):
     """Normal reads stay read-only; repair only live Phase 4 DBs under exclusive locks."""
     attrs=read_study_attrs(db,name)
     if attrs.get('phase4_accounting_pending') or attrs.get('phase4_memory_check_pending'):
-        if attrs.get('identity',{}).get('phase')!='phase4':raise ValueError('pending repair requires a Phase 4 study')
+        if attrs.get('identity',{}).get('phase')!=('phase4' if layout is None else layout.phase):
+            raise ValueError('pending repair requires a matching campaign phase')
         from scripts.phase4_policy import phase4_db_path,checked_write
         import optuna
-        db=phase4_db_path(db);lock=checked_write(study_lock_path(db,name))
-        with file_lock(lock,nonblocking=True),file_lock(checked_write(str(lock)+'.workers'),nonblocking=True):
+        db=phase4_db_path(db) if layout is None else layout.db_path(db)
+        writer=checked_write if layout is None else layout.checked_write
+        lock=writer(study_lock_path(db,name))
+        with file_lock(lock,nonblocking=True),file_lock(writer(str(lock)+'.workers'),nonblocking=True):
             study=optuna.load_study(storage='sqlite:///'+str(db),study_name=name)
             resolve_phase4_pending(study,args)
             attrs=study.user_attrs
     if attrs.get('phase4_runtime_stop') is not None:
+        stop=attrs['phase4_runtime_stop']
+        if getattr(args,'phase4_timeout_audit',None) is not None and stop.get('reason','').startswith('max_'):
+            args.phase4_timeout_audit(stop)
         raise ValueError('Phase 4 runtime stop; owner decision required')
     return attrs
 
@@ -1009,6 +1035,10 @@ def phase4_trial_timing(trial,study,prior,begun,args=None,terminal=None):
     memory={'peak_rss_bytes':0,'peak_private_bytes':0,'private_metric':None}
     def terminate(message,record=None):
         terminating.set()
+        audit=getattr(args,'phase4_timeout_audit',None)
+        if audit is not None and record is not None and record['reason'].startswith('max_'):
+            try:audit(record)
+            except Exception as exc:print('Timeout audit append failed: '+str(exc),file=sys.stderr,flush=True)
         phase4_fatal(message,study,record,last_success+PHASE4_HEARTBEAT_STALE_SECONDS)
     def stop(reason,**fields):
         return {'reason':reason,'live':True,'trial':trial.number,'utc':datetime.now(timezone.utc).isoformat(),**fields}
@@ -1144,8 +1174,9 @@ def phase4_runtime_stop(study,args,elapsed):
     if reason is None and study_limit is not None and since_reset>study_limit:
         reason,measured,limit='max_study_seconds',since_reset,study_limit
     if reason is not None:
-        study.set_user_attr('phase4_runtime_stop',{'reason':reason,'measured_seconds':measured,
-            'limit_seconds':limit,'utc':datetime.now(timezone.utc).isoformat()})
+        stop={'reason':reason,'measured_seconds':measured,'limit_seconds':limit,'utc':datetime.now(timezone.utc).isoformat()}
+        study.set_user_attr('phase4_runtime_stop',stop)
+        if getattr(args,'phase4_timeout_audit',None) is not None:args.phase4_timeout_audit(stop)
         return True
     return False
 
@@ -1157,12 +1188,16 @@ def optimize_loop(study, bars, folds, args, parent_pid=None):
     if phase4:resolve_phase4_pending(study,args)
     begun=time.perf_counter()
     prior=phase4_runtime_baseline(study) if phase4 else 0.
+    # Phase 4b (plan rev 13) supplies accounting-only hooks; Phase 4 uses the original functions.
+    stop_hook=getattr(args,'phase4_runtime_stop_hook',None)
+    def runtime_stop(elapsed):
+        return stop_hook(study,args,elapsed,prior=prior,begun=begun) if stop_hook else phase4_runtime_stop(study,args,elapsed)
     if phase4:
         study.set_user_attr('phase4_runtime_policy',phase4_runtime_policy())
         study.set_user_attr('phase4_runtime_seconds',prior)
-        reconciled_runtime_stop(study,args)
+        getattr(args,'phase4_reconciled_stop_hook',reconciled_runtime_stop)(study,args)
     while parent_pid is None or os.getppid() == parent_pid:
-        if phase4 and phase4_runtime_stop(study,args,prior+time.perf_counter()-begun):break
+        if phase4 and runtime_stop(prior+time.perf_counter()-begun):break
         if len(complete_trials(study)) >= args.n_trials:
             break
         # Phase 4 seeds count COMPLETE proposals only; failed/reconciled rows do not advance them.
@@ -1174,6 +1209,7 @@ def optimize_loop(study, bars, folds, args, parent_pid=None):
             terminal={}
             def run_trial(trial):
                 import socket
+                if getattr(args,'phase4_progress',None) is not None:args.phase4_progress(trial)
                 trial.set_user_attr('phase4_worker',{'pid':os.getpid(),'host':socket.gethostname()})
                 with phase4_trial_timing(trial,study,prior,begun,args,terminal=terminal):
                     return objective(trial,bars,folds,args)
@@ -1189,7 +1225,7 @@ def optimize_loop(study, bars, folds, args, parent_pid=None):
                             study.set_user_attr('phase4_terminal_wall_seconds',durations)
                         elapsed=prior+time.perf_counter()-begun
                         study.set_user_attr('phase4_runtime_seconds',elapsed)
-                        phase4_runtime_stop(study,args,elapsed)
+                        runtime_stop(elapsed)
                     finally:
                         if terminal:terminal['close']()
                     if terminal:study.set_user_attr('phase4_accounting_pending',None)

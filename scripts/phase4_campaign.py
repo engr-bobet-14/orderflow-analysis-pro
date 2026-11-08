@@ -39,7 +39,12 @@ def apply_runtime_limits(arms,trial_limits,study_limits):
             arms[arm][name]=seconds;seen.add(arm)
 
 
-def register(path, snapshots=(),phase4_db=None,*,trial_limits=(),study_limits=()):
+def register(path, snapshots=(),phase4_db=None,*,trial_limits=(),study_limits=(), phase='phase4', layout=None,
+             comparators=None, phase4_origin=None, benchmark=None, holdout_intervals=None,stage_limits=()):
+    if phase != 'phase4':
+        return register_phase4b(path, snapshots, phase=phase, layout=layout, comparators=comparators,
+            phase4_origin=phase4_origin, benchmark=benchmark, trial_limits=trial_limits, study_limits=study_limits,
+            holdout_intervals=holdout_intervals,stage_limits=stage_limits)
     path = checked_write(path)
     seal=Path(str(path)+'.sha256')
     if path.exists() != seal.exists():
@@ -376,8 +381,9 @@ def append_log(path,value):
         handle.write(canonical_bytes(value));handle.flush();os.fsync(handle.fileno())
 
 
-def atomic_bytes(path,raw):
-    path=checked_write(path);path.parent.mkdir(parents=True,exist_ok=True)
+def atomic_bytes(path,raw,*,layout=None):
+    path=checked_write(path) if layout is None else layout.checked_write(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent,prefix='.stage-',delete=False) as handle:
         temporary=Path(handle.name);handle.write(raw);handle.flush();os.fsync(handle.fileno())
     try:os.replace(temporary,path)
@@ -582,6 +588,13 @@ def run_driver(path, *, owner_approved=None, inspected_driver=None, driver=None,
 
 
 def main(argv=None):
+    phase_parser=argparse.ArgumentParser(add_help=False)
+    phase_parser.add_argument('--phase',choices=('phase4','phase4b-s1','phase4b'),default='phase4')
+    phase,remaining=phase_parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if phase.phase!='phase4':
+        from scripts.phase4b_campaign import main as full_strategy_main
+        if remaining and remaining[0]=='driver':remaining[0]='run'
+        return full_strategy_main([*remaining,'--phase',phase.phase])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command',choices=('register','driver','freeze','ablation','clear-runtime-stop'))
     parser.add_argument('--manifest',type=Path,default=ROOT/'output/phase4/campaign.json')
@@ -600,7 +613,7 @@ def main(argv=None):
     parser.add_argument('--max-trial-seconds',type=runtime_limit,action='append',default=[],metavar='ARM=SECONDS')
     parser.add_argument('--max-study-seconds',type=runtime_limit,action='append',default=[],metavar='ARM=SECONDS')
     parser.add_argument('--runtime-decision',help='host runtime-decision record SHA256')
-    cli = parser.parse_args(argv)
+    cli = parser.parse_args(remaining)
     try:
         if cli.command!='register' and (cli.max_trial_seconds or cli.max_study_seconds):
             raise ValueError('ARM=SECONDS runtime limits are registration options only')
@@ -624,6 +637,139 @@ def main(argv=None):
                           driver=cli.driver,protected_paths=cli.protected,dry_run=not cli.execute,stage=cli.stage)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
+
+
+def derive_ceilings(benchmark, budget=300):
+    from scripts.phase4_studies import s1_timings
+    bar_types=('fixed_tick_imbalance','fixed_volume_imbalance')
+    if budget!=300 or set(benchmark.get('lanes',{}))!=set(bar_types):
+        raise ValueError('benchmark requires both bar types and budget 300')
+    timings={bt:s1_timings(benchmark['lanes'][bt]) for bt in bar_types}
+    arms={bt:{'max_trial_seconds':math.ceil(1.5*max(values.values())),
+              'max_study_seconds':math.ceil(1.15*(sum(values.values())/10)*budget)} for bt,values in timings.items()}
+    maximum=max(max(values.values()) for values in timings.values())
+    return {'arms':arms,'max_stage_seconds':{
+        'S2t':arms[bar_types[0]]['max_study_seconds']+1200,'S2v':arms[bar_types[1]]['max_study_seconds']+1200,
+        'S3':math.ceil(1.3*maximum*51.25*2)+1200},
+        'inputs':{'timings':timings,'M':maximum,'N':budget,'trial_margin':1.5,'study_margin':1.15,
+            'S2_overhead_seconds':1200,
+            'S3_margin':1.3,'S3_replay_equivalents_per_arm':51.25,'S3_arms':2,'S3_overhead_seconds':1200}}
+
+
+def register_phase4b(path, snapshots, *, phase, layout=None, comparators=None, phase4_origin=None,
+                     benchmark=None, trial_limits=(), study_limits=(), holdout_intervals=None,stage_limits=()):
+    from scripts.phase4_policy import PhaseLayout
+    layout = layout or PhaseLayout(phase)
+    if layout.phase != phase or phase not in ('phase4b-s1', 'phase4b'):
+        raise ValueError('phase/layout mismatch')
+    path = layout.checked_write(path)
+    if path != layout.manifest:
+        raise ValueError('campaign manifest differs from phase layout')
+    from scripts.phase4b_regression import checkout_path
+    snapshots=[{**s,'path':str(checkout_path(s['path'],layout.root))} for s in snapshots]
+    if comparators:
+        comparators={bt:{**s,'path':str(checkout_path(s['path'],layout.root))} for bt,s in comparators.items()}
+    if len(snapshots) != 4 or len({Path(s['path']).resolve() for s in snapshots}) != 4:
+        raise ValueError('4b requires three legacy snapshots and the read-only Phase 4 snapshot')
+    if Path(snapshots[-1]['path']).resolve() != layout.root/'output/optimize/phase4/studies.db':
+        raise ValueError('fourth snapshot must bind the Phase 4 database')
+    for snapshot in snapshots:
+        if sha256_file(Path(snapshot['path'])) != snapshot['sha256']:
+            raise ValueError('snapshot hash mismatch at registration')
+    bar_types = ('fixed_tick_imbalance', 'fixed_volume_imbalance')
+    if not comparators or set(comparators) != set(bar_types):
+        raise ValueError('both Stage B comparators are required')
+    for bt, spec in comparators.items():
+        expected = layout.root/'output/phase4/frozen'/f'{bt}.json'
+        if Path(spec['path']).resolve() != expected or sha256_file(expected) != spec['sha256']:
+            raise ValueError('comparator path/hash mismatch')
+        artifact = json.loads(expected.read_bytes())
+        if artifact['study'] != spec['study']:
+            raise ValueError('comparator study mismatch')
+    from scripts.phase4_approvals import phase4_exposure_state
+    if not phase4_origin or phase4_exposure_state(phase4_origin, bar_types[0]) == 'unavailable':
+        raise ValueError('verified canonical Phase 4 origin required')
+    arms = {f'BTCUSDT:{bt}:full':{'kind':'study','budget':300,'comparator':comparators[bt],
+        'stageB_study':comparators[bt]['study'],'phase4_campaign_sha256':phase4_origin['sha256']} for bt in bar_types}
+    benchmark_sha = None
+    runtime=None
+    if phase == 'phase4b':
+        from scripts.phase4_approvals import allocation_path
+        if not holdout_intervals or set(holdout_intervals)!=set(bar_types):
+            raise ValueError('host-bound holdout interval metadata required for both arms')
+        for bt,interval in holdout_intervals.items():
+            if interval['bar_type']!=bt:raise ValueError('holdout interval bar type mismatch')
+            allocation_path(layout,interval)
+        expected_benchmark = layout.output/'s1/benchmark.json'
+        if benchmark is None or Path(benchmark).resolve() != expected_benchmark:
+            raise ValueError('sealed S1 benchmark required')
+        try:
+            raw = expected_benchmark.read_bytes()
+            benchmark_sha = hashlib.sha256(raw).hexdigest()
+            if Path(str(expected_benchmark)+'.sha256').read_text().strip() != benchmark_sha:
+                raise ValueError('benchmark seal mismatch')
+            measured = json.loads(raw)
+            s1layout = PhaseLayout('phase4b-s1', root=layout.root, approvals_base=layout.approvals_base)
+            s1raw = s1layout.manifest.read_bytes()
+            s1sha = hashlib.sha256(s1raw).hexdigest()
+            if (Path(str(s1layout.manifest)+'.sha256').read_text().strip() != s1sha
+                    or measured['campaign_sha256'] != s1sha or json.loads(s1raw)['phase'] != 'phase4b-s1'
+                    or set(measured['lanes']) != set(bar_types)):
+                raise ValueError('benchmark S1 campaign mismatch')
+            checkpoint=layout.checkpoints/s1sha/'S1.json'
+            try:completed=json.loads(checkpoint.read_bytes())
+            except (OSError,ValueError) as exc:raise ValueError('completed S1 checkpoint required') from exc
+            if (completed.get('status')!='complete' or completed.get('stage')!='S1'
+                    or completed.get('phase')!='phase4b-s1' or completed.get('campaign_sha256')!=s1sha
+                    or completed.get('source_state')!=json.loads(s1raw)['source_state']
+                    or completed.get('result')!=measured):
+                raise ValueError('S1 checkpoint/benchmark mismatch')
+            from scripts.phase4b_runtime import require_runtime_fingerprint
+            runtime=measured.get('runtime_fingerprint')
+            if completed.get('runtime_fingerprint')!=runtime:
+                raise ValueError('S1 runtime fingerprint/checkpoint mismatch')
+            require_runtime_fingerprint(runtime)
+            derived=derive_ceilings(measured)
+            for bt in bar_types:
+                arms[f'BTCUSDT:{bt}:full'].update(derived['arms'][bt])
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError('invalid S1 benchmark') from exc
+    else:
+        for arm in arms.values():arm.update(max_trial_seconds=1800, max_study_seconds=14400)
+        derived={'max_stage_seconds':{'S1':14400},'inputs':{
+            'S1_replay_or_trial_seconds':1800,'S1_stage_seconds':14400,'source':'pre-registered rev 11'}}
+    limits = {k:dict(v) for k,v in arms.items()}
+    apply_runtime_limits(limits, trial_limits, study_limits)
+    if limits != arms:
+        raise ValueError('hand-supplied runtime limits disagree with registered formula')
+    seen=set()
+    for stage,seconds in stage_limits:
+        if stage in seen or stage not in derived['max_stage_seconds'] or seconds!=derived['max_stage_seconds'][stage]:
+            raise ValueError('hand-supplied stage limit differs from registered formula')
+        seen.add(stage)
+    manifest = {'phase':phase,'version':1,'arms':arms,'seed':42,'fee_bps':5.,'slippage_bps':1.,
+        'min_total_trades':105,'min_trades_per_fold':11,'n_splits':5,'embargo':.02,'holdout_fraction':.2,
+        'snapshots':list(snapshots),'phase4b_db':str(layout.studies_db),'phase4_origin':phase4_origin,
+        'benchmark_sha256':benchmark_sha,'stages':['S1'] if phase == 'phase4b-s1' else ['S2t','S2v','S3'],
+        'holdout_intervals':holdout_intervals or {},
+        'source_state':source_state(),'runtime_fingerprint':runtime,'concurrency':1,'n_jobs':1,
+        'bootstrap':{'block_days':7,'resamples':2000,'seed':20261105},'CSCV_blocks':16,
+        'max_stage_seconds':derived['max_stage_seconds'],'runtime_ceilings':derived,
+        'holdout_allocation':'host installation only; Phase 4 Stage C approvals deferred while allocated'}
+    raw = canonical_bytes(manifest)
+    seal = layout.checked_write(str(path)+'.sha256')
+    if path.exists() != seal.exists():
+        raise ValueError('half-sealed campaign')
+    if path.exists():
+        stored = path.read_bytes()
+        if seal.read_text().strip() != hashlib.sha256(stored).hexdigest() or stored != raw:
+            raise ValueError('sealed campaign differs; register a new campaign')
+        return json.loads(stored)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # O_EXCL prevents one registration from replacing another sealed campaign.
+    with seal.open('xb') as handle:handle.write((hashlib.sha256(raw).hexdigest()+'\n').encode())
+    with path.open('xb') as handle:handle.write(raw)
+    return manifest
 
 
 if __name__=='__main__':

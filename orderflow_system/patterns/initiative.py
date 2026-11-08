@@ -26,8 +26,9 @@ from typing import Optional
 
 from orderflow_system.data.models import InfoBar, Signal, SignalType, Side
 from orderflow_system.analytics.delta import DeltaResult
-from orderflow_system.analytics.footprint import FootprintBar
-from orderflow_system.config.settings import InitiativeConfig
+from orderflow_system.analytics.footprint import (FootprintBar, aggregate_levels, diagonal_imbalances,
+                                                  stacked_runs, validate_trade_bucket_ticks)
+from orderflow_system.config.settings import InitiativeConfig, TradeSignalConfig
 
 
 class InitiativeDetector:
@@ -40,8 +41,9 @@ class InitiativeDetector:
     3. Trend joining signal (strong initiative = join the move)
     """
 
-    def __init__(self, config: InitiativeConfig, tick_size: float = 0.1):
+    def __init__(self, config: InitiativeConfig, tick_size: float = 0.1, *, signals=None):
         self.config = config
+        self.signals = signals or TradeSignalConfig()
         self.tick_size = tick_size
         # Last 50 KNOWN participation rates, rather than a fixed bar window.
         # First/gap bars contribute nothing and never evict a known rate.
@@ -54,8 +56,18 @@ class InitiativeDetector:
         bar: InfoBar,
         delta: DeltaResult,
         footprint: FootprintBar,
+        *,
+        trade_footprint=None,
+        trade_bucket_ticks=None,
     ) -> Optional[Signal]:
         """Check a completed bar for initiative auction pattern."""
+        trade_mode = self.signals.initiative_imbalance != 'off'
+        if trade_mode:
+            if trade_footprint is None:
+                raise ValueError('initiative imbalance requires a trade footprint')
+            validate_trade_bucket_ticks(trade_bucket_ticks)
+            if trade_bucket_ticks != 100:
+                raise ValueError('initiative imbalance requires the registered $1 trade buckets')
         if bar.volume == 0:
             return None
 
@@ -99,7 +111,27 @@ class InitiativeDetector:
 
         # 5. One-sided imbalance prints (bonus strength) — only with real price levels
         imbalance_count = 0
-        if footprint.has_price_levels:
+        if trade_mode:
+            mult = self.signals.imbalance_bucket_mult
+            memo = getattr(trade_footprint, '_phase4b_aggregated', {})
+            if mult not in memo:
+                raw = getattr(trade_footprint, '_source', None)
+                if raw is None:
+                    rows = [(round(p * 100), round(lv.ask_volume * 1000), round(lv.bid_volume * 1000))
+                            for p, lv in trade_footprint.levels.items()]
+                    raw = tuple(zip(*rows)) if rows else ((), (), ())
+                memo[mult] = aggregate_levels(raw, mult)
+                trade_footprint._phase4b_aggregated = memo
+            levels = memo[mult]
+            total = sum(bid + ask for bid, ask in levels.values())
+            imbalances = diagonal_imbalances(levels, self.signals.imbalance_ratio,
+                                             self.signals.imbalance_min_level_share, total)
+            dir_str = 'buy' if delta_bullish else 'sell'
+            imbalance_count = sum(side == dir_str for _, side in imbalances)
+            stacked_run = stacked_runs(imbalances, 0)[dir_str]
+            if self.signals.initiative_imbalance == 'required' and stacked_run < self.signals.stacked_min_levels:
+                return None
+        elif footprint.has_price_levels:
             imbalances = footprint.imbalance_levels(threshold=3.0)
             dir_str = "buy" if delta_bullish else "sell"
             imbalance_count = sum(1 for _, d in imbalances if d == dir_str)
@@ -125,10 +157,12 @@ class InitiativeDetector:
                 "avg_rate": round(avg_rate, 2),
                 "vol_acceleration": round(accel, 2),
                 "body_bps": round(body_bps, 2),
-                "imbalance_levels": imbalance_count if footprint.has_price_levels else None,
+                "imbalance_levels": imbalance_count if trade_mode or footprint.has_price_levels else None,
                 "bar_close": "green" if bar.is_green else "red",
             },
         )
+        if trade_mode:
+            signal.details.update(imbalance_source='trade', stacked_run=stacked_run)
         self._signal_history.append(signal)
         return signal
 

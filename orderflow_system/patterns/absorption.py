@@ -103,6 +103,9 @@ class AbsorptionDetector:
         if bar.volume == 0:
             return None
 
+        if self.signals.absorption_source == 'trade':
+            return self._check_trade_absorption(bar, trade_footprint, trade_bucket_ticks)
+
         # ── Method 1: Delta vs Close Mismatch ──
         signal = self._check_delta_close_mismatch(bar, delta, footprint)
         if signal:

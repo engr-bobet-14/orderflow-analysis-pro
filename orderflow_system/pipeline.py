@@ -112,7 +112,7 @@ class InfoBarPipeline:
 
         self.absorption = AbsorptionDetector(config.absorption, tick_size=config.tick_size, clock=self.clock,
                                              signals=self.trade_config.signals)
-        self.initiative = InitiativeDetector(config.initiative, tick_size=config.tick_size)
+        self.initiative = InitiativeDetector(config.initiative, tick_size=config.tick_size, signals=self.trade_config.signals)
         self.exhaustion = ExhaustionDetector(config.exhaustion, signals=self.trade_config.signals)
         self.divergence = DivergenceDetector(config.divergence)
         self.detectors = [self.absorption, self.initiative, self.exhaustion, self.divergence]
@@ -155,7 +155,7 @@ class InfoBarPipeline:
         if self.trade_config.signals.any_enabled and trade is None:
             raise ValueError('enabled trade signals require trade input')
         signals = self.trade_config.signals
-        if signals.absorption_levels or signals.exhaustion_contrarian != 'off':
+        if signals.absorption_levels or signals.exhaustion_contrarian != 'off' or signals.initiative_imbalance != 'off':
             if trade.fp_bucket_ticks is None or trade.fp_bucket_ticks != round(self.trade_config.footprint_bucket*100):
                 raise DataIntegrityError('trade footprint bucket width differs from pipeline configuration')
         if self._last_ts is not None and bar.timestamp_ms < self._last_ts:
@@ -249,7 +249,8 @@ class InfoBarPipeline:
         for sig in (
             self.absorption.check_bar(bar, footprint, delta, bar.close,
                                       **(trade_args if cfg.absorption_levels else {})),
-            self.initiative.check_bar(bar, delta, footprint),
+            self.initiative.check_bar(bar, delta, footprint,
+                                      **(trade_args if cfg.initiative_imbalance != 'off' else {})),
             self.exhaustion.check_bar(bar, delta, self.delta_engine, footprint, recent,
                                       **(trade_args if cfg.exhaustion_contrarian != 'off' else {})),
             self.divergence.check_bar(bar, self.delta_engine),
