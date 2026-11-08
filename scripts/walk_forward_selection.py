@@ -102,6 +102,10 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if opt.read_study_attrs(args.study_db,args.study_name).get('identity',{}).get('phase') == 'phase4':
+        from scripts.phase4_policy import checked_write
+        args.output_dir = checked_write(args.output_dir)
+        checked_write(args.output_dir / f'walk_forward_{args.study_name}.json')
     trials = load_trial_folds(args.study_db, args.study_name)
     if not trials:
         raise ValueError(f"study {args.study_name} has no completed trials with fold results")

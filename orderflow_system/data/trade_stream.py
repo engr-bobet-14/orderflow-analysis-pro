@@ -46,8 +46,17 @@ class VerifiedHour:
 
 class TradeStream:
     def __init__(self, ds: PairedDataset, start_ordinal: int = 1, end_ordinal: int | None = None,
-                 *, threads=4, memory_limit='1GB', temp_dir: Path, batch_rows=1_000_000):
+                 *, threads=4, memory_limit='1GB', temp_dir: Path, batch_rows=1_000_000,
+                 development_only=False, query_observer=None):
         self.ds = ds
+        self.development_only = development_only
+        self.query_observer = query_observer
+        cutoff = 1704067200000  # 2024-01-01T00:00Z, exclusive
+        if development_only and any(f['min_time'] < cutoff <= f['max_time'] for f in ds.manifest['files']):
+            raise ValueError('development policy refuses a straddling trade file at 2024-01-01; no file was opened')
+        self.files = [f for f in ds.manifest['files'] if not development_only or f['min_time'] < cutoff]
+        if development_only and (ds.hours.hour_ms >= cutoff).any():
+            raise ValueError('development stream requires development-only hours')
         self.start_ordinal, self.end_ordinal = start_ordinal, end_ordinal
         self.threads, self.memory_limit = threads, memory_limit
         self.temp_dir = Path(temp_dir).resolve()
@@ -63,6 +72,9 @@ class TradeStream:
         self.report = {'hours_verified': 0, 'n_verified': 0, 'overscan_n': 0, 'files_verified': 0,
                        'per_day_rss': []}
         self.settings = {}
+        if development_only:
+            self.report['excluded_by_policy'] = [dict(f, authenticated=False)
+                for f in ds.manifest['files'] if f['min_time'] >= cutoff]
 
     def _canonical(self, batch, day):
         cols = {}
@@ -114,7 +126,7 @@ class TradeStream:
         if self.end_ordinal is not None:
             stop_idx = int(np.flatnonzero((hours.first_ordinal <= self.end_ordinal) &
                                          (hours.first_ordinal+hours.n_trades > self.end_ordinal))[0])
-        files = [dict(f, abs=Path(m['source_root'])/f['path']) for f in m['files']]
+        files = [dict(f, abs=Path(m['source_root'])/f['path']) for f in self.files]
         hashed, last_key = set(), None
         ordinal = int(hours.first_ordinal.iloc[start_idx])
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +148,8 @@ class TradeStream:
                 todays = [f for f in files if f['min_time'] < hi and f['max_time'] >= lo]
                 for f in todays:
                     _check_file(f, hashed)
+                if self.query_observer is not None:
+                    self.query_observer([str(f['abs']) for f in todays])
                 reader = None
                 batches = iter(())
                 current = np.empty(0, dtype=ROW_DTYPE)
@@ -218,7 +232,8 @@ class TradeStream:
             if full:
                 for f in files:
                     _check_file(f, hashed)
-                if ordinal-1 != m['n_trades'] or ordinal-1 != int(hours.n_trades.sum()):
+                expected = int(hours.n_trades.sum()) if self.development_only else m['n_trades']
+                if ordinal-1 != expected or ordinal-1 != int(hours.n_trades.sum()):
                     raise DataIntegrityError('manifest trade count mismatch')
             self.report['files_verified'] = len(hashed)
         ds.recheck()
@@ -291,8 +306,10 @@ class TradeReplay:
     Optional digest ranges use inclusive global closing-trade ordinals (InfoBar.seq).
     """
     def __init__(self, ds: PairedDataset, lanes, *, temp_dir: Path, threads=4, memory_limit='1GB',
-                 batch_rows=1_000_000, digest_ranges=None, raw_signal_ranges=None, window_signals=False):
+                 batch_rows=1_000_000, digest_ranges=None, raw_signal_ranges=None, window_signals=False,
+                 development_only=False, query_observer=None, update_sink=None):
         self.ds = ds
+        self.update_sink = update_sink
         self.lanes = {}
         for reader, pipeline in lanes:
             bt = reader.info.bar_type.value
@@ -312,7 +329,8 @@ class TradeReplay:
         start = min(l.w for l in self.lanes.values())
         end = None if self.full else max(l.last_tn for l in self.lanes.values())
         self.stream = TradeStream(ds, start, end, temp_dir=temp_dir, threads=threads,
-                                  memory_limit=memory_limit, batch_rows=batch_rows)
+                                  memory_limit=memory_limit, batch_rows=batch_rows,
+                                  development_only=development_only, query_observer=query_observer)
         self.report = None
 
     def __iter__(self):
@@ -356,6 +374,8 @@ class TradeReplay:
                         lane.final_lots += total
                         lane.final_days += 1
                     result = lane.pipeline.process_bar(bar, update)
+                    if self.update_sink is not None:
+                        self.update_sink(bt, bar, update, result)
                     lane.replay_digest.update(result)
                     lane.trade_digest.update(result, update)
                     if lane.raw_signal_digest is not None:

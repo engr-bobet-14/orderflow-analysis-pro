@@ -24,7 +24,9 @@ import sqlite3
 import signal
 import subprocess
 import sys
+import time
 import tempfile
+import threading
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,8 +39,9 @@ from orderflow_system.config.settings import INFO_BARS, get_all_configs
 from orderflow_system.data.infobar_feed import open_bars
 from orderflow_system.data.models import BarType, InfoBar
 from orderflow_system.ledger import TradeLedger
-from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest
+from orderflow_system.pipeline import InfoBarPipeline, ReplayDigest, RawSignalDigest
 from scripts.dataset_policy import DEV_END, DEV_START
+from scripts.phase4_studies import TRADE_SEARCH_SPACE_BOUNDS, effective_trade_config
 
 
 def json_safe(value):
@@ -375,18 +378,27 @@ def suggest_params(trial, space=None):
     return params
 
 
-def run_backtest(bars, instrument_config, price_proximity_pct, bar_type=None, prefix_ends=()):
-    replay = bar_only_pipeline(instrument_config, bar_type)
+def run_backtest(bars, instrument_config, price_proximity_pct, bar_type=None, prefix_ends=(),
+                 trade_updates=None, trade_config=None):
+    replay = (bar_only_pipeline(instrument_config, bar_type) if trade_updates is None else
+              InfoBarPipeline(instrument_config, bar_type, trade_config=trade_config))
+    if trade_updates is not None and len(trade_updates) < len(bars):
+        raise ValueError('trade cache has fewer updates than bars')
+    raw = RawSignalDigest() if trade_updates is not None else None
     replay.aggregator.price_proximity_pct = price_proximity_pct
     ledger, digest = TradeLedger(), ReplayDigest()
     prefix_digests = {}
     for idx, bar in enumerate(bars):
-        result = replay.process_bar(bar)
+        result = replay.process_bar(bar) if trade_updates is None else replay.process_bar(bar, trade_updates[idx])
+        if raw is not None:
+            raw.update(result)
         ledger.process_result(result)
         digest.update(result)
         if idx in prefix_ends:
             prefix_digests[idx] = digest.hexdigest()
-    return {"ledger": ledger, "replay_digest": digest.hexdigest(), "prefix_digests": prefix_digests}
+    return {"ledger": ledger, "replay_digest": digest.hexdigest(), "prefix_digests": prefix_digests,
+            "signal_counts": dict(replay.signal_counts),
+            **({"raw_signal_digest": raw.hexdigest()} if raw is not None else {})}
 
 
 def closed_execution_rows(shared_ledger):
@@ -569,11 +581,13 @@ def score_window(full, bars, start, end, min_trades):
             "n_scored_bars": end - start + 1}, trades
 
 
-def evaluate_fold(fold, bars, params, args, full=None):
+def evaluate_fold(fold, bars, params, args, full=None, trade_updates=None, trade_config=None):
     start, end = fold["score_start_idx"], int(fold["test_idx"].max())
     if full is None:
         result = run_backtest(bars[:end + 1], build_instrument_config(params, args.symbol),
-                              params["price_proximity_pct"], bars[0].bar_type)
+                              params["price_proximity_pct"], bars[0].bar_type,
+                              **({"trade_updates": trade_updates, "trade_config": trade_config}
+                                 if trade_updates is not None else {}))
         full = simulate_trades_risk_based(result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     metrics, _ = score_window(full, bars, start, end, args.min_trades_per_fold)
     return {**metrics, "n_context_bars": len(fold["context_idx"]), "n_test_bars": len(fold["test_idx"])}
@@ -581,8 +595,13 @@ def evaluate_fold(fold, bars, params, args, full=None):
 
 def objective(trial, bars, folds, args):
     params = suggest_params(trial, args.space)
+    replay_kwargs = {}
+    if getattr(args, 'phase4', False):
+        from scripts.phase4_studies import merged_params, trial_replay_kwargs
+        params = merged_params(args, params)
+        replay_kwargs = trial_replay_kwargs(args, params)
     result = run_backtest(bars, build_instrument_config(params, args.symbol),
-                          params["price_proximity_pct"], bars[0].bar_type)
+                          params["price_proximity_pct"], bars[0].bar_type, **replay_kwargs)
     full = simulate_trades_risk_based(result["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     results = [evaluate_fold(fold, bars, params, args, full) for fold in folds]
     value, feasible = trial_score(results, args.n_splits, args.min_trades_per_fold, args.min_total_trades)
@@ -596,6 +615,15 @@ def objective(trial, bars, folds, args):
              "n_scored_bars": sum(r["n_scored_bars"] for r in results), "n_bars_search": len(bars),
              "n_penalized_folds": sum(r["penalized"] for r in results),
              "raw_daily_sharpe": float(np.mean(raw)) if raw else None, "replay_digest": result["replay_digest"]}
+    if getattr(args, 'phase4', False):
+        import base64
+        from scripts.phase4_report import search_returns
+        returns = search_returns(full, bars, folds)
+        attrs.update(daily_returns_search={'dtype': '<f4', 'start': str(returns.index[0].date()),
+                     'blown': bool(returns.attrs['blown']),
+                     'n': len(returns), 'base64': base64.b64encode(returns.to_numpy(dtype='<f4').tobytes()).decode()},
+                     signal_counts=result['signal_counts'], raw_signal_digest=result.get('raw_signal_digest'),
+                     trade_signal_config=asdict(effective_trade_config(args, params).signals))
     for key, value in json_safe(attrs).items():
         trial.set_user_attr(key, value)
     return attrs["cv_sharpe_mean"]
@@ -658,6 +686,17 @@ def study_identity(args, metadata, warm_start=False):
                 "n_splits": args.n_splits, "embargo": args.embargo,
                 "holdout_fraction": args.holdout_fraction, "min_trades_per_fold": args.min_trades_per_fold,
                 "seed": args.seed}
+    if getattr(args, 'phase4', False):
+        from scripts.phase4_studies import arm_key
+        identity.update(phase='phase4',arm=arm_key(args),
+                        trade_signals=trade_signal_identity(effective_trade_config(args, {})),
+                        trade_cache=getattr(args, 'trade_cache_identity', None),
+                        frozen_params=getattr(args, 'frozen_identity', None),
+                        pruner='NopPruner', sampler={'name':'TPESampler', 'seed':args.seed},
+                        campaign_sha256=getattr(args, 'campaign_identity', None),
+                        phase4_source_fp=hashlib.sha256(b''.join((ROOT/name).read_bytes() for name in
+                            ('scripts/optimize_orderflow.py', 'scripts/phase4_studies.py',
+                             'scripts/phase4_policy.py', 'scripts/phase4_report.py'))).hexdigest())
     if warm_start:   # the seeds are not hashed: they are persisted in the stored identity (resolve_study)
         identity["warm_start"] = {"max": args.warm_start_max}
     space_fp = fingerprint(identity)
@@ -670,7 +709,25 @@ def study_lock_path(db, name):
     return Path(str(db) + "." + hashlib.sha256(name.encode()).hexdigest()[:16] + ".lock")
 
 
+def phase4_study_preflight(args):
+    from scripts.phase4_campaign import command_memory_plan
+    from scripts.phase4_resources import enforce_current
+    command=['--trade-signals',getattr(args,'trade_signals','off'),'--bar-type',args.bar_type]
+    if getattr(args,'trade_cache',None):command+=['--trade-cache',str(args.trade_cache)]
+    report=command_memory_plan(command,strict=True)
+    enforce_current()
+    args.phase4_memory_preflight=report
+    return report
+
+
 def open_study(args, name, identity, worker_index=0):
+    if getattr(args,'phase4',False) and name in _study_names(args.study_db):
+        phase4_db_admission(args.study_db,name,args)
+    from scripts.phase4_studies import legacy_study_guard
+    legacy_study_guard(args, name)
+    if getattr(args,'phase4',False) and args.n_jobs!=1:
+        raise ValueError('Phase 4 requires --n-jobs 1')
+    if getattr(args,'phase4',False):phase4_study_preflight(args)
     bar_only_pipeline(instrument_config(args.symbol), None if args.bar_type == "time_1m" else BarType(args.bar_type))
     import optuna
     args.study_db.parent.mkdir(parents=True, exist_ok=True)
@@ -678,6 +735,9 @@ def open_study(args, name, identity, worker_index=0):
     with file_lock(str(args.study_db) + ".init.lock"):
         storage = optuna.storages.RDBStorage(f"sqlite:///{args.study_db.resolve()}",
                                            engine_kwargs={"connect_args": {"timeout": 60}})
+        if getattr(args,'phase4',False):
+            from scripts.phase4_studies import campaign_arm
+            campaign_arm(args,name,under_init_lock=True)
         study = optuna.create_study(storage=storage, study_name=name, direction="maximize",
                                    sampler=optuna.samplers.TPESampler(seed=args.seed),
                                    pruner=optuna.pruners.NopPruner(), load_if_exists=True)
@@ -691,6 +751,18 @@ def open_study(args, name, identity, worker_index=0):
         if "identity" not in stored:
             study.set_user_attr("identity", identity)
             study.set_user_attr("versions", versions)
+        if getattr(args,'phase4',False):
+            study.set_user_attr('phase4_runtime_policy',phase4_runtime_policy())
+            study.set_user_attr('phase4_memory_preflight',[*stored.get('phase4_memory_preflight',[]),
+                {**args.phase4_memory_preflight,'utc':datetime.now(timezone.utc).isoformat()}])
+            study.set_user_attr('phase4_implied',getattr(args,'phase4_implied',False))
+            if 'owner_approval_sha256' not in stored:
+                study.set_user_attr('owner_approval_sha256',args.approval_sha256)
+            if 'gates_sha256' not in stored:
+                study.set_user_attr('gates_sha256',args.gates_sha256)
+            study.set_user_attr('phase4_approvals',[*stored.get('phase4_approvals',[]),
+                {'approval_sha256':args.approval_sha256,'gates_sha256':args.gates_sha256,
+                 'utc':datetime.now(timezone.utc).isoformat()}])
         # Warm-start reconcile: the identity (intent, with the seeds) is persisted above and the marker is set
         # last, so a crash at any point is repaired here. A seed trial in any state counts as present.
         seeds = identity.get("warm_start", {}).get("seeds")
@@ -701,7 +773,8 @@ def open_study(args, name, identity, worker_index=0):
                 if key not in have:
                     study.enqueue_trial(seed["params"], user_attrs={"warm_start_source": key}, skip_if_exists=True)
             study.set_user_attr("warm_start_done", True)
-        study.sampler = optuna.samplers.TPESampler(seed=(args.seed + worker_index * 1_000_003 + len(study.trials)) % 2**32,
+        seed_count=sum(t.state.name=='COMPLETE' for t in study.trials) if getattr(args,'phase4',False) else len(study.trials)
+        study.sampler = optuna.samplers.TPESampler(seed=(args.seed + worker_index * 1_000_003 + seed_count) % 2**32,
                                                   constant_liar=args.n_jobs > 1)
     return study
 
@@ -711,15 +784,424 @@ def complete_trials(study):
     return study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
 
 
+def persist_failed_reconciliation(study,trial,record):
+    """Optuna seals finished attrs; audit only FAIL rows under the exclusive worker locks."""
+    from sqlalchemy import text
+    storage=study._storage;backend=getattr(storage,'_backend',storage)
+    params={'trial':trial._trial_id,'value':json.dumps(record)}
+    with backend.engine.begin() as connection:
+        state=connection.execute(text('SELECT state FROM trials WHERE trial_id=:trial'),params).scalar_one()
+        if state!='FAIL':raise ValueError('finished reconciliation may only annotate FAIL trials')
+        result=connection.execute(text("UPDATE trial_user_attributes SET value_json=:value WHERE trial_id=:trial AND key='phase4_reconciled'"),params)
+        if not result.rowcount:
+            connection.execute(text("INSERT INTO trial_user_attributes(trial_id,key,value_json) VALUES (:trial,'phase4_reconciled',:value)"),params)
+    # Refresh this failed row through Optuna's normal cache synchronization.
+    if storage is not backend:
+        with storage._lock:
+            storage._studies[study._study_id].unfinished_trial_ids.add(trial._trial_id)
+
+
+def reconcile_phase4_trials(study,args):
+    """Caller holds exclusive study AND worker locks; COMPLETE rows are never changed."""
+    if not getattr(args,'phase4',False):return
+    resolve_phase4_pending(study,args)
+    from optuna.trial import TrialState
+    audit=list(study.user_attrs.get('phase4_reconciliation_audit',[]))
+    accounted=phase4_runtime_baseline(study)
+    for trial in study.get_trials():
+        record=next((r for r in audit if r.get('trial')==trial.number and
+            r.get('accounting')=='conservative_upper_bound'),trial.user_attrs.get('phase4_reconciled'))
+        pending=trial.state in (TrialState.RUNNING,TrialState.WAITING)
+        timing=trial.user_attrs.get('phase4_timing',{})
+        unfinished=bool(timing) and 'phase4_wall_seconds' not in trial.user_attrs and trial.state!=TrialState.COMPLETE
+        if pending or unfinished:
+            owner=trial.user_attrs.get('phase4_worker',{})
+            record=record or {'trial':trial.number,'from_state':trial.state.name,
+                'reconciled_utc':datetime.now(timezone.utc).isoformat(),'reason':'orphan after interruption',
+                **{k:owner[k] for k in ('pid','host') if k in owner}}
+            if record.get('accounting')!='conservative_upper_bound':
+                started=timing.get('started_utc',(trial.datetime_start or datetime.now()).isoformat())
+                heartbeat=timing.get('heartbeat_utc',started)
+                delta=(datetime.fromisoformat(heartbeat)-datetime.fromisoformat(started)).total_seconds()
+                bound=timing.get('stale_seconds',PHASE4_HEARTBEAT_STALE_SECONDS)
+                elapsed=max(0.,delta,timing.get('wall_seconds',0.),trial.user_attrs.get('phase4_wall_seconds',0.))
+                record={**record,'accounting':'conservative_upper_bound','stale_bound_seconds':bound,
+                        'accounted_seconds':elapsed+bound,'heartbeat_utc':heartbeat,
+                        'started_utc':started,'runtime_seconds':max(accounted,
+                            timing.get('runtime_seconds',0.)+max(0.,elapsed-timing.get('wall_seconds',0.)))+bound}
+            accounted=max(accounted,record.get('runtime_seconds',0.))
+            if record!=trial.user_attrs.get('phase4_reconciled'):
+                if trial.state==TrialState.FAIL:persist_failed_reconciliation(study,trial,record)
+                else:study._storage.set_trial_user_attr(trial._trial_id,'phase4_reconciled',record)
+            if pending:study._storage.set_trial_state_values(trial._trial_id,TrialState.FAIL)
+        # Repair interruptions between the durable trial record, FAIL and study-level audit.
+        if record and record not in audit:audit.append(record)
+    if audit!=study.user_attrs.get('phase4_reconciliation_audit',[]):
+        study.set_user_attr('phase4_reconciliation_audit',audit)
+    accounted=phase4_runtime_baseline(study)
+    if accounted>study.user_attrs.get('phase4_runtime_seconds',0.):
+        study.set_user_attr('phase4_runtime_seconds',accounted)
+    reconciled_runtime_stop(study,args)
+
+
+def reconciled_runtime_stop(study,args):
+    """Reconstruct a lost live stop before admitting any new trial."""
+    if study.user_attrs.get('phase4_runtime_stop') is not None:return
+    boundary=study.user_attrs.get('phase4_runtime_reset',{}).get('last_trial_number',-1)
+    limit=getattr(args,'max_trial_seconds',None)
+    records={r['trial']:r for r in study.user_attrs.get('phase4_reconciliation_audit',[])
+             if r.get('accounting')=='conservative_upper_bound'}
+    for trial in study.trials:
+        attrs=getattr(trial,'user_attrs',{});record=records.get(getattr(trial,'number',None)) or attrs.get('phase4_reconciled',{})
+        breach=attrs.get('phase4_heartbeat_health',{}).get('memory_breach')
+        if not breach and record.get('accounting')!='conservative_upper_bound':continue
+        if trial.number<=boundary:continue
+        stop={'live':False,'reconciled':True,'trial':trial.number,'utc':datetime.now(timezone.utc).isoformat()}
+        if breach:stop.update(reason='memory',heartbeat_health=breach,**breach)
+        elif record.get('accounting')=='conservative_upper_bound' and limit is not None and record['accounted_seconds']>limit:
+            stop.update(reason='max_trial_seconds',measured_seconds=record['accounted_seconds'],limit_seconds=limit)
+        else:continue
+        study.set_user_attr('phase4_runtime_stop',stop)
+        return
+    study_limit=getattr(args,'max_study_seconds',None)
+    elapsed=phase4_runtime_baseline(study)-study.user_attrs.get('phase4_runtime_reset',{}).get('runtime_seconds',0.)
+    if study_limit is not None and elapsed>study_limit:
+        study.set_user_attr('phase4_runtime_stop',{'reason':'max_study_seconds','live':False,'reconciled':True,
+            'measured_seconds':elapsed,'limit_seconds':study_limit,'utc':datetime.now(timezone.utc).isoformat()})
+
+
+PHASE4_HEARTBEAT_SECONDS=30.
+PHASE4_HEARTBEAT_STALE_SECONDS=90.
+PHASE4_FINAL_CHECKPOINT_ATTEMPTS=3
+
+
+def resolve_phase4_pending(study,args=None):
+    """Caller holds the study/worker locks; durable audit records make recovery repeatable."""
+    from types import SimpleNamespace
+    pending=study.user_attrs.get('phase4_accounting_pending')
+    if pending:
+        limits=SimpleNamespace(**{k:pending.get('limits',{}).get(k,getattr(args,k,None))
+                                 for k in ('max_trial_seconds','max_study_seconds')})
+        trial=next(t for t in study.trials if t.number==pending['trial'])
+        audit=list(study.user_attrs.get('phase4_reconciliation_audit',[]))
+        record=next((r for r in audit if r.get('trial')==trial.number and
+            r.get('accounting')=='conservative_upper_bound'),trial.user_attrs.get('phase4_reconciled'))
+        if not record or record.get('accounting')!='conservative_upper_bound':
+            elapsed=max(pending['wall_seconds'],(datetime.fromisoformat(pending['heartbeat_utc'])-
+                datetime.fromisoformat(pending['started_utc'])).total_seconds())
+            charged=elapsed+pending['stale_bound']
+            record={'trial':trial.number,'from_state':trial.state.name,'accounting':'conservative_upper_bound',
+                'reason':'unresolved accounting marker','reconciled_utc':datetime.now(timezone.utc).isoformat(),
+                'accounted_seconds':charged,'stale_bound_seconds':pending['stale_bound'],
+                'started_utc':pending['started_utc'],'heartbeat_utc':pending['heartbeat_utc'],
+                'runtime_seconds':max(phase4_runtime_baseline(study),pending['runtime_seconds_before']+charged)}
+        if record not in audit:study.set_user_attr('phase4_reconciliation_audit',[*audit,record])
+        study.set_user_attr('phase4_runtime_seconds',max(phase4_runtime_baseline(study),record['runtime_seconds']))
+        reconciled_runtime_stop(study,limits)
+        study.set_user_attr('phase4_accounting_pending',None)
+    pending=study.user_attrs.get('phase4_memory_check_pending')
+    if pending:
+        stop={'reason':'memory','live':False,'unresolved_check':True,**pending}
+        previous=study.user_attrs.get('phase4_runtime_stop')
+        if previous!=stop and (previous or {}).get('memory_breach')!=stop:persist_phase4_stop(study,stop)
+        study.set_user_attr('phase4_memory_check_pending',None)
+
+
+def phase4_db_admission(db,name,args=None):
+    """Normal reads stay read-only; repair only live Phase 4 DBs under exclusive locks."""
+    attrs=read_study_attrs(db,name)
+    if attrs.get('phase4_accounting_pending') or attrs.get('phase4_memory_check_pending'):
+        if attrs.get('identity',{}).get('phase')!='phase4':raise ValueError('pending repair requires a Phase 4 study')
+        from scripts.phase4_policy import phase4_db_path,checked_write
+        import optuna
+        db=phase4_db_path(db);lock=checked_write(study_lock_path(db,name))
+        with file_lock(lock,nonblocking=True),file_lock(checked_write(str(lock)+'.workers'),nonblocking=True):
+            study=optuna.load_study(storage='sqlite:///'+str(db),study_name=name)
+            resolve_phase4_pending(study,args)
+            attrs=study.user_attrs
+    if attrs.get('phase4_runtime_stop') is not None:
+        raise ValueError('Phase 4 runtime stop; owner decision required')
+    return attrs
+
+
+@contextmanager
+def phase4_terminal_writeahead(study,terminal):
+    storage=getattr(study,'_storage',None)
+    if storage is None:
+        yield
+        return
+    commit=storage.set_trial_state_values
+    def guarded(trial_id,state,values=None):
+        if state.is_finished():
+            if study.user_attrs.get('phase4_accounting_pending'):
+                raise ValueError('unresolved accounting marker before terminal commit')
+            pending=terminal['accounting']()
+            study.set_user_attr('phase4_accounting_pending',pending)
+        result=commit(trial_id,state,values)
+        if state.is_finished():
+            terminal['committed']={'trial':pending['trial'],'wall_seconds':terminal['wall_seconds']()}
+        return result
+    storage.set_trial_state_values=guarded
+    try:yield
+    finally:storage.set_trial_state_values=commit
+
+
+def phase4_runtime_policy():
+    return {'interval_seconds':PHASE4_HEARTBEAT_SECONDS,'stale_seconds':PHASE4_HEARTBEAT_STALE_SECONDS,
+            'accounting':'pending/unfinished max(heartbeat elapsed, recorded wall) + stale bound, once per trial',
+            'study_ceiling':'checked between trials; overshoot bounded by one live trial ceiling'}
+
+
+def persist_phase4_stop(study,stop):
+    """Keep the first stop; subsequent memory evidence cannot replace its reason or boundary."""
+    previous=study.user_attrs.get('phase4_runtime_stop')
+    if previous is None:study.set_user_attr('phase4_runtime_stop',stop)
+    elif stop['reason']=='memory':study.set_user_attr('phase4_runtime_stop',{**previous,'memory_breach':stop})
+
+
+def persist_phase4_memory_stop(study,exc,phase,trial=None):
+    from scripts.phase4_resources import MemoryBoundsError,PRIVATE_BUDGET
+    stop={'reason':'memory','live':False,'phase':phase,'utc':datetime.now(timezone.utc).isoformat()}
+    if trial is not None:stop['trial']=trial
+    if isinstance(exc,MemoryBoundsError):stop.update(measurement=exc.measurement,bounds=exc.bounds)
+    else:stop.update(error=str(exc),measurement={'error':str(exc)},bounds={
+        'rss_limit_bytes':PRIVATE_BUDGET,'private_limit_bytes':PRIVATE_BUDGET,'private_measurement_available':False})
+    persist_phase4_stop(study,stop)
+
+
+@contextmanager
+def phase4_memory_check(study,phase,trial=None):
+    if study.user_attrs.get('phase4_memory_check_pending') or study.user_attrs.get('phase4_accounting_pending'):
+        resolve_phase4_pending(study)
+        if study.user_attrs.get('phase4_runtime_stop') is not None:
+            raise ValueError('Phase 4 runtime stop; owner decision required')
+    study.set_user_attr('phase4_memory_check_pending',{'phase':phase,'trial':trial,'utc':datetime.now(timezone.utc).isoformat()})
+    try:yield
+    except Exception as exc:
+        persist_phase4_memory_stop(study,exc,phase,trial)
+        study.set_user_attr('phase4_memory_check_pending',None)
+        raise
+    else:study.set_user_attr('phase4_memory_check_pending',None)
+
+
+def phase4_fatal(message,study=None,stop=None,deadline=None):
+    """Never unwind through Optuna: leave the active row RUNNING for reconciliation."""
+    print('Phase 4 fatal: '+message,file=sys.stderr,flush=True)
+    if stop is not None:
+        def persist():
+            try:persist_phase4_stop(study,stop)
+            except Exception as exc:print('Stop persistence failed: '+str(exc),file=sys.stderr,flush=True)
+        writer=threading.Thread(target=persist,daemon=True);writer.start()
+        remaining=max(0.,deadline-time.perf_counter()-min(.25,PHASE4_HEARTBEAT_SECONDS/10)) if deadline is not None else .5
+        writer.join(timeout=min(.5,remaining))
+        if writer.is_alive():print('Stop persistence unavailable before watchdog deadline',file=sys.stderr,flush=True)
+    os._exit(70)
+
+
+@contextmanager
+def phase4_trial_timing(trial,study,prior,begun,args=None,terminal=None):
+    """Retry checkpoints, with an independent watchdog and live runtime/memory limits."""
+    from scripts.phase4_resources import current_memory,memory_bounds
+    started=time.perf_counter();started_utc=datetime.now(timezone.utc)
+    last_success=started
+    done=threading.Event();pulse_done=threading.Event();terminating=threading.Event();active=False
+    health={'consecutive_failures':0,'total_failures':0,'last_error':None,'longest_gap_seconds':0.}
+    memory={'peak_rss_bytes':0,'peak_private_bytes':0,'private_metric':None}
+    def terminate(message,record=None):
+        terminating.set()
+        phase4_fatal(message,study,record,last_success+PHASE4_HEARTBEAT_STALE_SECONDS)
+    def stop(reason,**fields):
+        return {'reason':reason,'live':True,'trial':trial.number,'utc':datetime.now(timezone.utc).isoformat(),**fields}
+    def memory_health(breach):
+        health['memory_breach']=breach
+        try:trial.set_user_attr('phase4_heartbeat_health',dict(health))
+        except Exception:pass
+    def checkpoint(final=False):
+        nonlocal last_success
+        try:sample=current_memory()
+        except Exception as exc:
+            memory_health({'error':str(exc),'private_measurement_available':False})
+            terminate('memory measurement unavailable',stop('memory',error=str(exc)))
+        memory['peak_rss_bytes']=max(memory['peak_rss_bytes'],sample.get('peak_rss_bytes',sample['rss_bytes']))
+        private=sample.get('peak_private_bytes',sample.get('private_bytes'))
+        if private is not None:memory['peak_private_bytes']=max(memory['peak_private_bytes'],private)
+        memory['private_metric']=sample.get('private_metric')
+        memory['private_measurement_available']=private is not None and not sample.get('private_is_fallback',False)
+        bounds=memory_bounds(sample)
+        if not bounds['pass']:
+            memory_health({'measurement':sample,'bounds':bounds})
+            try:trial.set_user_attr('phase4_memory',dict(memory))
+            except Exception:pass
+            terminate('memory bounds exceeded or unavailable',stop('memory',measurement=sample,bounds=bounds))
+        stamp=time.perf_counter();now=datetime.now(timezone.utc).isoformat()
+        timing={'started_utc':started_utc.isoformat(),'heartbeat_utc':now,'wall_seconds':stamp-started,
+                'runtime_seconds':prior+stamp-begun,'stale_seconds':PHASE4_HEARTBEAT_STALE_SECONDS}
+        snapshot={**health,'consecutive_failures':0,
+                  'longest_gap_seconds':max(health['longest_gap_seconds'],stamp-last_success)}
+        trial.set_user_attr('phase4_memory',dict(memory))
+        trial.set_user_attr('phase4_heartbeat_health',snapshot)
+        trial.set_user_attr('phase4_heartbeat_utc',now)
+        study.set_user_attr('phase4_runtime_seconds',timing['runtime_seconds'])
+        trial.set_user_attr('phase4_timing',timing)
+        if final:trial.set_user_attr('phase4_wall_seconds',time.perf_counter()-started)
+        health.update(snapshot);last_success=stamp
+    def attempt(final=False):
+        try:checkpoint(final);return True
+        except Exception as exc:
+            health['consecutive_failures']+=1;health['total_failures']+=1
+            health['last_error']=str(exc)
+            health['longest_gap_seconds']=max(health['longest_gap_seconds'],time.perf_counter()-last_success)
+            try:trial.set_user_attr('phase4_heartbeat_health',dict(health))
+            except Exception:pass
+            return False
+    def bounded_checkpoint(final=False):
+        for index in range(PHASE4_FINAL_CHECKPOINT_ATTEMPTS):
+            if attempt(final):return
+            if index+1<PHASE4_FINAL_CHECKPOINT_ATTEMPTS:time.sleep(min(PHASE4_HEARTBEAT_SECONDS/4,.1))
+        try:trial.set_user_attr('phase4_heartbeat_health',dict(health))
+        except Exception as exc:print('Heartbeat health persistence failed: '+str(exc),file=sys.stderr,flush=True)
+        raise ValueError('Phase 4 final heartbeat checkpoint failed' if final else 'Phase 4 initial heartbeat checkpoint failed')
+    def pulse():
+        while not pulse_done.wait(PHASE4_HEARTBEAT_SECONDS):attempt()
+    def watchdog():
+        cadence=min(.25,PHASE4_HEARTBEAT_SECONDS/10)
+        while not done.wait(cadence):
+            now=time.perf_counter()
+            # Leave scheduling margin before the accounting bound expires.
+            if now-last_success>=PHASE4_HEARTBEAT_STALE_SECONDS-2*cadence:
+                terminate('heartbeat stale; leaving trial RUNNING')
+            limit=getattr(args,'max_trial_seconds',None)
+            if active and limit is not None and now-started>limit:
+                terminate('live max_trial_seconds exceeded',
+                          stop('max_trial_seconds',measured_seconds=now-started,limit_seconds=limit))
+    guard=threading.Thread(target=watchdog,daemon=True);guard.start()
+    def close():
+        # Bypass the storage cache: a returned objective is not a committed terminal row.
+        storage=study._storage;backend=getattr(storage,'_backend',storage)
+        try:finished=backend.get_trial(trial._trial_id).state.is_finished()
+        except Exception as exc:terminate('terminal state durability unavailable: '+str(exc))
+        if not finished:terminate('terminal state not durably committed; leaving trial RUNNING')
+        done.set();guard.join()
+    if terminal is not None:terminal['close']=close
+    if terminal is not None:
+        terminal['wall_seconds']=lambda:time.perf_counter()-started
+        def accounting():
+            timing=study._storage.get_trial(trial._trial_id).user_attrs.get('phase4_timing',{})
+            return {'trial':trial.number,'started_utc':started_utc.isoformat(),
+                'heartbeat_utc':timing.get('heartbeat_utc',started_utc.isoformat()),
+                'wall_seconds':time.perf_counter()-started,'runtime_seconds_before':prior+started-begun,
+                'stale_bound':PHASE4_HEARTBEAT_STALE_SECONDS,
+                'limits':{k:getattr(args,k,None) for k in ('max_trial_seconds','max_study_seconds')}}
+        terminal['accounting']=accounting
+    heartbeat=None
+    try:
+        bounded_checkpoint()
+        active=True
+        heartbeat=threading.Thread(target=pulse,daemon=True);heartbeat.start()
+        try:yield
+        finally:
+            while terminating.is_set():time.sleep(.01)  # Fatal writer must exit before Optuna can finish the row.
+            pulse_done.set();heartbeat.join()
+            bounded_checkpoint(final=True)
+    finally:
+        if terminal is None:done.set();guard.join()
+
+
+def phase4_runtime_baseline(study):
+    """Persisted loop/checkpoint time dominates; legacy fallback excludes reconciled FAILs."""
+    trials=study.trials
+    stored=study.user_attrs.get('phase4_runtime_seconds')
+    if stored is None:
+        stored=sum(getattr(t,'user_attrs',{}).get('phase4_wall_seconds',
+            (t.datetime_complete-t.datetime_start).total_seconds() if t.datetime_start and t.datetime_complete else 0.)
+            for t in trials if 'phase4_reconciled' not in getattr(t,'user_attrs',{}))
+    return max([stored,*[r.get('runtime_seconds',0.) for r in study.user_attrs.get('phase4_reconciliation_audit',[])],
+                        *[getattr(t,'user_attrs',{}).get(key,{}).get('runtime_seconds',0.)
+                        for t in trials for key in ('phase4_timing','phase4_reconciled')]])
+
+
+def phase4_runtime_stop(study,args,elapsed):
+    """Persist a stop before another admission; a resume cannot erase an earlier stop."""
+    if study.user_attrs.get('phase4_runtime_stop') is not None:return True
+    reset=study.user_attrs.get('phase4_runtime_reset',{})
+    reason=None;measured=None;limit=None
+    trial_limit=getattr(args,'max_trial_seconds',None)
+    if trial_limit is not None:
+        terminal_wall=study.user_attrs.get('phase4_terminal_wall_seconds',{})
+        for trial in study.trials:
+            if trial.number<=reset.get('last_trial_number',-1):continue
+            duration=terminal_wall.get(str(trial.number))
+            if duration is None:
+                if trial.state.name!='COMPLETE':continue
+                duration=trial.user_attrs.get('phase4_wall_seconds')
+            if duration is None and trial.datetime_complete and trial.datetime_start:
+                duration=(trial.datetime_complete-trial.datetime_start).total_seconds()
+            if duration is not None and duration>trial_limit:
+                reason,measured,limit='max_trial_seconds',duration,trial_limit
+                break
+    study_limit=getattr(args,'max_study_seconds',None)
+    since_reset=elapsed-reset.get('runtime_seconds',0.)
+    if reason is None and study_limit is not None and since_reset>study_limit:
+        reason,measured,limit='max_study_seconds',since_reset,study_limit
+    if reason is not None:
+        study.set_user_attr('phase4_runtime_stop',{'reason':reason,'measured_seconds':measured,
+            'limit_seconds':limit,'utc':datetime.now(timezone.utc).isoformat()})
+        return True
+    return False
+
+
 def optimize_loop(study, bars, folds, args, parent_pid=None):
     import optuna
+    phase4=getattr(args,'phase4',False)
+    if phase4 and args.n_jobs!=1:raise ValueError('Phase 4 requires --n-jobs 1')
+    if phase4:resolve_phase4_pending(study,args)
+    begun=time.perf_counter()
+    prior=phase4_runtime_baseline(study) if phase4 else 0.
+    if phase4:
+        study.set_user_attr('phase4_runtime_policy',phase4_runtime_policy())
+        study.set_user_attr('phase4_runtime_seconds',prior)
+        reconciled_runtime_stop(study,args)
     while parent_pid is None or os.getppid() == parent_pid:
+        if phase4 and phase4_runtime_stop(study,args,prior+time.perf_counter()-begun):break
         if len(complete_trials(study)) >= args.n_trials:
             break
-        # Per-trial seeding makes sequential resumes reproduce uninterrupted proposals.
-        study.sampler = optuna.samplers.TPESampler(seed=(args.seed + getattr(args, "worker_index", 0) * 1_000_003 + len(study.trials)) % 2**32,
+        # Phase 4 seeds count COMPLETE proposals only; failed/reconciled rows do not advance them.
+        seed_count=len(complete_trials(study)) if phase4 else len(study.trials)
+        study.sampler = optuna.samplers.TPESampler(seed=(args.seed + getattr(args, "worker_index", 0) * 1_000_003 + seed_count) % 2**32,
                                                   constant_liar=args.n_jobs > 1)
-        study.optimize(lambda trial: objective(trial, bars, folds, args), n_trials=1)
+        if getattr(args,'phase4',False):
+            from scripts.phase4_resources import MemoryBoundsError,enforce_current,mapped_cache_files
+            terminal={}
+            def run_trial(trial):
+                import socket
+                trial.set_user_attr('phase4_worker',{'pid':os.getpid(),'host':socket.gethostname()})
+                with phase4_trial_timing(trial,study,prior,begun,args,terminal=terminal):
+                    return objective(trial,bars,folds,args)
+            try:
+                try:
+                    with phase4_terminal_writeahead(study,terminal):study.optimize(run_trial, n_trials=1)
+                finally:
+                    try:
+                        if 'committed' in terminal:
+                            committed=terminal['committed']
+                            durations={**study.user_attrs.get('phase4_terminal_wall_seconds',{}),
+                                       str(committed['trial']):committed['wall_seconds']}
+                            study.set_user_attr('phase4_terminal_wall_seconds',durations)
+                        elapsed=prior+time.perf_counter()-begun
+                        study.set_user_attr('phase4_runtime_seconds',elapsed)
+                        phase4_runtime_stop(study,args,elapsed)
+                    finally:
+                        if terminal:terminal['close']()
+                    if terminal:study.set_user_attr('phase4_accounting_pending',None)
+            except MemoryBoundsError as exc:
+                persist_phase4_memory_stop(study,exc,'trial',study.trials[-1].number)
+                raise
+            updates=getattr(args,'trade_updates',None)
+            mapped=sum(mapped_cache_files(updates.path).values()) if updates is not None else 0
+            with phase4_memory_check(study,'post_trial',getattr(study.trials[-1],'number',None)):
+                enforce_current(mapped)
+        else:
+            study.optimize(lambda trial: objective(trial, bars, folds, args), n_trials=1)
 
 
 def worker_main(args, name, identity, cache_path, n_search, parent_pid, index):
@@ -1034,7 +1516,9 @@ def deflated_gate(study, returns, *, ineligible_reason=None, campaign=None):
                      if entries else {**base, "passes": None, "status": "indeterminate"})
 
 
-def evaluate_holdout(study, bars, n_search, args):
+def evaluate_holdout(study, bars, n_search, args, trade_updates=None, trade_config=None):
+    if getattr(args, 'phase4', False):
+        raise ValueError('Phase 4 requires --holdout-look')
     prior_evaluations = sum(key.startswith("holdout::") for key in study.user_attrs)
     if prior_evaluations > 0:
         print("Warning: repeated looks erode holdout independence "
@@ -1050,7 +1534,9 @@ def evaluate_holdout(study, bars, n_search, args):
         return {**base, "status": "not_evaluated", "reason": "no feasible trial to evaluate"}
     best = max(candidates, key=lambda t: t.value)
     replay = run_backtest(bars, build_instrument_config(best.params, args.symbol),
-                           best.params["price_proximity_pct"], bars[0].bar_type)
+                           best.params["price_proximity_pct"], bars[0].bar_type,
+                           **({"trade_updates": trade_updates, "trade_config": trade_config}
+                              if trade_updates is not None else {}))
     full = simulate_trades_risk_based(replay["ledger"], fee_bps=args.fee_bps, slippage_bps=args.slippage_bps)
     start = n_search + int(len(bars) * args.embargo)
     metrics, trades = score_window(full, bars, start, len(bars) - 1, args.min_trades_per_fold)
@@ -1082,6 +1568,7 @@ def git_state():
 
 
 def study_result(study, args, metadata, identity):
+    if getattr(args,'phase4',False):resolve_phase4_pending(study,args)
     trials = complete_trials(study)
     feasible = [t for t in trials if t.user_attrs.get("feasible") is True]
     best = max(feasible, key=lambda t: t.value) if feasible else None
@@ -1089,8 +1576,24 @@ def study_result(study, args, metadata, identity):
     best_infeasible = max(trials, key=lambda t: t.value).number if best_degenerate else None
     if best_degenerate:
         print(f"Warning: {study.study_name}: no feasible trial; best_* fields are empty")
-    return json_safe({"study_name": study.study_name, "symbol": args.symbol, "bar_type": args.bar_type,
-        "best_params": best.params if best else None, "best_objective": best.value if best else None,
+    recovery={}
+    if getattr(args,'phase4',False):
+        if study.user_attrs.get('phase4_runtime_stop') is not None:
+            raise ValueError('Phase 4 runtime stop; owner decision required')
+        from scripts.phase4_studies import trial_recovery
+        from scripts.phase4_resources import current_memory,enforce_memory,mapped_cache_files
+        updates=getattr(args,'trade_updates',None)
+        mapped=sum(mapped_cache_files(updates.path).values()) if updates is not None else 0
+        with phase4_memory_check(study,'result'):
+            sample=current_memory()
+            bounds=enforce_memory(sample,mapped)
+        recovery={'trial_recovery':trial_recovery(study.trials),'memory':sample,
+                  'memory_bounds':bounds,'mapped_cache_bytes':mapped,
+                  'phase4_runtime_seconds':study.user_attrs.get('phase4_runtime_seconds',0.),
+                  'phase4_runtime_stop':study.user_attrs.get('phase4_runtime_stop')}
+    return json_safe({**recovery,"study_name": study.study_name, "symbol": args.symbol, "bar_type": args.bar_type,
+        "best_params": (best.user_attrs['params'] if getattr(args, 'phase4', False) else best.params) if best else None,
+        "best_objective": best.value if best else None,
         "best_trial_number": best.number if best else None, "best_degenerate": best_degenerate,
         "best_infeasible_trial_number": best_infeasible,
         "n_scored_bars": best.user_attrs["n_scored_bars"] if best else 0,
@@ -1135,7 +1638,8 @@ def dry_run_plan(args, cache_path, resolved):
     bars = CachedBars(cache_path, args.bar_type)
     n_search, _ = split_timeline(bars, args)
     widened = [n for n, (lo, hi, _) in args.space.items()
-               if lo < SEARCH_SPACE_BOUNDS[n][0] or hi > SEARCH_SPACE_BOUNDS[n][1]]
+               if lo < {**SEARCH_SPACE_BOUNDS, **TRADE_SEARCH_SPACE_BOUNDS}[n][0]
+               or hi > {**SEARCH_SPACE_BOUNDS, **TRADE_SEARCH_SPACE_BOUNDS}[n][1]]
     prior = (sum(key.startswith("holdout::") for key in read_study_attrs(args.study_db, resolved["name"]))
              if resolved["mode"].startswith("resume") else 0)
     plan = json_safe({
@@ -1156,13 +1660,36 @@ def dry_run_plan(args, cache_path, resolved):
 
 
 def optimize_study(args, cache_path, metadata):
+    if getattr(args, 'phase4', False):
+        if not args.dry_run and not getattr(args,'phase4_memory_preflight',None):phase4_study_preflight(args)
+        from scripts import phase4_studies as p4
+        bars = CachedBars(cache_path, args.bar_type)
+        p4.attach_cache(args, bars)
+        if args.campaign_manifest:
+            p4.campaign_arm(args)
+        if args.holdout_look:
+            if args.dry_run:
+                return {'dry_run':True, 'study_name':'holdout_plan', 'holdout_candidate':args.holdout_look}
+            return p4.holdout_look(args, bars)
+        p4.load_frozen(args, bars)
+        if args.trade_signals == 'framing_trades':
+            if args.dry_run:
+                return {'dry_run':True, 'study_name':'deterministic_candidate', 'params':args.frozen_values,
+                        'trade_cache':args.trade_cache_identity}
+            return p4.write_candidate(args, bars)
+        if not args.space:
+            raise ValueError('empty search space; use deterministic candidate evaluation')
     resolved = resolve_study(args, metadata)
     name, identity = resolved["name"], resolved["identity"]
+    if getattr(args,'phase4',False) and args.campaign_manifest:
+        p4.campaign_arm(args,name)
     for skip in resolved["skipped"]:
         print(f"Warm start: skipped {skip['study']} trial {skip['trial']}: {skip['reason']}", file=sys.stderr)
     print(f"Warm start: {resolved['mode']}, {len(resolved['seeds'])} seed(s) [{name}]", file=sys.stderr)
     if args.dry_run:
         return dry_run_plan(args, cache_path, resolved)
+    from scripts.phase4_studies import legacy_study_guard
+    legacy_study_guard(args, name)
     study = open_study(args, name, identity)
     if resolved["mode"] == "new_warm":
         study.set_user_attr("warm_start_skipped", resolved["skipped"])
@@ -1173,11 +1700,14 @@ def optimize_study(args, cache_path, metadata):
         # Orphan workers retain their own shared descriptors even after parent death.
         with file_lock(str(lock) + ".workers", nonblocking=True,
                        message="orphaned workers still running; wait or kill pid(s)"):
-            pass
-        if args.n_jobs == 1:
-            optimize_loop(study, bars[:n_search], folds, args)
-        else:
-            run_workers(study, args, name, identity, cache_path, n_search)
+            if getattr(args,'phase4',False):
+                reconcile_phase4_trials(study,args)
+                optimize_loop(study,bars[:n_search],folds,args)
+        if not getattr(args,'phase4',False):
+            if args.n_jobs == 1:
+                optimize_loop(study, bars[:n_search], folds, args)
+            else:
+                run_workers(study, args, name, identity, cache_path, n_search)
         with file_lock(str(lock) + ".workers", nonblocking=True,
                        message="orphaned workers still running; wait or kill pid(s)"):
             if args.evaluate_holdout:
@@ -1187,6 +1717,8 @@ def optimize_study(args, cache_path, metadata):
                 print(f"Holdout: {evaluation['caveat']}")
             entry = study_result(study, args, metadata, identity)
             save_results(args.output, entry)
+    if getattr(args,'phase4',False) and study.user_attrs.get('phase4_runtime_stop') is not None:
+        raise ValueError('Phase 4 runtime stop; owner decision required')
     print(f"{args.symbol}/{args.bar_type}: best={entry['best_objective']}, "
           f"n_scored_bars={entry['n_scored_bars']}, total_trades={entry['total_trades']}, "
           f"trials={entry['trial_counts']} [{name}]")
@@ -1214,6 +1746,12 @@ def nonnegative(value):
     return n
 
 
+def positive_seconds(value):
+    n=nonnegative(value)
+    if n==0:raise argparse.ArgumentTypeError('must be finite and positive')
+    return n
+
+
 def fraction(value):
     n = float(value)
     if not math.isfinite(n) or not 0 <= n < 1:
@@ -1236,8 +1774,10 @@ def bar_types(value):
     return list(dict.fromkeys(values))
 
 
-def load_space(path):
+def load_space(path, *, include_trade=False):
     space = dict(SEARCH_SPACE_BOUNDS)
+    if include_trade:
+        space.update(TRADE_SEARCH_SPACE_BOUNDS)
     if path is None:
         return space
     overrides = json.loads(Path(path).read_text())
@@ -1251,12 +1791,16 @@ def load_space(path):
         lo, hi, kind = bounds["low"], bounds["high"], space[name][2]
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (lo, hi)):
             raise ValueError(f"{name}: bounds must be finite numbers")
-        if lo > hi or lo <= 0 or (kind == "int" and any(int(v) != v for v in (lo, hi))):
+        if lo > hi or (lo < 0 if name == 'ts_max_through_bps' else lo <= 0) or (kind == "int" and any(int(v) != v for v in (lo, hi))):
             raise ValueError(f"{name}: invalid ordered positive bounds")
         if name in ("volume_decline_pct", "delta_failure_pct", "absorption_min_delta_pct",
                     "initiative_min_delta_pct") and hi > 1:
             raise ValueError(f"{name}: fractions must not exceed 1")
         space[name] = (int(lo), int(hi), kind) if kind == "int" else (lo, hi, kind)
+        if name.startswith('ts_'):
+            from orderflow_system.config.settings import TradeSignalConfig
+            TradeSignalConfig(**{name[3:]:lo})
+            TradeSignalConfig(**{name[3:]:hi})
     return space
 
 
@@ -1290,13 +1834,33 @@ def build_parser():
     parser.add_argument("--study-db", type=Path, default=output / "studies.db")
     parser.add_argument("--cache-dir", type=Path, default=output / "cache")
     parser.add_argument("--output", type=Path, default=output / "results.json")
+    parser.add_argument('--phase4', action='store_true')
+    parser.add_argument('--trade-signals', default='off')
+    parser.add_argument('--trade-cache', type=Path)
+    parser.add_argument('--freeze-params', type=Path)
+    parser.add_argument('--holdout-look')
+    parser.add_argument('--campaign-manifest', type=Path)
+    parser.add_argument('--owner-approved', help='owner approval token for later experiments')
+    parser.add_argument('--max-trial-seconds',type=positive_seconds)
+    parser.add_argument('--max-study-seconds',type=positive_seconds)
     return parser
+
+
+@contextmanager
+def phase4_execution(enabled):
+    """One active campaign replay process across all arms and studies in this checkout."""
+    from scripts.phase4_policy import checked_write
+    lock=checked_write(ROOT/'output/phase4/campaign-execution.lock') if enabled else None
+    with file_lock(lock,nonblocking=True,message='Same study already running or another Phase 4 campaign process is active') if enabled else nullcontext():
+        yield
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        from scripts import phase4_studies as p4
+        p4.configure(args)
         for name in ("study_db", "output", "cache_dir"):
             setattr(args, name, getattr(args, name).expanduser().resolve())
         if args.start_date > args.end_date:
@@ -1315,24 +1879,28 @@ def main(argv=None):
         for symbol in args.symbol:
             for bar_type in args.bar_type:
                 bar_only_pipeline(instrument_config(symbol), None if bar_type == "time_1m" else BarType(bar_type))
-        args.space = load_space(args.search_space)
-        # Validate all mount roots before doing any work.
-        if any(b != "time_1m" for b in args.bar_type):
-            require_source(args.data_root)
-        if "time_1m" in args.bar_type:
-            require_source(args.trades_root)
-        results = {"symbols": {}}
-        for symbol in args.symbol:
-            results["symbols"][symbol] = {}
-            for bar_type in args.bar_type:
-                study_args = argparse.Namespace(**vars(args))
-                study_args.symbol, study_args.bar_type = symbol, bar_type
-                path, metadata = build_cache(study_args, symbol, bar_type)
-                # Reject unusable holdout/CV geometry before creating or running a study.
-                split_timeline(CachedBars(path, bar_type), study_args)
-                entry = optimize_study(study_args, path, metadata)
-                results["symbols"][symbol][bar_type] = {entry["study_name"]: entry}
-        return results
+        args.space = load_space(args.search_space, include_trade=True) if args.phase4 else load_space(args.search_space)
+        if args.phase4:
+            args.space = p4.active_space(args.space, args.trade_signal_config, frozen=args.freeze_params is not None)
+        with phase4_execution(args.phase4 and not args.dry_run):
+            # Validate all mount roots before doing any work.
+            if any(b != "time_1m" for b in args.bar_type):
+                require_source(args.data_root)
+            if "time_1m" in args.bar_type:
+                require_source(args.trades_root)
+            results = {"symbols": {}}
+            for symbol in args.symbol:
+                results["symbols"][symbol] = {}
+                for bar_type in args.bar_type:
+                    study_args = argparse.Namespace(**vars(args))
+                    study_args.symbol, study_args.bar_type = symbol, bar_type
+                    if args.phase4 and not args.dry_run:phase4_study_preflight(study_args)
+                    path, metadata = build_cache(study_args, symbol, bar_type)
+                    # Reject unusable holdout/CV geometry before creating or running a study.
+                    split_timeline(CachedBars(path, bar_type), study_args)
+                    entry = optimize_study(study_args, path, metadata)
+                    results["symbols"][symbol][bar_type] = {entry.get("study_name", "candidate"): entry}
+            return results
     except (ValueError, RuntimeError, OSError) as exc:
         parser.error(str(exc))
 

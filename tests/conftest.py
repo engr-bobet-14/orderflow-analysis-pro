@@ -1,5 +1,6 @@
 """Shared fixtures: build tiny synthetic info-bar parquet datasets in the real on-disk layout."""
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,3 +73,15 @@ def no_repo_trade_report_pollution():
     yield
     added = {p.relative_to(reports) for p in reports.rglob('*') if p.is_file()}-before
     assert not added, f'test polluted repo output/trade_replay: {sorted(map(str, added))}'
+
+
+@pytest.fixture(autouse=True)
+def no_repo_phase4_checkpoint_pollution():
+    root=Path(__file__).resolve().parents[1]/'output/phase4/checkpoints'
+    def snapshot():
+        return {str(p.relative_to(root)):(p.is_dir(),p.stat().st_mtime_ns,
+                    hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None)
+                for p in (root,*root.rglob('*')) if p.exists()}
+    before=snapshot()
+    yield
+    assert snapshot()==before, 'test changed real output/phase4/checkpoints; use a temporary ROOT'

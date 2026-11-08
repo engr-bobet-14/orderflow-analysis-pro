@@ -1,0 +1,310 @@
+{
+  "bounded_off": {
+    "source": "output/phase3_detector_plan/trade_replay/20261103T011635Z-d3a7b9603b37-2021-05-19-2021-05-20-20261105T092344357413Z.json",
+    "source_sha256": "819227b2adf64e9e670b54c1908937c80442cb8a228def5832612a406714a67e",
+    "lanes": {
+      "fixed_dollar_imbalance": {
+        "bars": 5146,
+        "replay_digest": "449179ca5131afc4fb9e488728597618cc86eaabfd792b6394a9e9ed0c6393e7",
+        "trade_digest": "3fbc815f26bd5ee6ffc7f813120fbd6c12e9d4321234912e2d4e26341e6c5cfc",
+        "signal_counts": {
+          "initiative_auction": 607,
+          "exhaustion": 186,
+          "delta_divergence": 60,
+          "absorption": 106
+        }
+      },
+      "fixed_dollar_run": {
+        "bars": 7963,
+        "replay_digest": "35d40e4b9433edb068d333aa09c9d4ad6ac55d60d578092111e713c270f6d08e",
+        "trade_digest": "4d61667186131002fb0b13aaec9697b9b7af2d3a42c163a6fa21e6740de2ead5",
+        "signal_counts": {
+          "initiative_auction": 868,
+          "absorption": 157,
+          "exhaustion": 130,
+          "delta_divergence": 147
+        }
+      },
+      "fixed_tick_imbalance": {
+        "bars": 5098,
+        "replay_digest": "b1e8f2ec55beb236146f65233726d40e78ee4d19dadba36c8093051e1d0e3fa6",
+        "trade_digest": "1db33a2c85770edcb889a48c05ad89961abe5855eab1a3ddbedeacf1a75fcf1e",
+        "signal_counts": {
+          "initiative_auction": 634,
+          "exhaustion": 193,
+          "absorption": 82,
+          "delta_divergence": 70
+        }
+      },
+      "fixed_tick_run": {
+        "bars": 7485,
+        "replay_digest": "5ade79716b140cd04291c1a9bdebe7d6a347819c965df21dfcd4aa738396ae7e",
+        "trade_digest": "bcac2d96161ecdb4ad981797c278fed2bcaf2ce41d488f8cde3151e48dd09db8",
+        "signal_counts": {
+          "initiative_auction": 653,
+          "absorption": 149,
+          "delta_divergence": 182,
+          "exhaustion": 84
+        }
+      },
+      "fixed_volume_imbalance": {
+        "bars": 5104,
+        "replay_digest": "8997c0d54c7a0545f1f6269ca4f5bc6e1f359f0007259d0f876eb5242e1b2632",
+        "trade_digest": "45b48825aa823c5b1ec81ec6d9b0a3a8e41233651e9f46b288626df36e04a475",
+        "signal_counts": {
+          "initiative_auction": 626,
+          "exhaustion": 193,
+          "delta_divergence": 61,
+          "absorption": 94
+        }
+      },
+      "fixed_volume_run": {
+        "bars": 7972,
+        "replay_digest": "f890f0d0a5255ac70423fed5c9415c1fd5e677269195a73189ba422a74a90a98",
+        "trade_digest": "1422b670a426b66d1a477aa2561f317c7111a731dd80d7f0a26e3cf835294522",
+        "signal_counts": {
+          "initiative_auction": 863,
+          "absorption": 162,
+          "exhaustion": 139,
+          "delta_divergence": 144
+        }
+      }
+    },
+    "start": "2021-05-19",
+    "end": "2021-05-20"
+  },
+  "bounded_all": {
+    "source": "output/phase3_detector_plan/trade_replay/20261103T011635Z-d3a7b9603b37-2021-05-19-2021-05-20-20261105T092420976414Z.json",
+    "source_sha256": "39c40ffab4572c178ed7dab6f9e8035311ecf1a3cde7d32d783442a5dc29538b",
+    "lanes": {
+      "fixed_dollar_imbalance": {
+        "bars": 5146,
+        "replay_digest": "5aec466f091d8590d51ded19ac3e3e313e843f578eb125a1635037942b5803e8",
+        "trade_digest": "3fbc815f26bd5ee6ffc7f813120fbd6c12e9d4321234912e2d4e26341e6c5cfc",
+        "signal_counts": {
+          "initiative_auction": 607,
+          "exhaustion": 186,
+          "absorption": 401,
+          "delta_divergence": 60
+        },
+        "raw_signal_digest": "675fcbf7affee562aae9e0720008019f43cc5fc5f80abfaac2866f6a65667e2c"
+      },
+      "fixed_dollar_run": {
+        "bars": 7963,
+        "replay_digest": "8a3eb40a1fb7be645df416f21c1e26b1b1292f6f55d91e4addb709c4fd744458",
+        "trade_digest": "4d61667186131002fb0b13aaec9697b9b7af2d3a42c163a6fa21e6740de2ead5",
+        "signal_counts": {
+          "initiative_auction": 868,
+          "absorption": 765,
+          "exhaustion": 130,
+          "delta_divergence": 147
+        },
+        "raw_signal_digest": "e227ca70fc7b26937bd85a17b2291513d482b748392c7e8e6c6a4d18abb16dd8"
+      },
+      "fixed_tick_imbalance": {
+        "bars": 5098,
+        "replay_digest": "1b28d61939c1c70691a26b6cc3b7fcc2b1c8ffabb64e0867c6a5534234efa4bd",
+        "trade_digest": "1db33a2c85770edcb889a48c05ad89961abe5855eab1a3ddbedeacf1a75fcf1e",
+        "signal_counts": {
+          "absorption": 378,
+          "initiative_auction": 634,
+          "exhaustion": 193,
+          "delta_divergence": 70
+        },
+        "raw_signal_digest": "7351a0cc5890aace2c192c8755cccd2596722b5aa59fc01175036f677b763032"
+      },
+      "fixed_tick_run": {
+        "bars": 7485,
+        "replay_digest": "5e9a2ca70462a796bfc0ecc64cc69a30671bb1f8eebb20528de67342536c1ab7",
+        "trade_digest": "bcac2d96161ecdb4ad981797c278fed2bcaf2ce41d488f8cde3151e48dd09db8",
+        "signal_counts": {
+          "initiative_auction": 653,
+          "absorption": 814,
+          "delta_divergence": 182,
+          "exhaustion": 84
+        },
+        "raw_signal_digest": "d66eaea9f2efd5eeade0713ab28290b7606d592e4d301dc4b91bdcf60354896c"
+      },
+      "fixed_volume_imbalance": {
+        "bars": 5104,
+        "replay_digest": "51e5e7822ed0a409d563b074b3e29b729bc9abae2ca52ebbf426d97436282230",
+        "trade_digest": "45b48825aa823c5b1ec81ec6d9b0a3a8e41233651e9f46b288626df36e04a475",
+        "signal_counts": {
+          "initiative_auction": 626,
+          "exhaustion": 193,
+          "absorption": 378,
+          "delta_divergence": 61
+        },
+        "raw_signal_digest": "e9a7ce0d0ecfcc883551cce920eef7b38f6d940dda744624640cc85b2213cdde"
+      },
+      "fixed_volume_run": {
+        "bars": 7972,
+        "replay_digest": "d4b1ae578dc32f44dd721c1c8ddd321383e543cab895d1a86d3c002075e365c9",
+        "trade_digest": "1422b670a426b66d1a477aa2561f317c7111a731dd80d7f0a26e3cf835294522",
+        "signal_counts": {
+          "initiative_auction": 863,
+          "absorption": 763,
+          "exhaustion": 139,
+          "delta_divergence": 144
+        },
+        "raw_signal_digest": "58c7770577b1f01dd18fcd722e4b48be34571c7369cc781f6472a480613245f0"
+      }
+    },
+    "start": "2021-05-19",
+    "end": "2021-05-20"
+  },
+  "full_off": {
+    "source": "output/phase3_detector_plan/trade_replay/20261103T011635Z-d3a7b9603b37-begin-end-20261105T031958828563Z.json",
+    "source_sha256": "a11f8f9a12c4ea5b0868fcefc1a315e81738319172682569b9a2092b4a877cbc",
+    "lanes": {
+      "fixed_dollar_imbalance": {
+        "bars": 1998532,
+        "replay_digest": "463fa4b6c2ab677706809562ceed777e41e7d74fb79122ff8dfbf64236915179",
+        "trade_digest": "995b49e447508216b02f97d1a1038abc77ca5b5b610dbcdf38a960d4a21c7924",
+        "signal_counts": {
+          "absorption": 31137,
+          "delta_divergence": 17773,
+          "initiative_auction": 162936,
+          "exhaustion": 99815
+        }
+      },
+      "fixed_dollar_run": {
+        "bars": 2464981,
+        "replay_digest": "a246bcf4a7e394e4014c516eaa818dc7811531644a5ebe2f5f53a5c1d93a5f7c",
+        "trade_digest": "cc59dc194ce8752415f668662e1f06570e043e96e1f982a128bf1671482dee43",
+        "signal_counts": {
+          "delta_divergence": 42029,
+          "initiative_auction": 207412,
+          "exhaustion": 67909,
+          "absorption": 35278
+        }
+      },
+      "fixed_tick_imbalance": {
+        "bars": 2339617,
+        "replay_digest": "046ec38d17806837f09a98e0be16d83fade5f9652bb95a650e1fa4dfdba5a956",
+        "trade_digest": "86f09db5a177ce0c6b87a84b3aa9ea3b436d6cd9175ce587f0b2e655b256916a",
+        "signal_counts": {
+          "initiative_auction": 212155,
+          "delta_divergence": 33350,
+          "exhaustion": 113980,
+          "absorption": 17057
+        }
+      },
+      "fixed_tick_run": {
+        "bars": 2429670,
+        "replay_digest": "cf8645380767e0d1b9f28b115cb92c2604e8a0d4717f79e982e7146db8c821ee",
+        "trade_digest": "6bf9b0d508a95c53dc6d5064a7cf5becb7f7d52f499181d7b99b1aaaf95b36cb",
+        "signal_counts": {
+          "delta_divergence": 51934,
+          "initiative_auction": 191760,
+          "exhaustion": 47510,
+          "absorption": 28990
+        }
+      },
+      "fixed_volume_imbalance": {
+        "bars": 1996838,
+        "replay_digest": "902bfb7281ef642a0fd98b74f451063eb8d8b87221629f216953f8bd52e1394c",
+        "trade_digest": "6049373c2c9f17e8bac1363ddf775d55192b3eb0eaa5ba50fc62a0ae3948d9ae",
+        "signal_counts": {
+          "absorption": 31310,
+          "delta_divergence": 17696,
+          "initiative_auction": 162786,
+          "exhaustion": 99986
+        }
+      },
+      "fixed_volume_run": {
+        "bars": 2464960,
+        "replay_digest": "e5c1c06d64dfa29f8592b81982f9b30cf9e25f3f4ca8bde54f0ab50941c5d1ed",
+        "trade_digest": "4e18432d0469f25de57db0848b6aabd6caea51934481cbc001c3a08db0716fbe",
+        "signal_counts": {
+          "delta_divergence": 42087,
+          "initiative_auction": 207192,
+          "exhaustion": 68021,
+          "absorption": 35297
+        }
+      }
+    },
+    "start": null,
+    "end": null
+  },
+  "full_all": {
+    "source": "output/phase3_detector_plan/trade_replay/20261103T011635Z-d3a7b9603b37-begin-end-20261105T054909871085Z.json",
+    "source_sha256": "46a00b1daeecedf34d952c5e912e5265bd062ffba1aa7350d766e4107a62e883",
+    "lanes": {
+      "fixed_dollar_imbalance": {
+        "bars": 1998532,
+        "replay_digest": "4d17ba07fc8097c9f780754f84f07e52a437a34001ade80725ff81290d3e4f12",
+        "trade_digest": "995b49e447508216b02f97d1a1038abc77ca5b5b610dbcdf38a960d4a21c7924",
+        "signal_counts": {
+          "absorption": 199913,
+          "delta_divergence": 17773,
+          "initiative_auction": 162936,
+          "exhaustion": 99815
+        },
+        "raw_signal_digest": "6565449f59d5c471c62a3b287a1bbfc4497ac4cf0ba6aec6e04dfb576ebcc58d"
+      },
+      "fixed_dollar_run": {
+        "bars": 2464981,
+        "replay_digest": "4a143fc7c23f30b43acfa6489747c0770a074c3a99083ea9725f3d551615bea7",
+        "trade_digest": "cc59dc194ce8752415f668662e1f06570e043e96e1f982a128bf1671482dee43",
+        "signal_counts": {
+          "delta_divergence": 42029,
+          "initiative_auction": 207412,
+          "exhaustion": 67909,
+          "absorption": 333082
+        },
+        "raw_signal_digest": "4da22f3aaf8cb5f7cf14a363ff40d86af44cf7f46742148184de221d10803b08"
+      },
+      "fixed_tick_imbalance": {
+        "bars": 2339617,
+        "replay_digest": "437a8edab1bbb3547d57a3fb0f4c2d1165133b3dd45fd8076e0369e2d1222fb3",
+        "trade_digest": "86f09db5a177ce0c6b87a84b3aa9ea3b436d6cd9175ce587f0b2e655b256916a",
+        "signal_counts": {
+          "initiative_auction": 212155,
+          "delta_divergence": 33350,
+          "absorption": 244039,
+          "exhaustion": 113980
+        },
+        "raw_signal_digest": "5578f64cd557ade5156012730d0033f4fc21cc6a836ce1809d934d4ba6d0d30f"
+      },
+      "fixed_tick_run": {
+        "bars": 2429670,
+        "replay_digest": "743d73683f8f3fae6405116b4f9193b90783fdeb48552f21e0258cfd83d42284",
+        "trade_digest": "6bf9b0d508a95c53dc6d5064a7cf5becb7f7d52f499181d7b99b1aaaf95b36cb",
+        "signal_counts": {
+          "delta_divergence": 51934,
+          "initiative_auction": 191760,
+          "absorption": 352419,
+          "exhaustion": 47510
+        },
+        "raw_signal_digest": "543418da0be76ca80dd8eba34ff6b8376a39f0d1c24a653a49ff5da5b0f08ad0"
+      },
+      "fixed_volume_imbalance": {
+        "bars": 1996838,
+        "replay_digest": "50bd2134be5505e87111c1abd9427ca78a8349eaf427cee585da76fdc08aa3bd",
+        "trade_digest": "6049373c2c9f17e8bac1363ddf775d55192b3eb0eaa5ba50fc62a0ae3948d9ae",
+        "signal_counts": {
+          "absorption": 199736,
+          "delta_divergence": 17696,
+          "initiative_auction": 162786,
+          "exhaustion": 99986
+        },
+        "raw_signal_digest": "a8bf2f01162e878519b3310ad2adb4aae856715cdfbe892995c3d557bc070584"
+      },
+      "fixed_volume_run": {
+        "bars": 2464960,
+        "replay_digest": "2f64a01ce6c3928d241f48bd9059d8a9bf486b14e99f486ca3744fa862ae55e3",
+        "trade_digest": "4e18432d0469f25de57db0848b6aabd6caea51934481cbc001c3a08db0716fbe",
+        "signal_counts": {
+          "delta_divergence": 42087,
+          "initiative_auction": 207192,
+          "absorption": 333018,
+          "exhaustion": 68021
+        },
+        "raw_signal_digest": "c2ad390132285ddf3a4f9df5eaaefc87cec04f9ba82b3859d7a81c258ca88daf"
+      }
+    },
+    "start": null,
+    "end": null
+  }
+}

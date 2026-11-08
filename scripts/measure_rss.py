@@ -24,13 +24,32 @@ def maxrss_bytes(ru_maxrss: int, platform: str = sys.platform) -> int:
     return ru_maxrss if platform == "darwin" else ru_maxrss * 1024
 
 
-def run_measured(argv: list[str]) -> dict:
+def run_measured(argv: list[str], *, memory=False) -> dict:
     t0 = time.monotonic()
     proc = subprocess.Popen(argv)
-    _, status, usage = os.wait4(proc.pid, 0)
+    sample_count=0;best=None
+    if memory:
+        from scripts.phase4_resources import process_memory
+        import psutil
+        while True:
+            pid,status,usage=os.wait4(proc.pid,os.WNOHANG)
+            if pid:break
+            try:
+                sample=process_memory(proc.pid);sample_count+=1
+                if sample['peak_private_bytes'] is not None and (best is None or sample['peak_private_bytes']>best['peak_private_bytes']):
+                    best=sample
+            except (OSError,psutil.Error):pass # Child may exit between wait4 and sampling.
+            time.sleep(.02)
+    else:
+        _, status, usage = os.wait4(proc.pid, 0)
     proc.returncode = os.waitstatus_to_exitcode(status)   # reaped here; keep Popen consistent
-    return {"argv": argv, "returncode": proc.returncode, "peak_rss_bytes": maxrss_bytes(usage.ru_maxrss),
+    result={"argv": argv, "returncode": proc.returncode, "peak_rss_bytes": maxrss_bytes(usage.ru_maxrss),
             "wall_seconds": round(time.monotonic() - t0, 3)}
+    if memory:
+        result.update(peak_private_bytes=best['peak_private_bytes'] if best else None,
+                      private_metric=best['private_metric'] if best else 'private measurement unavailable',
+                      private_is_fallback=best is None,memory_samples=sample_count)
+    return result
 
 
 def rss_growth_ok(samples: list[int], factor: float = 1.10, slack: int = 50 * MIB) -> bool:
