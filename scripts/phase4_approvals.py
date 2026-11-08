@@ -20,6 +20,13 @@ GATES = ('U','FH1','FH2','FH3','FH4','R')
 PHASE4B_PLAN_SHA256 = '75b22452c0b168f43fd91704a7aee23a4cb1c84c637f4a8f775b87be13857b7f'
 PHASE4B_PLAN_PATH = ROOT/'docs/plans/phase4b-full-strategy-plan-rev13.md'
 PHASE4_CAMPAIGN_SHA256 = 'b54076c64820ed75cfbaff35a311b1ffecd294944c4f5c1d1189c8c60df32434'
+# Amendment A2 (owner, 2026-11-08): S1 calibration may run on the interim review. R is never recorded as
+# 'pass' for it; the exception value is accepted only for the phase4b-s1 manifest and an owner record.
+PHASE4B_S1_EXCEPTION_PATH = ROOT/'docs/plans/phase4b-s1-inspection-exception-A2.md'
+PHASE4B_A1_PATH = ROOT/'docs/plans/phase4b-proof-amendment-A1-search-only-real-data.md'
+S1_EXCEPTION_R = 'owner_exception_interim_review'
+EXCEPTION_FIELDS = {'kind','phase','stage','campaign_sha256','plan_sha256','source_state','amendment_sha256',
+                    'interim_review_sha256','owner_statement','created_utc'}
 
 
 def approval_root():
@@ -397,29 +404,131 @@ def verify_phase4b_approval(layout, selector, campaign_sha256, stage, argv=None)
 
 def require_phase4b_approval(layout, selector, campaign_sha256, stage, argv=None, *, consume=False):
     approval=verify_phase4b_approval(layout,selector,campaign_sha256,stage,argv)
-    gates_sha256=verify_phase4b_gates(layout,campaign_sha256)
+    gates_sha256,basis=verify_phase4b_gates(layout,campaign_sha256,stage,with_basis=True)
     if consume:consume_approval(approval,layout=layout)
-    return {**approval,'gates_sha256':gates_sha256}
+    return {**approval,'gates_sha256':gates_sha256,'inspection_basis':basis}
 
 
-def verify_phase4b_gates(layout, campaign_sha256):
+def inspection_basis(layout, campaign_sha256):
+    """What R rested on, for the stage record and campaign log (A2): never inferred from the gates sha alone."""
+    return _basis(json.loads((layout.approval_root/f'gates-{campaign_sha256}.json').read_bytes()))
+
+
+def _basis(gates):
+    by_role={a.get('role'):a for a in gates.get('artifacts',[])}
+    return {'R':gates.get('R'),
+            'owner_exception_sha256':by_role.get('owner_exception',{}).get('sha256'),
+            'interim_review_sha256':by_role.get('interim_review',{}).get('sha256')}
+
+
+def _utc(value, what):
+    try:
+        created=datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        if created.tzinfo is None or created.utcoffset().total_seconds()!=0 or 'T' not in str(value):
+            raise ValueError('not UTC')
+    except (TypeError,ValueError) as exc:
+        raise ValueError(what+' created_utc must be an ISO UTC timestamp') from exc
+
+
+def verify_proof_artifacts(by_role):
+    """A1: the unit artifact excludes real-data tests; the real_data artifact is the guarded search-only run."""
+    from scripts import phase4b_proof as proof
+    try:
+        unit=json.loads(Path(by_role['unit']['path']).read_bytes())
+        real=json.loads(Path(by_role['real_data']['path']).read_bytes())
+    except (OSError,ValueError,KeyError) as exc:
+        raise ValueError('phase4b proof artifacts must be A1 JSON records') from exc
+    if (unit.get('argv') or [None])[1:]!=proof.proof_argv('unit')[1:]:
+        raise ValueError('unit proof must be exactly the A1 command (-m "not real_data")')
+    if unit.get('failed')!=0 or unit.get('errors')!=0:
+        raise ValueError('unit proof must have no failures or errors')
+    selection=proof.real_data_selection();argv=real.get('argv') or []
+    if argv[-len(selection):]!=selection:raise ValueError('real_data proof must be the A1 command')
+    collected=real.get('collected') or []
+    if (len(collected)!=proof.EXPECTED_COLLECTED or len(set(collected))!=len(collected)
+            or any(c.startswith(d) for c in collected for d in proof.DESELECTED)):
+        raise ValueError('real_data proof collected nodes do not match A1')
+    if real.get('horizon_utc')!=proof.HORIZON_UTC:raise ValueError('real_data proof horizon mismatch')
+    if real.get('amendment_sha256')!=hashlib.sha256(PHASE4B_A1_PATH.read_bytes()).hexdigest():
+        raise ValueError('real_data proof amendment A1 hash mismatch')
+    if (real.get('failed'),real.get('errors'),real.get('skipped'),real.get('passed'))!=(0,0,0,proof.EXPECTED_COLLECTED):
+        raise ValueError('real_data proof must pass every collected node (failed/skipped/errors = 0)')
+
+
+def verify_phase4b_gates(layout, campaign_sha256, stage=None, *, with_basis=False):
     """Host proof gates (plan hash, U/AC1/AC7/R, proof artifacts); returns the gates record sha256."""
     if hashlib.sha256(PHASE4B_PLAN_PATH.read_bytes()).hexdigest()!=PHASE4B_PLAN_SHA256:
         raise ValueError('approval plan hash mismatch: the plan file changed')
     path=layout.approval_root/f'gates-{campaign_sha256}.json';trusted_path(path)
     raw=path.read_bytes();gates=json.loads(raw)
+    exception=gates.get('R')==S1_EXCEPTION_R and layout.phase=='phase4b-s1' and stage=='S1'
     if (gates.get('plan_sha256')!=PHASE4B_PLAN_SHA256 or gates.get('campaign_sha256')!=campaign_sha256
             or gates.get('source_state')!=source_state()
-            or any(gates.get(key)!='pass' for key in ('U','AC1','AC7','R'))):
+            or any(gates.get(key)!='pass' for key in ('U','AC1','AC7'))
+            or not (gates.get('R')=='pass' or exception)):
         raise ValueError('phase4b requires host unit, digest, preservation/real-data and inspection gates')
     artifacts=gates.get('artifacts',[])
-    if {a.get('role') for a in artifacts} != {'unit','digests','protected','real_data','inspection'}:
+    roles=[a.get('role') for a in artifacts]
+    expected=({'unit','digests','protected','real_data','interim_review','owner_exception'} if exception
+              else {'unit','digests','protected','real_data','inspection'})
+    if set(roles)!=expected or len(roles)!=len(expected):
         raise ValueError('phase4b host proof artifacts incomplete')
     for artifact in artifacts:
         raw_artifact=Path(artifact['path']).read_bytes()
         if hashlib.sha256(raw_artifact).hexdigest()!=artifact['sha256']:
             raise ValueError('host proof artifact hash mismatch')
-    return hashlib.sha256(raw).hexdigest()
+    verify_proof_artifacts({a['role']:a for a in artifacts})
+    if exception:
+        by_role={a['role']:a for a in artifacts}
+        verify_inspection_exception(layout,by_role['owner_exception'],campaign_sha256,
+                                    by_role['interim_review']['sha256'])
+    digest=hashlib.sha256(raw).hexdigest()
+    return (digest,_basis(gates)) if with_basis else digest
+
+
+def exception_root(layout):
+    return layout.approval_root/'exceptions'
+
+
+def install_inspection_exception(layout, record):
+    """Host-only, after the owner's explicit decision (A2): content-addressed, 0600, O_EXCL, S1 only."""
+    if not isinstance(record,dict) or set(record)!=EXCEPTION_FIELDS or record['kind']!='inspection_exception':
+        raise ValueError('inspection exception fields invalid')
+    if layout.phase!='phase4b-s1' or record['phase']!='phase4b-s1':
+        raise ValueError('inspection exception is limited to the phase4b-s1 manifest')
+    if record['stage']!='S1':raise ValueError('inspection exception is limited to stage S1')
+    _utc(record['created_utc'],'inspection exception')
+    raw=canonical_bytes(record);root=exception_root(layout)
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    path=root/(hashlib.sha256(raw).hexdigest()+'.json')
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as handle:
+        handle.write(raw);handle.flush();os.fsync(handle.fileno())
+    return path
+
+
+def verify_inspection_exception(layout, artifact, campaign_sha256, interim_review_sha256):
+    root=exception_root(layout);path=Path(artifact['path'])
+    try:
+        for directory in (root.parent,root):trusted_path(directory,directory=True)
+        trusted_path(path)
+    except ValueError as exc:
+        raise ValueError('inspection exception record untrusted: '+str(exc)) from exc
+    if path.parent.resolve()!=root.resolve() or path.stat().st_mode & 0o077 or root.stat().st_mode & 0o077:
+        raise ValueError('inspection exception record must be private and inside the exception root')
+    raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
+    record=json.loads(raw)
+    if (path.name!=digest+'.json' or artifact['sha256']!=digest or not isinstance(record,dict)
+            or set(record)!=EXCEPTION_FIELDS or canonical_bytes(record)!=raw):
+        raise ValueError('inspection exception record content mismatch')
+    policy=hashlib.sha256(PHASE4B_S1_EXCEPTION_PATH.read_bytes()).hexdigest()
+    if (record['kind']!='inspection_exception' or record['phase']!=layout.phase or record['stage']!='S1'
+            or record['campaign_sha256']!=campaign_sha256 or record['plan_sha256']!=PHASE4B_PLAN_SHA256
+            or record['source_state']!=source_state() or record['amendment_sha256']!=policy
+            or record['interim_review_sha256']!=interim_review_sha256):
+        raise ValueError('inspection exception record binding mismatch')
+    _utc(record['created_utc'],'inspection exception')
+    return record
 
 
 # Rev 13: only an external/unknown termination is recoverable, and only with an owner record.

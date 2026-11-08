@@ -243,11 +243,11 @@ def termination_admission(layout,manifest,digest,stage,recovery_selector,argv,*,
 
 def recovery_admission(layout,manifest,digest,stage,selector,argv):
     """Host proof gates are re-verified before an owner recovery approval is consumed."""
-    try:gates=verify_phase4b_gates(layout,digest)
+    try:gates,basis=verify_phase4b_gates(layout,digest,stage,with_basis=True)
     except (ValueError,OSError) as exc:raise ValueError('recovery requires the host proof gates: '+str(exc)) from exc
     approval=termination_admission(layout,manifest,digest,stage,selector,argv)
     if approval is None:raise ValueError('no unrecovered termination for this recovery approval')
-    return {**approval,'gates_sha256':gates}
+    return {**approval,'gates_sha256':gates,'inspection_basis':basis}
 
 
 @contextmanager
@@ -473,7 +473,8 @@ def run_stage(layout,stage,owner_approved,*,operation=None,argv=None,finalize=Tr
         marker=attempts/f'{owner_approved}.json' if recovered is None else attempts/f"recovery-{recovered['recovery_sha256']}.json"
         if marker.exists():raise ValueError('stage approval already used')
         verified=(require_phase4b_approval(layout,owner_approved,digest,stage,argv,consume=False) if recovered is None
-                  else {'sha256':recovered['recovery_sha256'],'gates_sha256':recovered.get('gates_sha256')})
+                  else {'sha256':recovered['recovery_sha256'],'gates_sha256':recovered.get('gates_sha256'),
+                        'inspection_basis':recovered.get('inspection_basis')})
         preflight(layout,manifest)
         # The production preflight is strict; synthetic tests replace it, never the writer policy.
         before=protected_hashes(layout,manifest) if operation is None else {
@@ -485,7 +486,8 @@ def run_stage(layout,stage,owner_approved,*,operation=None,argv=None,finalize=Tr
             completed_s2(layout,digest)
         if recovered is None:require_phase4b_approval(layout,owner_approved,digest,stage,argv,consume=True)
         record={'stage':stage,'phase':layout.phase,'campaign_sha256':digest,'owner_approval_sha256':verified['sha256'],
-            'gates_sha256':verified['gates_sha256'],'source_state':source_state(),'status':'started',
+            'gates_sha256':verified['gates_sha256'],'inspection_basis':verified.get('inspection_basis'),
+            'source_state':source_state(),'status':'started',
             'attempt':(launch or {}).get('attempt','unlaunched'),'recovery':recovered,
             'utc':datetime.now(timezone.utc).isoformat()}
         from scripts.phase4b_runtime import runtime_fingerprint,require_runtime_fingerprint
@@ -875,6 +877,7 @@ def main(argv=None,*,recovery_argv=None):
                 with os.fdopen(fd,'wb') as handle:
                     handle.write(canonical_bytes({'recovery_sha256':approval['sha256'],'campaign_sha256':digest,
                         'stage':cli.stage,'attempt':launch['attempt'],'gates_sha256':approval['gates_sha256'],
+                        'inspection_basis':approval.get('inspection_basis'),
                         'termination_sha256':approval['record']['termination_sha256']}))
                     handle.flush();os.fsync(handle.fileno())
                 pending=(layout.checkpoints/digest/f'{cli.stage}.result.pending.json').exists()

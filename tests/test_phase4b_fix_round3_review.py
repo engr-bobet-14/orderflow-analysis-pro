@@ -306,7 +306,7 @@ def test_gap_main_recovery_path_admits_once_and_launches_recovery_child(tmp_path
     selector = next((layout.approval_root / 'recovery').glob('*.json')).stem
     monkeypatch.setattr(driver, 'PhaseLayout', lambda *a: layout)
     monkeypatch.setattr(driver.shutil, 'which', lambda *a: '/t')
-    monkeypatch.setattr(driver, 'verify_phase4b_gates', lambda *a: 'gates-sha')
+    monkeypatch.setattr(driver, 'verify_phase4b_gates', lambda *a, **k: ('gates-sha', {'R': 'pass'}))
     @contextmanager
     def locks(layout, manifest): yield {}
     monkeypatch.setattr(driver, 'stage_locks', locks)
@@ -317,6 +317,7 @@ def test_gap_main_recovery_path_admits_once_and_launches_recovery_child(tmp_path
     assert '--recovery' in commands[0] and commands[0][commands[0].index('--recovery') + 1] == selector
     marker = json.loads((layout.approval_root / 'recovery' / f'{selector}.admitted.json').read_bytes())
     assert marker['gates_sha256'] == 'gates-sha' and marker['stage'] == 'S2t'
+    assert marker['inspection_basis'] == {'R': 'pass'}
     with pytest.raises(SystemExit):
         driver.main([*argv[1:], '--recovery-approved', selector], recovery_argv=argv)
 
