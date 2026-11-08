@@ -104,23 +104,6 @@ def test_c7_file_heartbeat_reuses_existing_runtime_watchdog(tmp_path,monkeypatch
     assert paths and all(p.is_relative_to(layout.checkpoints) for p in paths)
 
 
-def test_c7_protection_inventory_rebases_sources_and_includes_complete(tmp_path):
-    from scripts import phase4b_campaign as driver, trade_feature_cache as tfc
-    from scripts.phase4_benchmark import DATASET_ID
-    layout,snapshots,_,_=fixture_inputs(tmp_path)
-    baseline=tmp_path/'output/phase4/build/protected-before.sha256'
-    baseline.parent.mkdir(parents=True)
-    original='/original/checkout/output/optimize/studies.db'
-    baseline.write_text(sha(snapshots[0]['path'])+'  '+original+'\n')
-    for name in tfc.BUILDER_FILES:
-        path=tmp_path/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'frozen')
-    complete=tmp_path/'output/optimize/trade_cache'/DATASET_ID/'COMPLETE.json'
-    complete.parent.mkdir(parents=True);complete.write_bytes(b'{}')
-    hashes=driver.protected_hashes(layout,{'snapshots':snapshots})
-    assert str(complete) in hashes
-    assert all(Path(name).is_relative_to(tmp_path) for name in hashes)
-
-
 def test_c7_campaign_cli_routes_phase4b_before_phase4_policy(monkeypatch):
     from scripts import phase4b_campaign as driver
     monkeypatch.setattr(driver,'main',lambda argv:argv)

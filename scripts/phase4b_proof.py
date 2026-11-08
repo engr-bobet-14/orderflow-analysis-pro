@@ -61,14 +61,18 @@ def write_artifact(role, path, *, runner=None):
     """Run the A1 proof command for ``role`` and write its JSON artifact (the gate checks its content)."""
     import hashlib
     import json
+    import os
     import subprocess
     from pathlib import Path
     runner = runner or subprocess.run
     argv = proof_argv(role)
-    collected = runner(argv + ['--collect-only'], cwd=_root(), capture_output=True, text=True)
+    # Host-input tests fail instead of skipping; the post-look holdout opt-in never reaches a proof run.
+    env = {k: v for k, v in os.environ.items() if k != 'PHASE4B_ALLOW_HOLDOUT_TESTS'} | {'PHASE4B_REQUIRE_HOST': '1'}
+    collected = runner(argv + ['--collect-only'], cwd=_root(), capture_output=True, text=True, env=env)
     nodes = [line for line in collected.stdout.splitlines() if '::' in line]
-    result = runner(argv, cwd=_root(), capture_output=True, text=True)
-    value = {'role': role, 'argv': argv, 'returncode': result.returncode, **_counts(result.stdout)}
+    result = runner(argv, cwd=_root(), capture_output=True, text=True, env=env)
+    value = {'role': role, 'argv': argv, 'returncode': result.returncode, 'require_host': True,
+             **_counts(result.stdout)}
     if role == 'real_data':
         value.update(collected=nodes, horizon_utc=HORIZON_UTC,
                      amendment_sha256=hashlib.sha256(Path(A1_PATH).read_bytes()).hexdigest())

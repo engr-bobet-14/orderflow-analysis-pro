@@ -162,3 +162,18 @@ def test_replacements_skip_without_the_guard_plugin():
                              proof.REPLACEMENT_FILE + '::test_a1_3_real_prefix_and_notebook_parity'],
                             cwd=ROOT, capture_output=True, text=True)
     assert '1 skipped' in result.stdout and 'guard plugin' in result.stdout, result.stdout + result.stderr
+
+
+def test_proof_writer_requires_host_inputs_and_never_allows_holdout_tests(tmp_path, monkeypatch):
+    # Host-only tests must fail, not skip, in proof runs; the post-look holdout flag never leaks into a proof.
+    envs = []
+    def runner(argv, **kwargs):
+        envs.append(kwargs['env'])
+        out = 'tests/test_x.py::t\n' if '--collect-only' in argv else '1 passed in 1.0s\n'
+        return __import__('types').SimpleNamespace(returncode=0, stdout=out, stderr='')
+    monkeypatch.setenv('PHASE4B_ALLOW_HOLDOUT_TESTS', '1')
+    monkeypatch.delenv('PHASE4B_REQUIRE_HOST', raising=False)
+    value = __import__('json').loads(proof.write_artifact('unit', tmp_path / 'u.json', runner=runner).read_bytes())
+    assert len(envs) == 2
+    assert all(e['PHASE4B_REQUIRE_HOST'] == '1' and 'PHASE4B_ALLOW_HOLDOUT_TESTS' not in e for e in envs)
+    assert value['require_host'] is True

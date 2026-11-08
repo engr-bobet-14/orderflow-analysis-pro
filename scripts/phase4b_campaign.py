@@ -397,16 +397,55 @@ def write_json(layout,path,value,*,exclusive=False):
     return path
 
 
+# Phase 4's sealed owner baseline (46 files); its listed absolute paths are the only ones verified in place.
+PHASE4_PROTECTED_BASELINE_SHA256='f9412c6c104852c4c175b90b589618bbe2ba77d8c3705ab55eefef902a0d590a'
+PHASE4_PROTECTED_COUNT=46
+MARKET_DATA_ROOT=Path('/Volumes/Market-Data')
+
+
+def protected_roots(root):
+    """Market-Data, the main orderflow checkout (even from a worktree) and the sibling bars repository."""
+    import subprocess
+    common=subprocess.run(['git','-C',str(root),'rev-parse','--path-format=absolute','--git-common-dir'],
+        check=True,capture_output=True,text=True).stdout.strip()
+    main=Path(common).parent
+    return MARKET_DATA_ROOT,main,main.parent/'information-driven-bars'
+
+
+def phase4_protected_files(baseline,roots,*,sealed_sha256,count):
+    """Verify each sealed-baseline entry at its exact original path; never rebase, follow symlinks or widen."""
+    import stat
+    data=Path(baseline).read_bytes()
+    if hashlib.sha256(data).hexdigest()!=sealed_sha256:
+        raise ValueError('protected baseline is not the sealed Phase 4 baseline')
+    entries={}
+    for line in data.decode().splitlines():
+        if not line.strip():continue
+        digest,name=line.split(maxsplit=1);name=name.strip()
+        if name in entries:raise ValueError('duplicate protected path: '+name)
+        entries[name]=digest
+    if len(entries)!=count:raise ValueError(f'protected baseline count {len(entries)} != {count}')
+    verified={}
+    for name,digest in entries.items():
+        path=Path(name)
+        if not path.is_absolute() or os.path.normpath(name)!=name:
+            raise ValueError('protected path is not an exact absolute path: '+name)
+        if not any(path!=root and path.is_relative_to(root) for root in roots):
+            raise ValueError('protected path outside authorized roots: '+name)
+        # ponytail: check-then-hash, not O_NOFOLLOW per component; the baseline is sha-pinned and read-only.
+        if os.path.realpath(name)!=name:raise ValueError('protected path traverses a symlink: '+name)
+        if not stat.S_ISREG(os.lstat(name).st_mode):raise ValueError('protected path is not a regular file: '+name)
+        if sha256_file(path)!=digest:raise ValueError('protected file changed: '+name)
+        verified[name]=digest
+    return verified
+
+
 def protected_hashes(layout,manifest):
     from scripts.phase4_campaign import protected_snapshot
     from scripts.trade_feature_cache import BUILDER_FILES
-    from scripts.phase4b_regression import checkout_path,verify_protected
     from scripts.phase4_benchmark import DATASET_ID
-    baseline=layout.root/'output/phase4/build/protected-before.sha256'
-    expected={line.split(maxsplit=1)[1].strip():line.split(maxsplit=1)[0]
-        for line in baseline.read_text().splitlines() if line.strip()}
-    verify_protected(layout.root,expected)
-    protected={str(checkout_path(name,layout.root)):digest for name,digest in expected.items()}
+    protected=phase4_protected_files(layout.root/'output/phase4/build/protected-before.sha256',
+        protected_roots(layout.root),sealed_sha256=PHASE4_PROTECTED_BASELINE_SHA256,count=PHASE4_PROTECTED_COUNT)
     historical={item['path']:item['sha256'] for item in manifest['snapshots']}
     for path,digest in historical.items():
         if sha256_file(Path(path))!=digest:raise ValueError('registered historical snapshot changed')
