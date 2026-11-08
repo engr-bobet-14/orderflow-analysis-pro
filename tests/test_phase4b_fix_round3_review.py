@@ -493,3 +493,25 @@ def test_i2_run_measured_default_is_unchanged_for_phase4_callers():
     result = measure_rss.run_measured([sys.executable, '-c', 'pass'], memory=True)
     assert set(result) == {'argv', 'returncode', 'peak_rss_bytes', 'wall_seconds', 'peak_private_bytes',
                            'private_metric', 'private_is_fallback', 'memory_samples'}
+
+
+def test_i2_zombie_sample_never_replaces_last_live_sample(monkeypatch):
+    # A SIGKILLed worker is reaped late: proc_pid_rusage still succeeds, keeps resident_size but reports a
+    # 0 phys_footprint (measured on darwin: rss 314 MiB, private 0, status idle).
+    import shutil
+    from scripts import measure_rss, phase4_resources
+    timeout = shutil.which('timeout') or shutil.which('gtimeout')
+    if not timeout:
+        pytest.skip('GNU timeout not installed')
+    live = {'rss_bytes': 300 << 20, 'private_bytes': 290 << 20, 'peak_rss_bytes': 300 << 20,
+            'peak_private_bytes': 295 << 20, 'private_metric': 'phys_footprint', 'private_is_fallback': False}
+    dead = {**live, 'private_bytes': 0}
+    calls = []
+    def fake(pid):
+        calls.append(pid);return dict(live if len(calls) == 1 else dead)
+    monkeypatch.setattr(phase4_resources, 'process_memory', fake)
+    result = measure_rss.run_measured([timeout, '--foreground', '5', sys.executable, '-c', 'import time;time.sleep(.3)'],
+                                      memory=True, worker=True)
+    assert len(calls) >= 2
+    assert result['last_memory_sample']['last']['private_bytes'] == 290 << 20
+    assert result['peak_private_bytes'] == 295 << 20 and result['last_memory_sample']['samples'] == 1

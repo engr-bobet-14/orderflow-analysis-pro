@@ -40,7 +40,11 @@ def run_measured(argv: list[str], *, memory=False, env=None, pass_fds=(), worker
                     children=psutil.Process(proc.pid).children()
                     if not children:time.sleep(.02);continue
                     target=children[0].pid
-                sample=process_memory(target);sample_count+=1;last=sample
+                sample=process_memory(target)
+                # A SIGKILLed worker not yet reaped still answers, with a 0 private footprint: not evidence.
+                if worker and (sample.get('private_bytes')==0 or sample.get('rss_bytes')==0):
+                    time.sleep(.02);continue
+                sample_count+=1;last=sample
                 if sample['peak_private_bytes'] is not None and (best is None or sample['peak_private_bytes']>best['peak_private_bytes']):
                     best=sample
             except (OSError,psutil.Error):pass # Child may exit between wait4 and sampling.
