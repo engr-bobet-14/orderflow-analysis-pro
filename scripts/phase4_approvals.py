@@ -442,6 +442,10 @@ def verify_proof_artifacts(by_role):
         raise ValueError('unit proof must be exactly the A1 command (-m "not real_data")')
     if unit.get('failed')!=0 or unit.get('errors')!=0:
         raise ValueError('unit proof must have no failures or errors')
+    # A1a: host-input tests must have run; a skipped or flagless unit proof cannot satisfy the gate.
+    if unit.get('skipped')!=0:raise ValueError('unit proof must have zero skipped tests (A1a)')
+    if unit.get('require_host') is not True:
+        raise ValueError('unit proof must be run with PHASE4B_REQUIRE_HOST=1 (A1a)')
     selection=proof.real_data_selection();argv=real.get('argv') or []
     if argv[-len(selection):]!=selection:raise ValueError('real_data proof must be the A1 command')
     collected=real.get('collected') or []

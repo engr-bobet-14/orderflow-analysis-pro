@@ -36,7 +36,8 @@ def proof_content(role, **changes):
     from scripts import phase4b_proof as proof
     if role == 'unit':
         value = {'role': 'unit', 'argv': ['python', *proof.proof_argv('unit')[1:]],
-                 'passed': 1747, 'failed': 0, 'errors': 0, 'summary': '1747 passed'}
+                 'passed': 1747, 'failed': 0, 'errors': 0, 'skipped': 0, 'require_host': True,
+                 'summary': '1747 passed'}
     elif role == 'real_data':
         collected = [f'tests/test_x.py::t{i}' for i in range(proof.EXPECTED_COLLECTED)]
         value = {'role': 'real_data', 'argv': ['python', '-m', 'pytest', '-q', *proof.real_data_selection()],
@@ -209,13 +210,32 @@ def test_a2_exception_requires_stage_s1_explicitly(tmp_path):
     ('unit', {'argv': ['python', '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-m', 'not real_data',
                        '-m', 'real_data']}, 'not real_data'),
     ('unit', {'failed': 1}, 'unit proof'),
-    ('unit', {'errors': 1}, 'unit proof')])
+    ('unit', {'errors': 1}, 'unit proof'),
+    # A1a: the gate itself requires zero skipped unit tests and the mandatory host-input flag.
+    ('unit', {'skipped': 1}, 'skipped'),
+    ('unit', {'skipped': None}, 'skipped'),
+    ('unit', {'require_host': False}, 'PHASE4B_REQUIRE_HOST'),
+    ('unit', {'require_host': 'true'}, 'PHASE4B_REQUIRE_HOST'),
+    ('unit', {'require_host': None}, 'PHASE4B_REQUIRE_HOST')])
 def test_a1_gates_check_proof_artifact_content(tmp_path, role, changes, match):
     layout = layout_for(tmp_path, 'phase4b')
     roles = ('unit', 'digests', 'protected', 'real_data', 'inspection')
     artifacts = [artifact(tmp_path, r, proof_content(r, **changes) if r == role else None) for r in roles]
     write_gates(layout, 'pass', artifacts)
     with pytest.raises(ValueError, match=match):
+        approvals.verify_phase4b_gates(layout, CAMPAIGN, 'S2t')
+
+
+@pytest.mark.parametrize('missing', ['skipped', 'require_host'])
+def test_a1a_unit_artifact_without_skip_count_or_host_flag_is_refused(tmp_path, missing):
+    # Artifacts written before A1a (no skip count / host flag) must not satisfy the gate.
+    layout = layout_for(tmp_path, 'phase4b')
+    value = json.loads(proof_content('unit'))
+    del value[missing]
+    roles = ('unit', 'digests', 'protected', 'real_data', 'inspection')
+    artifacts = [artifact(tmp_path, r, json.dumps(value).encode() if r == 'unit' else None) for r in roles]
+    write_gates(layout, 'pass', artifacts)
+    with pytest.raises(ValueError, match='skipped|PHASE4B_REQUIRE_HOST'):
         approvals.verify_phase4b_gates(layout, CAMPAIGN, 'S2t')
 
 
