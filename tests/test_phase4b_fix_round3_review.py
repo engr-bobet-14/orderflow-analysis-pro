@@ -115,7 +115,7 @@ def driver_fixture(tmp_path, monkeypatch):
 def test_i4_driver_memory_breach_after_rc0_is_strict_memory_stop(tmp_path, monkeypatch):
     layout, manifest, digest, launch, measure_rss, resources = driver_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(measure_rss, 'run_measured', lambda *a, **k: {'returncode': 0})
-    def breach(measurement): raise resources.MemoryBoundsError(measurement, {'pass': False, 'rss': 'above 4 GiB'})
+    def breach(measurement, *a): raise resources.MemoryBoundsError(measurement, {'pass': False, 'rss': 'above 4 GiB'})
     monkeypatch.setattr(resources, 'enforce_memory', breach)
     with pytest.raises((ValueError, resources.MemoryBoundsError)):
         driver.launch_stage(layout, manifest, digest, 'S2t', ['worker'], {}, launch, '/t')

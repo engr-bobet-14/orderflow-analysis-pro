@@ -40,6 +40,28 @@ def stage_progress(layout,digest,stage,*,arm=None,trial=None,marker):
 LAUNCH_ENV='PHASE4B_LAUNCH'
 LOCK_ENV='PHASE4B_LOCK_FDS'
 # Rev 13 C7 termination kinds. Consuming kinds end the stage under the sealed manifest.
+# A3 (owner decision 2026-11-08): S1 only. Its RSS includes both production trade caches' file-backed
+# residency while two arms are open (measured 4.0 GiB mapped, 0.46 GiB private); private stays 4 GiB.
+S1_RSS_LIMIT_BYTES=12*1024**3
+
+
+def stage_rss_limit(stage):
+    from scripts.phase4_resources import PRIVATE_BUDGET
+    return S1_RSS_LIMIT_BYTES if stage=='S1' else PRIVATE_BUDGET
+
+
+def stage_min_available(stage):
+    """Host memory required at admission: the stage RSS limit above 4 GiB plus the unchanged 8 GiB margin."""
+    from scripts.phase4_resources import MIN_AVAILABLE,PRIVATE_BUDGET
+    limit=stage_rss_limit(stage)
+    return MIN_AVAILABLE+limit if limit>PRIVATE_BUDGET else MIN_AVAILABLE
+
+
+def enforce_stage_memory(measurement,stage):
+    from scripts.phase4_resources import enforce_memory
+    return enforce_memory(measurement,0,stage_rss_limit(stage))
+
+
 CONSUMING_KINDS=('timeout_confirmed','study_allowance_exhausted','integrity_stop','strict_memory_stop')
 UNKNOWN='external_or_unknown_termination'
 KILL_AFTER_SECONDS=30
@@ -463,7 +485,7 @@ def preflight(layout,manifest):
 
 
 @contextmanager
-def file_timing(layout,digest,label,ceiling,*,audit=None):
+def file_timing(layout,digest,label,ceiling,*,audit=None,rss_limit=None):
     """Reuse the existing heartbeat, private/RSS bounds and live ceiling without a study DB."""
     import time
     class FileAttributes:
@@ -479,7 +501,7 @@ def file_timing(layout,digest,label,ceiling,*,audit=None):
     directory=layout.checkpoints/digest/'runtime'/label
     trial=FileAttributes(directory/'trial.json');study=FileAttributes(directory/'study.json')
     with opt.phase4_trial_timing(trial,study,0.,time.perf_counter(),args=SimpleNamespace(
-            max_trial_seconds=ceiling,phase4_timeout_audit=audit)):
+            max_trial_seconds=ceiling,phase4_timeout_audit=audit,phase4_rss_limit_bytes=rss_limit)):
         yield
 
 
@@ -541,7 +563,8 @@ def run_stage(layout,stage,owner_approved,*,operation=None,argv=None,finalize=Tr
             manifest={**manifest,'_approval_sha256':verified['sha256'],'_gates_sha256':verified['gates_sha256']}
             stage_progress(layout,digest,stage,marker='stage start')
             with stage_watchdog(layout,manifest,digest,stage) if operation is None else nullcontext():
-                with file_timing(layout,digest,stage,None) if operation is None else nullcontext():
+                with (file_timing(layout,digest,stage,None,rss_limit=stage_rss_limit(stage))
+                      if operation is None else nullcontext()):
                     result=(operation or execute_stage)(stage,manifest,digest,layout)
             result=opt.json_safe(result)
             record.update(status='pending_postflight',result=result,protected_before=before,
@@ -618,12 +641,13 @@ def postflight_stage(layout,stage,*,synthetic=False):
     return record
 
 
-def open_prefix(layout,manifest,bt):
+def open_prefix(layout,manifest,bt,stage=None):
     """Historical caches are opened read-only for validation; strategy gets SearchPrefix only."""
     from scripts import diagnose_trades as diagnose
     from scripts.trade_feature_cache import production_generation,generation_directory
     from scripts.phase4_benchmark import DATASET_ID
-    from scripts.phase4_resources import require_memory_plan,mapped_cache_files,enforce_current
+    from scripts import phase4_resources as resources
+    resources.enforce_current(0,stage_rss_limit(stage))
     arm=manifest['arms'][f'BTCUSDT:{bt}:full'];spec=arm['comparator']
     raw=Path(spec['path']).read_bytes()
     if hashlib.sha256(raw).hexdigest()!=spec['sha256']:raise ValueError('comparator hash mismatch')
@@ -637,7 +661,7 @@ def open_prefix(layout,manifest,bt):
     ensure_dev_window(date.fromisoformat(meta['start']),date.fromisoformat(meta['end']))
     generation=production_generation(generation_directory(layout.root/'output/optimize/trade_cache',DATASET_ID))
     trade_path=Path(generation['lanes'][bt])
-    require_memory_plan([{'mapped_files':mapped_cache_files(trade_path)}]);enforce_current()
+    resources.require_memory_plan([{'mapped_files':resources.mapped_cache_files(trade_path)}])
     args=SimpleNamespace(**{k:manifest[k] for k in ('holdout_fraction','embargo','n_splits')})
     prefix=p4.SearchPrefix.open(cache,bt,trade_path,args,production=True,dataset_id=DATASET_ID,bar_type=bt)
     prefix.metadata=meta
@@ -736,13 +760,13 @@ def execute_stage(stage,manifest,digest,layout):
     if stage=='S1':
         lanes={}
         for bt in BAR_TYPES:
-            prefix,comparator,_=open_prefix(layout,manifest,bt)
+            prefix,comparator,_=open_prefix(layout,manifest,bt,stage)
             def replay_guard(label):
                 stage_progress(layout,digest,stage,arm=f'BTCUSDT:{bt}:full',marker=label)
                 def audit(stop):
                     return record_termination(layout,manifest,digest,stage,stop={k:v for k,v in stop.items() if k!='trial'})
                 return file_timing(layout,digest,f'{bt}-{label}',
-                    manifest['arms'][f'BTCUSDT:{bt}:full']['max_trial_seconds'],audit=audit)
+                    manifest['arms'][f'BTCUSDT:{bt}:full']['max_trial_seconds'],audit=audit,rss_limit=stage_rss_limit(stage))
             lanes[bt]=p4.run_s1(prefix,comparator,guard=replay_guard)
         return {'lanes':lanes}
     if stage in ('S2t','S2v'):
@@ -859,7 +883,7 @@ def launch_stage(layout,manifest,digest,stage,child,fds,launch,timeout,*,postfli
                     if memory_stop else record_termination(layout,attempt,digest,stage,
                     returncode=measurement['returncode'],memory=memory,elapsed=elapsed))
             raise ValueError(f"stage process ended: {record['kind']}")
-        try:resources.enforce_memory(measurement)
+        try:enforce_stage_memory(measurement,stage)
         except (MemoryBoundsError,ValueError) as exc:
             record_termination(layout,attempt,digest,stage,stop={'reason':'memory','cause':str(exc)},
                                memory=memory,elapsed=elapsed)
@@ -906,6 +930,11 @@ def main(argv=None,*,recovery_argv=None):
         # Locks first: contention with another driver never consumes an owner approval.
         with stage_locks(layout,manifest) as fds:
             launch=new_launch()
+            if stage_min_available(cli.stage)>stage_min_available(None):
+                # A3: host memory for the raised S1 limit is checked before any approval (fresh or recovery)
+                # is consumed.
+                from scripts.phase4_resources import require_memory_plan
+                require_memory_plan([{'mapped_files':{}}],stage_min_available(cli.stage))
             if cli.recovery_approved:
                 from scripts.phase4_approvals import recovery_root
                 driver_argv=_strip(list(recovery_argv if recovery_argv is not None else

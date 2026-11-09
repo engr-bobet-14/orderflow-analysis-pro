@@ -1027,7 +1027,7 @@ def phase4_fatal(message,study=None,stop=None,deadline=None):
 @contextmanager
 def phase4_trial_timing(trial,study,prior,begun,args=None,terminal=None):
     """Retry checkpoints, with an independent watchdog and live runtime/memory limits."""
-    from scripts.phase4_resources import current_memory,memory_bounds
+    from scripts.phase4_resources import current_memory,memory_bounds,PRIVATE_BUDGET
     started=time.perf_counter();started_utc=datetime.now(timezone.utc)
     last_success=started
     done=threading.Event();pulse_done=threading.Event();terminating=threading.Event();active=False
@@ -1057,7 +1057,9 @@ def phase4_trial_timing(trial,study,prior,begun,args=None,terminal=None):
         if private is not None:memory['peak_private_bytes']=max(memory['peak_private_bytes'],private)
         memory['private_metric']=sample.get('private_metric')
         memory['private_measurement_available']=private is not None and not sample.get('private_is_fallback',False)
-        bounds=memory_bounds(sample)
+        # Phase 4b A3: a caller may pass a stage RSS limit (S1 only); Phase 4 callers keep the 4 GiB default.
+        limit=getattr(args,'phase4_rss_limit_bytes',None)
+        bounds=memory_bounds(sample,0,PRIVATE_BUDGET if limit is None else limit)
         if not bounds['pass']:
             memory_health({'measurement':sample,'bounds':bounds})
             try:trial.set_user_attr('phase4_memory',dict(memory))
