@@ -57,12 +57,13 @@ def process_memory(pid=None):
             'private_metric':'RSS only; private measurement unavailable','private_is_fallback':True}
 
 
-def memory_bounds(sample,mapped_bytes=0):
+def memory_bounds(sample,mapped_bytes=0,rss_limit=PRIVATE_BUDGET):
+    """Strict RSS and private bounds; only the RSS limit is a parameter (Phase 4b A3: S1 only)."""
     rss=sample.get('peak_rss_bytes',sample.get('rss_bytes',0))
     private=sample.get('peak_private_bytes',sample.get('private_bytes'))
     private_ok=private is not None and not sample.get('private_is_fallback',False) and private<=PRIVATE_BUDGET
-    return {'pass':bool(rss<=PRIVATE_BUDGET and private_ok),'rss_bytes':rss,'private_bytes':private,
-            'mapped_cache_bytes':mapped_bytes,'mapped_rss_credit_bytes':0,'rss_limit_bytes':PRIVATE_BUDGET,
+    return {'pass':bool(rss<=rss_limit and private_ok),'rss_bytes':rss,'private_bytes':private,
+            'mapped_cache_bytes':mapped_bytes,'mapped_rss_credit_bytes':0,'rss_limit_bytes':rss_limit,
             'private_limit_bytes':PRIVATE_BUDGET,
             'private_measurement_available':private is not None}
 
@@ -74,8 +75,8 @@ class MemoryBoundsError(ValueError):
         super().__init__(f'Phase 4 process memory bounds exceeded or unavailable: {bounds}')
 
 
-def enforce_memory(sample,mapped_bytes=0):
-    result=memory_bounds(sample,mapped_bytes)
+def enforce_memory(sample,mapped_bytes=0,rss_limit=PRIVATE_BUDGET):
+    result=memory_bounds(sample,mapped_bytes,rss_limit)
     if not result['pass']:
         raise MemoryBoundsError(sample,result)
     return result
@@ -89,8 +90,8 @@ def current_memory():
     return result
 
 
-def enforce_current(mapped_bytes=0):
-    return enforce_memory(current_memory(),mapped_bytes)
+def enforce_current(mapped_bytes=0,rss_limit=PRIVATE_BUDGET):
+    return enforce_memory(current_memory(),mapped_bytes,rss_limit)
 
 
 def mapped_cache_files(directory):
@@ -122,7 +123,7 @@ def available_memory():
     return psutil.virtual_memory().available,'psutil available (non-macOS fallback)'
 
 
-def memory_plan(plans,available_bytes=None):
+def memory_plan(plans,available_bytes=None,min_available=MIN_AVAILABLE):
     mapped={}
     for plan in plans:
         for path,size in plan.get('mapped_files',{}).items():
@@ -134,10 +135,10 @@ def memory_plan(plans,available_bytes=None):
         except (OSError,ValueError,subprocess.SubprocessError) as exc:
             error=str(exc)
     planned=private+sum(mapped.values())
-    return {'pass':bool(planned<=TOTAL_BUDGET and available_bytes is not None and available_bytes>=MIN_AVAILABLE),
+    return {'pass':bool(planned<=TOTAL_BUDGET and available_bytes is not None and available_bytes>=min_available),
         'processes':len(plans),'planned_private_bytes':private,'unique_mapped_bytes':sum(mapped.values()),
         'planned_bytes':planned,'total_limit_bytes':TOTAL_BUDGET,'available_bytes':available_bytes,
-        'minimum_available_bytes':MIN_AVAILABLE,'available_source':source,'error':error,'mapped_files':mapped}
+        'minimum_available_bytes':min_available,'available_source':source,'error':error,'mapped_files':mapped}
 
 
 class MemoryAdmissionError(ValueError):
@@ -146,7 +147,7 @@ class MemoryAdmissionError(ValueError):
         super().__init__(f'Phase 4 total-memory admission refused: {report}')
 
 
-def require_memory_plan(plans):
-    result=memory_plan(plans)
+def require_memory_plan(plans,min_available=MIN_AVAILABLE):
+    result=memory_plan(plans,min_available=min_available)
     if not result['pass']:raise MemoryAdmissionError(result)
     return result

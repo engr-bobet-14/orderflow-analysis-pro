@@ -469,5 +469,303 @@ def main(argv=None):
         parser.error(str(exc))
 
 
+def neighbours_rel(params, space):
+    """Phase 4b only: ±10% of value, adjacent categories, explicit unavailable rows."""
+    rows = []
+    for name, (lo, hi, kind) in space.items():
+        base = params[name]
+        for sign in (-1, 1):
+            if kind == 'categorical':
+                index = lo.index(base) + sign
+                effective = lo[index] if 0 <= index < len(lo) else base
+                proposed = effective
+            else:
+                step = .1 * abs(base) if base != 0 else .1 * (hi-lo)
+                proposed = base + sign * step
+                if kind == 'int':
+                    proposed = min(base-1, round(proposed)) if sign < 0 else max(base+1, round(proposed))
+                effective = min(hi, max(lo, proposed))
+            rows.append({'dimension':name,'direction':sign,'base':base,'requested_value':proposed,
+                         'effective_value':effective,'status':'available' if effective != base else 'unavailable_at_bound'})
+    return rows
+
+
+def expectancy_r(trades, pnl='net_pnl', *, empty=None):
+    """Equal-weight mean per-trade R; nonpositive dollar risk is excluded."""
+    valid = trades[trades.dollar_risk > 0]
+    return float((valid[pnl]/valid.dollar_risk).mean()) if len(valid) else empty
+
+
+def net_bootstrap(arm, baseline, start, end, **kwargs):
+    """Use precisely the Phase 4 joint day-block draws and invalid-resample rule."""
+    return gross_bootstrap(arm.assign(gross_pnl=arm.net_pnl), baseline.assign(gross_pnl=baseline.net_pnl),
+                           start, end, **kwargs)
+
+
+def bootstrap_sharpes(values, block, n_draws, rng):
+    """Literal moving-block SR estimator, evaluated in bounded-memory batches.
+
+    Cumulative block sums/squares avoid materialising B×T returns. The last
+    block uses only its leading remainder, exactly like concatenate/truncate.
+    """
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    if n < block:
+        raise ValueError('a full registered bootstrap block is required')
+    count = math.ceil(n/block)
+    remainder = n - (count-1)*block
+    sums = np.r_[0., np.cumsum(values)]
+    squares = np.r_[0., np.cumsum(values*values)]
+    draws = np.empty(n_draws)
+    # The RNG stream is independent of batch size: row-major draws match the literal scheme.
+    batch_size = max(1, min(4096, 1_000_000 // count))
+    for offset in range(0, n_draws, batch_size):
+        size = min(batch_size, n_draws-offset)
+        starts = rng.integers(0, n-block+1, size=(size, count))
+        ends = starts + block
+        ends[:, -1] = starts[:, -1] + remainder
+        means = (sums[ends]-sums[starts]).sum(axis=1)/n
+        variances = (squares[ends]-squares[starts]).sum(axis=1)/n-means*means
+        std = np.sqrt(np.maximum(0., variances))
+        draws[offset:offset+size] = np.divide(means, std, out=np.zeros(size), where=std>0)
+    return draws
+
+
+def bootstrap_tail_quantile(draws, n_trials):
+    return float(np.quantile(draws, 1-.05/n_trials, method='inverted_cdf'))
+
+
+def null_sharpe_calibration(returns, n_trials, *, sigma_draws=2000, tail_draws=1_000_000):
+    values = np.asarray(returns, dtype=float)
+    demeaned = values-values.mean()
+    sigma_rng = np.random.default_rng(20261107)
+    tail_rng = np.random.default_rng(20261108)
+    sds, tails = {}, {}
+    for block in (7, 30, 90):
+        draws = bootstrap_sharpes(demeaned, block, sigma_draws, sigma_rng)
+        sds[str(block)] = float(np.std(draws, ddof=0))
+    for block in (7, 30, 90):
+        draws = bootstrap_sharpes(demeaned, block, tail_draws, tail_rng)
+        tails[str(block)] = bootstrap_tail_quantile(draws, n_trials)
+    floor = 1/math.sqrt(len(values)-1)
+    return {'sigma_null':max(floor,*sds.values()), 'iid_floor':floor,'block_sds':sds,
+            'c_tail':max(tails.values()),'tail_quantiles':tails,
+            'sigma_draws':sigma_draws,'tail_draws':tail_draws,'sigma_seed':20261107,'tail_seed':20261108,
+            'quantile_method':'inverted_cdf','tail_comparison':'strict >'}
+
+
+def dsr_conditions(sharpe, sigma_null, c_tail, n_trials):
+    from scipy.stats import norm
+    from RiskLabAI.backtest.test_set_overfitting import expected_max_sharpe_ratio
+    expected = float(expected_max_sharpe_ratio(n_trials, 0., 1.))
+    threshold = sigma_null*(expected+norm.ppf(.95))
+    return {'sharpe_daily':sharpe,'sigma_null':sigma_null,'c_tail':c_tail,
+            'expected_max_standard_normal':expected,'sr_star':sigma_null*expected,
+            'dsr':float(norm.cdf((sharpe-sigma_null*expected)/sigma_null)),
+            'dsr_threshold':float(threshold),'dsr_pass':bool(sharpe>=threshold),
+            'tail_pass':bool(sharpe>c_tail)}
+
+
+def dependence_dsr_gate(returns, n_trials):
+    values = np.asarray(returns, dtype=float)
+    failure = {'status':'indeterminate','dsr_pass':False,'tail_pass':False}
+    if (values.ndim != 1 or len(values)<90 or not np.isfinite(values).all() or values.std(ddof=0)==0
+            or type(n_trials) is not int or n_trials<2):
+        return {**failure,'reason':'need >=90 varying finite calendar days and N >= 2 (full 90-day block)'}
+    calibration = null_sharpe_calibration(values, n_trials)
+    if not all(math.isfinite(calibration[k]) for k in ('sigma_null','c_tail')) or calibration['sigma_null']<=0:
+        return {**failure,'reason':'non-finite null calibration'}
+    sr = float(values.mean()/values.std(ddof=0))
+    conditions = dsr_conditions(sr, calibration['sigma_null'], calibration['c_tail'], n_trials)
+    floor = calibration.get('iid_floor', 1/math.sqrt(len(values)-1))
+    iid = dsr_conditions(sr, floor, calibration['c_tail'], n_trials)
+    acf = [float(np.corrcoef(values[:-lag],values[lag:])[0,1]) for lag in range(1,31)]
+    return {**calibration,**conditions,'status':'evaluated','n_trials':n_trials,
+            'iid_floor_dsr_diagnostic':iid['dsr'],'autocorrelations_lag1_to_30':acf,
+            'binding_sigma_block':max({'iid_floor':floor,**calibration.get('block_sds',{})},
+                key={'iid_floor':floor,**calibration.get('block_sds',{})}.get),
+            'binding_tail_block':max(calibration.get('tail_quantiles',{'unknown':0}),
+                key=calibration.get('tail_quantiles',{'unknown':0}).get),
+            'binding_condition':'DSR' if conditions['dsr_threshold']>=calibration['c_tail'] else 'tail'}
+
+
+def slippage_resimulation(ledger, search_bars, folds):
+    import hashlib
+    stressed = opt.simulate_trades_risk_based(ledger, fee_bps=5., slippage_bps=2.)
+    scored = diagnose.scored_only(stressed, search_bars, folds)
+    return {'net_expectancy_r':expectancy_r(scored),'n_trades':len(scored),
+            'excluded_nonpositive_risk':int((scored.dollar_risk<=0).sum()),
+            'quantities_sha256':hashlib.sha256(stressed.quantity.to_numpy(dtype='<f8').tobytes()).hexdigest(),
+            'quantities_length':len(stressed),'sizing':'risk-based re-simulation at 5/2 bps'}
+
+
+def net_profitability_gates(*, net, gross, top3, pbo, dsr, folds, neighbours, stress, feasible):
+    def positive(value):
+        return value is not None and math.isfinite(value) and value>0
+    def lower_ci(data, name):
+        ci = data.get(name)
+        return data.get('status')=='evaluated' and ci is not None and len(ci)==2 and positive(ci[0])
+    available = [r.get('net_expectancy_r') for r in neighbours if r['status']=='available']
+    floors = (feasible is True and len(folds)==5 and sum(f.get('n_trades',0) for f in folds)>=105
+              and all(f.get('n_trades',0)>=11 for f in folds))
+    gates = {
+        '1':lower_ci(net,'arm_ci'), '2':lower_ci(net,'difference_ci'), '3':lower_ci(gross,'arm_ci'),
+        '4':len(top3)==3 and all(positive(v) for v in top3),
+        '5':pbo is not None and math.isfinite(pbo) and 0<=pbo<.5,
+        '6':dsr.get('status')=='evaluated' and dsr.get('dsr_pass') is True and dsr.get('tail_pass') is True,
+        '7':len(folds)==5 and sum(positive(f.get('sharpe_ratio')) and not f.get('penalized',True) for f in folds)>=3,
+        '8':len(neighbours)==46 and len(available)>=23 and all(v is not None and math.isfinite(v) for v in available)
+            and bool(available) and positive(float(np.median(available))),
+        '9':positive(stress), '10':floors,
+    }
+    gates = {k:bool(v) for k,v in gates.items()}
+    return {'G4b_N':all(gates.values()),'gates':gates}
+
+
+def rev5_dsr_diagnostic(returns, campaign):
+    """The withdrawn empirical-sigma PSR is reported, never used for admission."""
+    from RiskLabAI.backtest.validation.leakage_aware_hpo import deflated_sharpe_gate
+    sigma=campaign.get('trial_sharpe_std')
+    values=np.asarray(returns,dtype=float)
+    result={'label':'rev 5 empirical-σ DSR (diagnostic)','diagnostic':True}
+    if (sigma is None or not math.isfinite(sigma) or sigma<=0 or len(values)<3
+            or not np.isfinite(values).all() or np.std(values)==0):
+        return {**result,'status':'indeterminate'}
+    value=deflated_sharpe_gate(values,n_trials=campaign['n_symbol_all_studies'],trial_sharpe_std=sigma)
+    # The library's `passes` flag (> .5) is deliberately never consulted.
+    return {**result,'status':'evaluated','deflated_sharpe':float(value['deflated_sharpe'])}
+
+
+def build_full_strategy_report(prefix, trials, comparator, snapshots, folds, *, symbol='BTCUSDT',progress=None):
+    from scripts import phase4_studies as p4
+    if not isinstance(prefix,p4.SearchPrefix) or not isinstance(comparator,p4.FrozenComparator):
+        raise TypeError('full-strategy report needs SearchPrefix and FrozenComparator')
+    feasible=sorted((t for t in trials if t['state']=='COMPLETE' and t.get('feasible') is True
+        and t['value'] is not None and math.isfinite(t['value'])),key=lambda t:(-t['value'],t['number']))
+    if not feasible:
+        return {'G4b_N':False,'gates':{str(i):False for i in range(1,11)},
+                'status':'indeterminate','reason':'no feasible candidate','trial':None}
+    def sample(trial):
+        values=dict(trial['attrs']['params'])
+        inert=values.pop('absorption_min_delta_pct',opt.instrument_config(symbol).absorption.min_delta_pct)
+        if inert!=opt.instrument_config(symbol).absorption.min_delta_pct:
+            raise ValueError('candidate inert parameter differs from registration')
+        return p4.FullStrategySample(values,trial['attrs']['replay_digest'])
+    def replay_trial_full(trial):
+        result=p4.replay_full_strategy(sample(trial),prefix,symbol=symbol)
+        if (trial['attrs'].get('raw_signal_digest') is not None
+                and result.get('raw_signal_digest')!=trial['attrs']['raw_signal_digest']):
+            raise ValueError('candidate raw signal digest mismatch')
+        full=diagnose.add_gross(opt.simulate_trades_risk_based(result['ledger'],fee_bps=5.,slippage_bps=1.))
+        return result,full,diagnose.scored_only(full,prefix.bars,folds)
+    if progress:progress('comparator',None)
+    baseline=p4.replay_comparator(comparator,prefix,symbol=symbol)
+    base_full=diagnose.add_gross(opt.simulate_trades_risk_based(baseline['ledger'],fee_bps=5.,slippage_bps=1.))
+    base_scored=diagnose.scored_only(base_full,prefix.bars,folds)
+    best=feasible[0];top=[]
+    for rank,trial in enumerate(feasible[:3],1):
+        if progress:progress(f'top-3 {rank}/3',trial['number'])
+        result,full,scored=replay_trial_full(trial)
+        top.append({'trial':trial['number'],'replay_digest':result['replay_digest'],
+                    'net_expectancy_r':expectancy_r(scored),'decomposition':diagnose.decompose(scored)})
+        if trial is best:candidate,full_candidate,scored_candidate=result,full,scored
+    search=prefix.bars
+    start,end=[pd.Timestamp(b.timestamp_ms,unit='ms',tz='UTC') for b in (search[0],search[-1])]
+    try:net=net_bootstrap(scored_candidate,base_scored,start,end)
+    except ValueError as exc:net={'status':'indeterminate','reason':str(exc),'arm_ci':None,'difference_ci':None}
+    try:gross=gross_bootstrap(scored_candidate,base_scored,start,end)
+    except ValueError as exc:gross={'status':'indeterminate','reason':str(exc),'arm_ci':None,'difference_ci':None}
+    try:pbo=cscv_pbo(daily_matrix(feasible),blocks=16)
+    except ValueError as exc:pbo={'pbo':None,'status':'indeterminate','reason':str(exc)}
+    union=campaign_union(snapshots,symbol)
+    returns=search_returns(full_candidate,search,folds)
+    if progress:progress('null calibration',best['number'])
+    dsr=dependence_dsr_gate(returns,union['n_symbol_all_studies'])
+    diagnostic=rev5_dsr_diagnostic(returns,union)
+    values=sample(best).params
+    stability=neighbours_rel(values,p4.FULL_STRATEGY_SPACE)
+    for index,row in enumerate(stability,1):
+        if row['status']!='available':continue
+        if progress:progress(f'neighbour {index}/46',best['number'])
+        neighbour={**values,row['dimension']:row['effective_value']}
+        result=p4.replay_full_strategy(p4.FullStrategySample(neighbour),prefix,symbol=symbol)
+        full=opt.simulate_trades_risk_based(result['ledger'],fee_bps=5.,slippage_bps=1.)
+        scored=diagnose.scored_only(full,search,folds)
+        row.update(net_expectancy_r=expectancy_r(scored,empty=0.),replay_digest=result['replay_digest'])
+    if progress:progress('slippage stress',best['number'])
+    stress=slippage_resimulation(candidate['ledger'],search,folds)
+    gates=net_profitability_gates(net=net,gross=gross,top3=[t['net_expectancy_r'] for t in top],
+        pbo=pbo['pbo'],dsr=dsr,folds=best['attrs']['fold_results'],neighbours=stability,
+        stress=stress['net_expectancy_r'],feasible=best['feasible'])
+    multiples=signal_multiples(candidate['signal_counts'],baseline['signal_counts'])
+    return opt.json_safe({**gates,'trial':best['number'],'replay_digest':candidate['replay_digest'],
+        'replay_identity':candidate.get('replay_identity'),'raw_signal_digest':candidate.get('raw_signal_digest'),
+        'top3':top,'bootstrap_net':net,'bootstrap_gross':gross,'CSCV':pbo,'campaign':union,
+        'deflated_sharpe':dsr,'rev5_dsr_diagnostic':diagnostic,'parameter_stability':stability,
+        'slippage_stress':stress,'fold_results':best['attrs']['fold_results'],
+        'comparator':{'params':dict(comparator.params),'replay_digest':baseline['replay_digest']},
+        'signal_frequency_multiples':multiples,
+        'trade_frequency_multiple':len(scored_candidate)/len(base_scored) if len(base_scored) else None,
+        'cost_grid':{'label':'diagnostic: fixed-quantity repricing',**cost_stress(scored_candidate)},
+        'gross_edge_gates':{'G2':gate(gross,best,[t['decomposition']['gross_expectancy_r'] for t in top],
+                                    pbo['pbo'],multiples['maximum']),
+            'positive_gross_ci':gross['status']=='evaluated' and gross['arm_ci'][0]>0,
+            'positive_gross_difference_ci':gross['status']=='evaluated' and gross['difference_ci'][0]>0},
+        'limitations':['Funding not modelled','Stop-fill model optimistic for fast moves',
+            'Bootstrap null validity in extreme tails is an assumption',
+            'Blocks stop at 90 days; longer dependence/nonstationarity may invalidate inference',
+            'One million draws has material extreme-quantile Monte Carlo error',
+            'FWER <=5% is conditional on per-trial bootstrap null validity',
+            'Pseudo-holdout conditional on full-history bar calibration']})
+
+
+def phase4b_report_snapshots(layout, campaign, campaign_hash, *, reported_arms=None):
+    """Hash-fixed historical inputs plus a read-transaction SQLite backup of 4b only."""
+    if layout.phase!='phase4b' or campaign.get('phase')!='phase4b':
+        raise ValueError('snapshot phase mismatch')
+    source=layout.db_path(campaign['phase4b_db'])
+    reported_arms=set(campaign['arms']) if reported_arms is None else set(reported_arms)
+    if not reported_arms<=set(campaign['arms']):raise ValueError('unregistered report arm')
+    historical=campaign.get('snapshots',[])
+    if len(historical)!=4 or len({Path(s['path']).resolve() for s in historical})!=4:
+        raise ValueError('four distinct historical snapshots required')
+    for item in historical:
+        if sha256_file(Path(item['path']))!=item['sha256']:raise ValueError('historical snapshot changed')
+    # Writer/worker locks are already held by the sequential S3 driver.
+    with opt._readonly_db(source) as con:
+        admitted=set()
+        identities=con.execute("SELECT s.study_id,s.study_name,a.value_json FROM studies s "
+            "JOIN study_user_attributes a ON a.study_id=s.study_id AND a.key='identity'").fetchall()
+        for sid,name,raw in identities:
+            identity=json.loads(raw)
+            if identity.get('campaign_sha256')!=campaign_hash:continue
+            arm=identity['arm']
+            if arm not in reported_arms:continue
+            attrs={key:json.loads(value) for key,value in con.execute(
+                'SELECT key,value_json FROM study_user_attributes WHERE study_id=?',(sid,))}
+            if (identity.get('phase')!='phase4b' or attrs.get('phase4_runtime_stop') is not None
+                    or attrs.get('phase4_accounting_pending') or attrs.get('phase4_memory_check_pending')):
+                raise ValueError('snapshot requires resolved, unstopped phase4b studies')
+            if arm in admitted or arm not in campaign['arms']:
+                raise ValueError('duplicate or unregistered arm')
+            counts=dict(con.execute('SELECT state,count(*) FROM trials WHERE study_id=? GROUP BY state',(sid,)))
+            if (counts.get('COMPLETE',0)!=campaign['arms'][arm]['budget']
+                    or counts.get('RUNNING',0) or counts.get('WAITING',0)):
+                raise ValueError('snapshot requires exact completed budgets')
+            admitted.add(arm)
+        if admitted!=reported_arms:raise ValueError('snapshot missing campaign arm')
+        out=layout.checked_write(layout.snapshots);out.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=out,prefix='.snapshot-') as staging:
+            path=Path(staging)/'phase4b.db'
+            with sqlite3.connect(path) as target:con.backup(target)
+            digest=sha256_file(path);final=layout.checked_write(out/(digest+'.db'))
+            if final.exists():
+                if sha256_file(final)!=digest:raise ValueError('snapshot hash collision/tamper')
+            else:path.rename(final)
+    for item in historical:
+        if sha256_file(Path(item['path']))!=item['sha256']:raise ValueError('historical snapshot changed during backup')
+    return [*historical,{'path':str(final),'sha256':digest,'source_path':str(source),'campaign_sha256':campaign_hash}]
+
+
 if __name__=='__main__':
     print(json.dumps(main(),indent=2))

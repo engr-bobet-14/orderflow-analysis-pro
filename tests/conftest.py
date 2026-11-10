@@ -85,3 +85,19 @@ def no_repo_phase4_checkpoint_pollution():
     before=snapshot()
     yield
     assert snapshot()==before, 'test changed real output/phase4/checkpoints; use a temporary ROOT'
+
+
+def pytest_collection_modifyitems(config, items):
+    """Phase 4b amendment A1: real-data tests that read pseudo-holdout dates never run by accident.
+
+    They are skipped unless PHASE4B_ALLOW_HOLDOUT_TESTS=1 is set explicitly (only after the single look).
+    """
+    import os
+    from scripts.phase4b_proof import DESELECTED
+    if os.environ.get('PHASE4B_ALLOW_HOLDOUT_TESTS') == '1':
+        return
+    skip = pytest.mark.skip(reason='Phase 4b amendment A1: reads pseudo-holdout dates '
+                                   '(set PHASE4B_ALLOW_HOLDOUT_TESTS=1 only after the single look)')
+    for item in items:
+        if any(item.nodeid == node or item.nodeid.startswith(node + '[') for node in DESELECTED):
+            item.add_marker(skip)

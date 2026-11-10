@@ -24,10 +24,11 @@ def maxrss_bytes(ru_maxrss: int, platform: str = sys.platform) -> int:
     return ru_maxrss if platform == "darwin" else ru_maxrss * 1024
 
 
-def run_measured(argv: list[str], *, memory=False) -> dict:
+def run_measured(argv: list[str], *, memory=False, env=None, pass_fds=(), worker=False) -> dict:
+    """``worker=True``: argv[0] is a wrapper (timeout --foreground) whose single child is sampled."""
     t0 = time.monotonic()
-    proc = subprocess.Popen(argv)
-    sample_count=0;best=None
+    proc = subprocess.Popen(argv, env=env, pass_fds=pass_fds)
+    sample_count=0;best=None;last=None;target=None if worker else proc.pid
     if memory:
         from scripts.phase4_resources import process_memory
         import psutil
@@ -35,7 +36,15 @@ def run_measured(argv: list[str], *, memory=False) -> dict:
             pid,status,usage=os.wait4(proc.pid,os.WNOHANG)
             if pid:break
             try:
-                sample=process_memory(proc.pid);sample_count+=1
+                if target is None:
+                    children=psutil.Process(proc.pid).children()
+                    if not children:time.sleep(.02);continue
+                    target=children[0].pid
+                sample=process_memory(target)
+                # A SIGKILLed worker not yet reaped still answers, with a 0 private footprint: not evidence.
+                if worker and (sample.get('private_bytes')==0 or sample.get('rss_bytes')==0):
+                    time.sleep(.02);continue
+                sample_count+=1;last=sample
                 if sample['peak_private_bytes'] is not None and (best is None or sample['peak_private_bytes']>best['peak_private_bytes']):
                     best=sample
             except (OSError,psutil.Error):pass # Child may exit between wait4 and sampling.
@@ -49,6 +58,9 @@ def run_measured(argv: list[str], *, memory=False) -> dict:
         result.update(peak_private_bytes=best['peak_private_bytes'] if best else None,
                       private_metric=best['private_metric'] if best else 'private measurement unavailable',
                       private_is_fallback=best is None,memory_samples=sample_count)
+        if worker:
+            result['last_memory_sample']={'source':'worker','pid':target,'wrapper_pid':proc.pid,'last':last,
+                'peak_private_bytes':result['peak_private_bytes'],'samples':sample_count}
     return result
 
 

@@ -5,12 +5,92 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from dataclasses import dataclass, field
 
 ROOT = Path(__file__).resolve().parents[1]
 WRITE_ROOTS = ('output/optimize/phase4', 'output/optimize/trade_cache', 'output/phase4', 'output/duckdb_tmp')
 PROTECTED = ('output/optimize/studies.db', 'output/optimize/results.json', 'output/optimize/cache',
              'output/optimize/main', 'output/optimize/smoke', 'output/certificates', 'output/diagnose',
              'orderflow_system/config/paired_datasets.json')
+
+
+@dataclass(frozen=True)
+class PhaseLayout:
+    """All campaign-owned paths; phase4 retains its original policy exactly."""
+    phase: str
+    root: Path = field(default_factory=lambda: ROOT)
+    approvals_base: Path | None = None
+
+    def __post_init__(self):
+        if self.phase not in ('phase4', 'phase4b', 'phase4b-s1'):
+            raise ValueError('unknown campaign phase')
+        object.__setattr__(self, 'root', Path(self.root).resolve())
+
+    @property
+    def namespace(self):
+        return 'phase4' if self.phase == 'phase4' else 'phase4b'
+
+    @property
+    def output(self):
+        return self.root/'output'/self.namespace
+
+    @property
+    def optimize(self):
+        return self.root/'output/optimize'/self.namespace
+
+    @property
+    def manifest(self):
+        return self.output/('s1/campaign.json' if self.phase == 'phase4b-s1' else 'campaign.json')
+
+    @property
+    def studies_db(self):
+        return self.optimize/'studies.db'
+
+    @property
+    def approval_root(self):
+        import os
+        import pwd
+        base = self.approvals_base or Path(pwd.getpwuid(os.getuid()).pw_dir)/'.orderflow-approvals'
+        return Path(base)/self.namespace
+
+    @property
+    def allocation_root(self):
+        return self.approval_root.parent/'holdout-allocation'
+
+    @property
+    def exposure(self):
+        return self.output/'holdout/exposures.json'
+
+    @property
+    def checkpoints(self):
+        return self.output/'checkpoints'
+
+    @property
+    def snapshots(self):
+        return self.output/'reports/snapshots'
+
+    @property
+    def write_roots(self):
+        return WRITE_ROOTS if self.phase == 'phase4' else ('output/phase4b', 'output/optimize/phase4b', 'output/duckdb_tmp')
+
+    def checked_write(self, path):
+        path = Path(path).expanduser()
+        resolved = (path if path.is_absolute() else self.root/path).resolve()
+        protected = PROTECTED + (() if self.phase == 'phase4' else
+            ('output/phase4', 'output/optimize/phase4', 'output/optimize/trade_cache'))
+        if (not resolved.is_relative_to(self.root/'output')
+                or not any(resolved.is_relative_to(self.root/p) for p in self.write_roots)
+                or any(resolved.is_relative_to(self.root/p) for p in protected)
+                or resolved.is_relative_to('/Volumes')):
+            raise ValueError(f'{self.phase} write destination outside allowlist: {resolved}')
+        return resolved
+
+    def db_path(self, path):
+        result = self.checked_write(path)
+        if (self.phase == 'phase4' and not result.is_relative_to(self.optimize)
+                or self.phase != 'phase4' and result != self.studies_db):
+            raise ValueError('database differs from the phase layout')
+        return result
 
 
 def checked_write(path):
@@ -94,7 +174,7 @@ def assert_no_conflicts(*, strict=True):
     import os
     import psutil
     scripts = {'optimize_orderflow.py','replay_trades.py','trade_feature_cache.py','phase4_benchmark.py',
-               'phase4_campaign.py','validate_oos.py','diagnose_trades.py'}
+               'phase4_campaign.py','phase4b_campaign.py','phase4b_regression.py','validate_oos.py','diagnose_trades.py'}
     try:
         ignored = {os.getpid(),*[p.pid for p in psutil.Process().parents()]}
         for process in psutil.process_iter(['pid','cmdline']):

@@ -1,7 +1,8 @@
 """Phase 4 admission, immutable candidates and single-look holdout reservations."""
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
+from contextlib import contextmanager
 from datetime import date
 import hashlib
 import json
@@ -105,7 +106,26 @@ def active_space(space, signals, *, frozen):
 def effective_trade_config(args, params):
     base = getattr(args, 'trade_signal_config', TradeSignalConfig())
     fields = {k[3:]:v for k,v in params.items() if k.startswith('ts_')}
-    return TradeFlowConfig(signals=replace(base, **fields))
+    if getattr(args, 'phase', None) == 'phase4b':
+        if base.initiative_imbalance == 'bonus':
+            raise ValueError('phase4b refuses diagnostic-only initiative bonus')
+        base = TradeSignalConfig(absorption_levels=True, absorption_source='trade',
+            framing_profile_source='trades', exhaustion_contrarian='required',
+            initiative_imbalance='required', stacked_min_levels=3)
+    config=TradeFlowConfig(signals=replace(base, **fields))
+    if getattr(args,'phase',None)=='phase4b':
+        validate_phase4b_signals(config.signals)
+    return config
+
+
+def validate_phase4b_signals(signals, *, s1=False):
+    if signals.initiative_imbalance=='bonus':
+        raise ValueError('phase4b refuses diagnostic-only initiative bonus')
+    if (not signals.absorption_levels or signals.absorption_source!='trade'
+            or signals.initiative_imbalance not in (('required','off') if s1 else ('required',))
+            or signals.exhaustion_contrarian not in (('required','off') if s1 else ('required',))
+            or signals.framing_profile_source not in (('trades','bar_vwap') if s1 else ('trades',))):
+        raise ValueError('invalid final phase4b signals config')
 
 
 def merged_params(args, params):
@@ -146,7 +166,7 @@ def legacy_study_guard(args, name):
     if not getattr(args, 'phase4', False):
         from scripts import optimize_orderflow as opt
         stored = opt._stored_identity(args.study_db, name)
-        if stored and stored.get('phase') == 'phase4':
+        if stored and stored.get('phase') in ('phase4','phase4b'):
             raise ValueError('legacy optimizer cannot open a Phase 4 study')
 
 
@@ -173,10 +193,15 @@ def sequential_campaign(campaign):
 
 
 def arm_key(args):
+    if getattr(args,'phase',None)=='phase4b':
+        return args.symbol+':'+args.bar_type+':full'
     return args.symbol+':'+args.bar_type+':'+getattr(args,'trade_signals','off')
 
 
 def campaign_arm(args,study_name=None,*,under_init_lock=False):
+    if getattr(args,'phase',None)=='phase4b':
+        from scripts.phase4b_campaign import campaign_arm as full_arm
+        return full_arm(args,study_name)
     campaign, digest = read_campaign(args.campaign_manifest)
     key = arm_key(args)
     if key not in campaign['arms']:
@@ -458,3 +483,304 @@ def holdout_look(args, bars):
     # The optimizer takes the corresponding exclusive lock for the entire study run.
     with opt._shared_lock_readonly(opt.study_lock_path(db,study_name)):
         return reserved_look(ROOT/'output/phase4/holdout/exposures.json',arm_key(args),reservation,replay,revalidate)
+
+
+# The registered 23-dimensional joint space. The original Phase 4 space is untouched.
+FULL_STRATEGY_SPACE = {
+    'price_proximity_pct': (.0005, .005, 'float_log'),
+    'min_composite_score': (10., 70., 'float'),
+    'signal_cooldown_seconds': (5., 120., 'float'),
+    'volume_decline_pct': (.05, .6, 'float'),
+    'lookback_bars': (5, 30, 'int'),
+    'delta_failure_pct': (.5, .95, 'float'),
+    'initiative_min_delta_pct': (.2, .6, 'float'),
+    'initiative_min_body_bps': (1., 8., 'float_log'),
+    'initiative_volume_acceleration_min': (1., 3., 'float'),
+    'default_stop_pct': (.001, .01, 'float_log'),
+    'target_rr': (1., 4., 'float'),
+    **TRADE_SEARCH_SPACE_BOUNDS,
+    'ts_imbalance_ratio': (2., 6., 'float_log'),
+    'ts_imbalance_min_level_share': (.002, .05, 'float_log'),
+    'ts_imbalance_bucket_mult': ((1, 2, 5, 10), None, 'categorical'),
+    'ts_stacked_min_levels': (1, 4, 'int'),
+}
+
+
+def full_strategy_params(sampled, symbol='BTCUSDT'):
+    from scripts.optimize_orderflow import instrument_config
+    if set(sampled) != set(FULL_STRATEGY_SPACE):
+        raise ValueError('full strategy requires exactly the 23 sampled dimensions')
+    return {**sampled, 'absorption_min_delta_pct': instrument_config(symbol).absorption.min_delta_pct}
+
+
+class HoldoutAccessError(IndexError):
+    """Strategy attempted to read beyond its registered search prefix."""
+
+
+class TradeUpdatesPrefix:
+    def __init__(self, updates, stop):
+        self.__updates, self.__stop = updates, stop
+
+    def __len__(self):
+        return self.__stop
+
+    @property
+    def path(self):
+        """Cache path for integrity/memory accounting; no unbounded updates are exposed."""
+        return self.__updates.path
+
+    def __getitem__(self, index):
+        if not isinstance(index, int) or not 0 <= index < self.__stop:
+            raise HoldoutAccessError('trade update outside search prefix')
+        return self.__updates[index]
+
+    def __iter__(self):
+        for index in range(self.__stop):
+            yield self[index]
+
+
+class SearchPrefix:
+    """Only bounded strategy views escape the full-cache integrity-opening path."""
+    def __init__(self, bars, updates, n_search):
+        if not 0 < n_search <= len(bars) or len(updates) != len(bars):
+            raise ValueError('search prefix/cache length mismatch')
+        self.bars = bars[:n_search]
+        self.trade_updates = TradeUpdatesPrefix(updates, n_search)
+        self.trade_cache_identity = getattr(updates, 'identity', None)
+
+    @classmethod
+    def open(cls, bars_path, bars_type, trade_path, args, **cache_options):
+        # bars_type, not bar_type: production callers pass bar_type= as a cache identity option.
+        from scripts.optimize_orderflow import CachedBars, split_timeline
+        from scripts.trade_feature_cache import CachedTradeUpdates
+        bars = CachedBars(bars_path, bars_type)
+        # Frozen constructor hashes all bytes and validates the full-length bars.
+        updates = CachedTradeUpdates(trade_path, bars, **cache_options)
+        n_search, _ = split_timeline(bars, args)
+        return cls(bars, updates, n_search)
+
+
+@dataclass(frozen=True)
+class FrozenComparator:
+    params: dict
+    replay_digest: str
+
+
+@dataclass(frozen=True)
+class LegacyReplay:
+    params: dict
+    signals: TradeSignalConfig
+    replay_digest: str
+
+    def __post_init__(self):
+        defaults = TradeSignalConfig()
+        for name in ('absorption_source', 'initiative_imbalance', 'imbalance_ratio',
+                     'imbalance_min_level_share', 'imbalance_bucket_mult', 'stacked_min_levels'):
+            if getattr(self.signals, name) != getattr(defaults, name):
+                raise ValueError('legacy replay requires backward-compatible 4b defaults')
+
+
+@dataclass(frozen=True)
+class FullStrategySample:
+    params: dict
+    replay_digest: str | None = None
+
+
+def _typed_replay(value, expected_type, prefix, params, config, symbol, verify):
+    from scripts import optimize_orderflow as opt
+    if not isinstance(value, expected_type) or not isinstance(prefix, SearchPrefix):
+        raise TypeError('replay type/prefix mismatch')
+    kwargs = {} if config is None else {'trade_config':config, 'trade_updates':prefix.trade_updates}
+    result = opt.run_backtest(prefix.bars, opt.build_instrument_config(params, symbol),
+        params['price_proximity_pct'], prefix.bars[0].bar_type, **kwargs)
+    if verify and value.replay_digest is not None and result['replay_digest'] != value.replay_digest:
+        raise ValueError('stored replay digest mismatch')
+    return result
+
+
+def replay_comparator(frozen_artifact, prefix, *, symbol='BTCUSDT'):
+    if not isinstance(frozen_artifact, FrozenComparator):
+        raise TypeError('comparator requires FrozenComparator')
+    return _typed_replay(frozen_artifact, FrozenComparator, prefix, frozen_artifact.params, None, symbol, True)
+
+
+def replay_legacy(stageA_config, prefix, *, symbol='BTCUSDT'):
+    if not isinstance(stageA_config, LegacyReplay):
+        raise TypeError('legacy replay requires LegacyReplay')
+    config = TradeFlowConfig(signals=stageA_config.signals) if stageA_config.signals.any_enabled else None
+    return _typed_replay(stageA_config, LegacyReplay, prefix, stageA_config.params, config, symbol, True)
+
+
+def replay_full_strategy(sampled, prefix, *, symbol='BTCUSDT', signal_overrides=None):
+    if not isinstance(sampled, FullStrategySample):
+        raise TypeError('full strategy requires FullStrategySample')
+    params = full_strategy_params(sampled.params, symbol)
+    from types import SimpleNamespace
+    config = effective_trade_config(SimpleNamespace(phase='phase4b'), params)
+    if signal_overrides:
+        allowed={'initiative_imbalance':'off','exhaustion_contrarian':'off','framing_profile_source':'bar_vwap'}
+        if len(signal_overrides)!=1 or any(allowed.get(k)!=v for k,v in signal_overrides.items()):
+            raise ValueError('unregistered phase4b signal override (initiative bonus is refused)')
+        config = replace(config, signals=replace(config.signals, **signal_overrides))
+    validate_phase4b_signals(config.signals,s1=True)
+    result = _typed_replay(sampled, FullStrategySample, prefix, params, config, symbol, True)
+    result['replay_identity'] = {'sampled_params':dict(sampled.params),
+        'inert_params':{'absorption_min_delta_pct':params['absorption_min_delta_pct']},
+        'trade_signals':asdict(config.signals)}
+    return result
+
+
+def full_strategy_defaults(symbol='BTCUSDT'):
+    from scripts.optimize_orderflow import instrument_config
+    base, signals = instrument_config(symbol), TradeSignalConfig()
+    values = {
+        'price_proximity_pct':.002, 'min_composite_score':base.risk.min_composite_score,
+        'signal_cooldown_seconds':base.risk.signal_cooldown_seconds,
+        'volume_decline_pct':base.exhaustion.volume_decline_pct,
+        'lookback_bars':base.divergence.lookback_bars, 'delta_failure_pct':base.divergence.delta_failure_pct,
+        'initiative_min_delta_pct':base.initiative.min_delta_pct, 'initiative_min_body_bps':base.initiative.min_body_bps,
+        'initiative_volume_acceleration_min':base.initiative.volume_acceleration_min,
+        'default_stop_pct':base.risk.default_stop_pct, 'target_rr':base.risk.default_target_pct/base.risk.default_stop_pct,
+        **{name:getattr(signals,name[3:]) for name in TRADE_SEARCH_SPACE_BOUNDS},
+        'ts_imbalance_ratio':3., 'ts_imbalance_min_level_share':.01,
+        'ts_imbalance_bucket_mult':1, 'ts_stacked_min_levels':3,
+    }
+    return values
+
+
+S1_REPLAY_NAMES=('defaults','initiative_off','k1','E2_off','P2_bar_vwap','stageB_bar_params')
+
+
+def full_strategy_probe(symbol='BTCUSDT'):
+    """Rev 11's fixed worst-case trial-equivalent, never an adaptive proposal."""
+    return {**full_strategy_defaults(symbol),
+        'ts_stacked_min_levels':1,'ts_imbalance_bucket_mult':1,'ts_imbalance_min_level_share':.002,
+        'ts_imbalance_ratio':2.,'ts_min_level_share':.02,'ts_min_side_ratio':.55,
+        'ts_min_reject_bps':.5,'ts_max_through_bps':4.,'ts_level_zone_frac':.50,
+        'ts_contrarian_ratio':1.5,'ts_contrarian_zone_frac':.50,'ts_contrarian_min_level_share':.005,
+        'signal_cooldown_seconds':5.,'min_composite_score':10.,'price_proximity_pct':.005}
+
+
+def s1_timings(lane):
+    """Require all ten named measurements, including the exact registered probe."""
+    import math
+    try:
+        if set(lane['replays'])!=set(S1_REPLAY_NAMES) or len(lane['trial_equivalent_seconds'])!=3:
+            raise ValueError('benchmark requires all ten S1 timings')
+        if lane['worst_case_probe']['params']!=full_strategy_probe():
+            raise ValueError('benchmark probe differs from registration')
+        values={name:lane['replays'][name]['runtime_seconds'] for name in S1_REPLAY_NAMES}
+        values.update({f'trial_equivalent_{i}':v for i,v in enumerate(lane['trial_equivalent_seconds'])})
+        values['worst_case_probe']=lane['worst_case_probe']['runtime_seconds']
+        if any(type(v) not in (int,float) or not math.isfinite(v) or v<=0 for v in values.values()):
+            raise ValueError('benchmark timings must be finite and positive')
+        return values
+    except (KeyError,TypeError) as exc:
+        raise ValueError('benchmark missing a timing or probe') from exc
+
+
+def run_s1(prefix, comparator, *, symbol='BTCUSDT', guard=None):
+    """Six replays, three default trial-equivalents and the rev 11 probe; no selection."""
+    import time
+    from contextlib import nullcontext
+    from scripts import optimize_orderflow as opt, diagnose_trades as diagnose
+    if not isinstance(prefix, SearchPrefix) or not isinstance(comparator, FrozenComparator):
+        raise TypeError('S1 requires a SearchPrefix and FrozenComparator')
+    defaults = full_strategy_defaults(symbol)
+    cases = [('defaults', defaults, {}),
+        ('initiative_off', defaults, {'initiative_imbalance':'off'}),
+        ('k1', {**defaults,'ts_stacked_min_levels':1}, {}),
+        ('E2_off', defaults, {'exhaustion_contrarian':'off'}),
+        ('P2_bar_vwap', defaults, {'framing_profile_source':'bar_vwap'}),
+        ('stageB_bar_params', {**defaults, **{k:v for k,v in comparator.params.items()
+            if k in FULL_STRATEGY_SPACE and not k.startswith('ts_')}}, {})]
+    rows, timings = {}, []
+    for label, values, overrides in cases:
+        with guard(label) if guard else nullcontext():
+            with replay_measurement() as measurement:
+                result = replay_full_strategy(FullStrategySample(values), prefix, symbol=symbol, signal_overrides=overrides)
+                full = diagnose.add_gross(opt.simulate_trades_risk_based(result['ledger'],fee_bps=5.,slippage_bps=1.))
+            rows[label] = {'decomposition':diagnose.decompose(full),'signal_counts':result['signal_counts'],
+                'replay_digest':result['replay_digest'],**measurement}
+    for index in range(3):
+        with guard(f'benchmark-{index}') if guard else nullcontext():
+            started=time.perf_counter()
+            benchmark_trial_equivalent(prefix, defaults, symbol=symbol)
+            timings.append(time.perf_counter()-started)
+    probe=full_strategy_probe(symbol)
+    with guard('worst_case_probe') if guard else nullcontext():
+        started=time.perf_counter()
+        benchmark_trial_equivalent(prefix,probe,symbol=symbol)
+        probe_seconds=time.perf_counter()-started
+    return {'replays':rows,'trial_equivalent_seconds':timings,'gate_input':False,
+            'worst_case_probe':{'params':probe,'runtime_seconds':probe_seconds}}
+
+
+@contextmanager
+def replay_measurement():
+    """Per-replay sampled RSS peak; strict lifetime RSS/private bounds remain in the watchdog."""
+    import psutil
+    import threading
+    import time
+    process=psutil.Process();done=threading.Event()
+    measured={'peak_rss_bytes':process.memory_info().rss,'rss_metric':'per-replay RSS sampled every 20 ms'}
+    def sample():
+        measured['peak_rss_bytes']=max(measured['peak_rss_bytes'],process.memory_info().rss)
+    def monitor():
+        while not done.wait(.02):sample()
+    started=time.perf_counter();thread=threading.Thread(target=monitor,daemon=True);thread.start()
+    try:yield measured
+    finally:
+        done.set();thread.join();sample()
+        measured['runtime_seconds']=time.perf_counter()-started
+
+
+def benchmark_trial_equivalent(prefix, values, *, symbol='BTCUSDT'):
+    """Measure the complete objective using fixed proposals, without an Optuna study."""
+    from types import SimpleNamespace
+    from scripts import optimize_orderflow as opt
+    trial=SimpleNamespace(suggest_int=lambda name,*a:values[name],suggest_float=lambda name,*a,**kw:values[name],
+        suggest_categorical=lambda name,*a:values[name],set_user_attr=lambda *a:None)
+    args=SimpleNamespace(phase='phase4b',phase4=True,symbol=symbol,space=FULL_STRATEGY_SPACE,
+        n_splits=5,embargo=.02,min_total_trades=105,min_trades_per_fold=11,fee_bps=5.,slippage_bps=1.)
+    folds=opt.build_chronological_folds(prefix.bars,5,.02)
+    return opt.objective(trial,prefix,folds,args)
+
+
+def phase4b_reserved_look(layout, manifest, campaign_sha256, interval, candidate, report, replay):
+    """Every entry and recovery checks gates and cross-campaign allocation under the look lock.
+
+    The replay callback is the only place allowed to open the full cache/holdout.
+    """
+    from scripts.optimize_orderflow import file_lock, atomic_json, json_safe
+    from scripts.phase4_approvals import require_holdout_allocation
+    if layout.phase != 'phase4b' or manifest.get('phase') != 'phase4b':
+        raise ValueError('holdout phase mismatch')
+    path = layout.checked_write(layout.exposure)
+    lock = layout.checked_write(str(path)+'.lock')
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock):
+        from scripts.phase4b_campaign import s2_status
+        if s2_status(layout,campaign_sha256,interval['bar_type'])!='complete':
+            raise ValueError('look requires a completed S2 checkpoint for this arm')
+        if (report.get('G4b_N') is not True or set(report.get('gates', {})) != {str(i) for i in range(1, 11)}
+                or any(v is not True for v in report['gates'].values())
+                or report.get('replay_digest')!=candidate.get('replay_digest')
+                or report.get('campaign_sha256')!=campaign_sha256 or report.get('bar_type')!=interval['bar_type']):
+            raise ValueError('candidate has not passed every G4b-N gate')
+        require_holdout_allocation(layout, interval, campaign_sha256, manifest['phase4_origin'])
+        arm = f"BTCUSDT:{interval['bar_type']}:full"
+        data = json.loads(path.read_bytes()) if path.exists() else {}
+        prior = data.get(arm)
+        if prior and prior['candidate'] != candidate:
+            raise ValueError('another candidate is already exposed')
+        if prior and 'result' in prior:
+            return prior['result']
+        data[arm] = {'candidate':candidate, 'status':'reserved'}
+        atomic_json(path, data)
+        result = json_safe(replay())
+        if prior:
+            result['completed_after_interruption'] = True
+        data[arm].update(status='complete', result=result)
+        atomic_json(path, data)
+        return result
