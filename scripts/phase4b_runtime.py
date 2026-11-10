@@ -14,9 +14,12 @@ from scripts.phase4_policy import ROOT,canonical_bytes,source_state
 
 
 def runtime_fingerprint():
-    # Load the same execution closure in registration and worker processes, including lazy imports.
+    # Load the same execution closure in registration and worker processes, including lazy imports, so the hashed
+    # module set never depends on import history (S1 attempt 9056f902: the worker's gate check lazily imported
+    # phase4b_proof, the post-flight child did not). tests/test_phase4b_fingerprint_determinism.py guards closure.
     for name in ('scripts.phase4_campaign','scripts.phase4b_campaign','scripts.phase4_report','scripts.phase4b_regression',
-                 'scripts.phase4_benchmark','scripts.phase4_resources','scripts.trade_feature_cache'):
+                 'scripts.phase4_benchmark','scripts.phase4_resources','scripts.trade_feature_cache',
+                 'scripts.phase4b_proof','scripts.phase4b_accounting','scripts.search_space_audit'):
         importlib.import_module(name)
     from scripts import optimize_orderflow as opt,phase4_studies as p4
     from scripts.trade_feature_cache import BUILDER_FILES
